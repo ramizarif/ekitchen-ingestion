@@ -5,7 +5,7 @@ recipe discovery operations with phase management and statistics.
 """
 
 import asyncio
-from typing import Dict, Any, Optional, Callable
+from typing import Dict, Any, Optional, Callable, List
 from dataclasses import dataclass, field
 from datetime import datetime
 from enum import Enum

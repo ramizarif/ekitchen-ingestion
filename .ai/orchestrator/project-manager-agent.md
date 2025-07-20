@@ -315,8 +315,9 @@ Respond within 30 seconds."
       # Wait for engineer response
       sleep 35
       
-      # Capture response
+      # Capture response AND full terminal content for deep analysis
       ENG_RESPONSE=$(tmux capture-pane -t "$ENG_SESSION:0" -p | tail -15 | grep -A 10 "PM REPORT:" || echo "No response")
+      FULL_TERMINAL=$(tmux capture-pane -t "$ENG_SESSION:0" -p | tail -50)
       
       if [[ "$ENG_RESPONSE" == "No response" ]]; then
         echo "⚠️ Engineer $ENG_SESSION did not respond - may be stuck or unresponsive"
@@ -325,10 +326,83 @@ Respond within 30 seconds."
         echo "✅ Response received from $ENG_SESSION"
         ENGINEER_RESPONSES["$ENG_SESSION"]="$ENG_RESPONSE"
         
-        # Parse response for issues
+        # DEEP ANALYSIS: Check if engineer is following implementation plan
+        echo "🔍 Analyzing engineer $ENG_SESSION progress alignment..."
+        
+        # Read the implementation plan for this issue
+        ISSUE_FILE="project-breakdown/features/{feature-name}/issues/issue$ISSUE_NUM.md"
+        if [ -f "$ISSUE_FILE" ]; then
+          IMPLEMENTATION_PLAN=$(grep -A 50 "## Implementation Plan" "$ISSUE_FILE" 2>/dev/null || echo "No plan found")
+          ACCEPTANCE_CRITERIA=$(grep -A 20 "## Acceptance Criteria" "$ISSUE_FILE" 2>/dev/null || echo "No criteria found")
+          
+          # Analyze what engineer is actually doing vs what they should be doing
+          CURRENT_WORK=$(echo "$FULL_TERMINAL" | tail -20 | grep -E "(echo|Phase|Status|Current|Working on)" | tail -3)
+          
+          echo "Current work detected: $CURRENT_WORK"
+          
+          # Check for alignment issues
+          ALIGNMENT_ISSUES=""
+          
+          # Check if engineer is working on wrong phase
+          if echo "$IMPLEMENTATION_PLAN" | grep -q "Phase 1" && echo "$ENG_RESPONSE" | grep -q "Phase [23]" && ! echo "$IMPLEMENTATION_PLAN" | grep -A 20 "Phase 1" | grep -q "completed\|done"; then
+            ALIGNMENT_ISSUES+="⚠️ Engineer may be skipping Phase 1 steps. "
+          fi
+          
+          # Check if engineer is stuck on same task too long
+          REPEATED_WORK=$(echo "$FULL_TERMINAL" | grep -c "$(echo "$CURRENT_WORK" | head -1)" 2>/dev/null || echo "0")
+          if [ "$REPEATED_WORK" -gt 5 ]; then
+            ALIGNMENT_ISSUES+="⚠️ Engineer appears stuck on same task for multiple check-ins. "
+          fi
+          
+          # Check if engineer is not following implementation plan structure
+          if ! echo "$ENG_RESPONSE" | grep -qE "Phase [123]" && echo "$IMPLEMENTATION_PLAN" | grep -q "Phase"; then
+            ALIGNMENT_ISSUES+="⚠️ Engineer not following phase structure from implementation plan. "
+          fi
+          
+          # Check for git discipline issues
+          if ! echo "$FULL_TERMINAL" | grep -q "git commit\|Commit" && ! echo "$ENG_RESPONSE" | grep -q "commit"; then
+            ALIGNMENT_ISSUES+="⚠️ No recent commits detected - ensure 30-minute commit frequency. "
+          fi
+          
+          # If alignment issues found, provide specific guidance
+          if [ -n "$ALIGNMENT_ISSUES" ]; then
+            echo "🚨 Alignment issues detected: $ALIGNMENT_ISSUES"
+            
+            ./scripts/send-claude-message.sh "$ENG_SESSION:0" "PM GUIDANCE - Course Correction Needed:
+
+ALIGNMENT ISSUES DETECTED:
+$ALIGNMENT_ISSUES
+
+IMPLEMENTATION PLAN REVIEW:
+$(echo "$IMPLEMENTATION_PLAN" | head -20)
+
+CURRENT PHASE GUIDANCE:
+$(echo "$IMPLEMENTATION_PLAN" | grep -A 10 "Phase 1\|Phase 2\|Phase 3" | head -15)
+
+ACCEPTANCE CRITERIA REMINDER:
+$(echo "$ACCEPTANCE_CRITERIA" | head -10)
+
+ACTION REQUIRED:
+1. Review your issue file: $ISSUE_FILE
+2. Confirm which phase you should be on
+3. Follow the step-by-step implementation plan
+4. Commit your work every 30 minutes
+5. Report specific phase progress in next status
+
+Stay focused on the implementation plan - it's your roadmap to success."
+          
+          else
+            echo "✅ Engineer $ENG_SESSION appears on track with implementation plan"
+          fi
+          
+        else
+          echo "⚠️ Could not find issue file: $ISSUE_FILE"
+        fi
+        
+        # Parse response for explicit issues
         if echo "$ENG_RESPONSE" | grep -qi "blocked\|stuck\|error\|help"; then
-          echo "🚨 Engineer $ENG_SESSION reports issues - providing assistance..."
-          ./scripts/send-claude-message.sh "$ENG_SESSION:0" "I see you have issues. Let me help:
+          echo "🚨 Engineer $ENG_SESSION explicitly reports issues - providing assistance..."
+          ./scripts/send-claude-message.sh "$ENG_SESSION:0" "I see you have explicit issues. Let me help:
 
 1. If blocked on technical issue: Check project-breakdown/context/patterns.md for similar implementations
 2. If git issues: Ensure you're on feature branch, not development/main
