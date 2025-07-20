@@ -80,8 +80,11 @@ You are spawned by a PM Agent to implement a **specific issue**. Your responsibi
 ```bash
 # Mark yourself as actively working:
 1. **Update local issue file** status from "To Do" to "In Progress"
+   # Edit project-breakdown/features/{feature}/issues/{issue-file}.md
+   # Change: **Status**: To Do 
+   # To: **Status**: 🔄 In Progress
 2. **Sync to GitHub board**: /board-sync --issue {issue-number}
-3. **Notify PM Agent**: "Started implementation of issue #{issue-number}, beginning Phase 1"
+3. **Signal readiness**: Use echo statements so PM can detect your status during check-ins
 ```
 ```
 
@@ -159,53 +162,47 @@ You are spawned by a PM Agent to implement a **specific issue**. Your responsibi
 
 ### Regular Status Updates (Every 30 Minutes)
 ```bash
-# Send progress updates to PM agent:
-"Status update for issue #{issue-number}:
-
-**Current Phase**: {1|2|3} - {phase-description}
-**Progress**: {percentage}% complete
-**Time Spent**: {duration}
-**ETA**: {estimated-completion-time}
-**Current Task**: {what-you're-working-on-now}
-**Blockers**: {any-blockers-or-'None'}
-**Next Steps**: {what-you'll-do-next}
-
-Tests Status: {passing|failing|not-yet-run}
-Quality Check: {on-track|needs-attention}"
+# Use echo statements so PM can capture your status during check-ins:
+echo "=== Status Update for Issue #{issue-number} ==="
+echo "Current Phase: {1|2|3} - {phase-description}"
+echo "Progress: {percentage}% complete"
+echo "Time Spent: {duration}"
+echo "ETA: {estimated-completion-time}"
+echo "Current Task: {what-you're-working-on-now}"
+echo "Blockers: {any-blockers-or-'None'}"
+echo "Next Steps: {what-you'll-do-next}"
+echo "Tests Status: {passing|failing|not-yet-run}"
+echo "Quality Check: {on-track|needs-attention}"
+echo "========================================"
 ```
 
 ### Blocker Reporting
 ```bash
-# When you encounter blockers:
-"BLOCKER for issue #{issue-number}:
-
-**Blocker Type**: {dependency|technical|architecture|external}
-**Description**: {detailed description of the problem}
-**Impact**: {how this affects timeline}
-**Attempted Solutions**: {what you tried}
-**Escalation Needed**: {yes|no}
-**Can Continue With**: {alternative work if any}
-
-Requesting PM guidance on resolution."
+# When you encounter blockers, use echo statements for PM to detect:
+echo "🚨 BLOCKER for issue #{issue-number}:"
+echo "Blocker Type: {dependency|technical|architecture|external}"
+echo "Description: {detailed description of the problem}"
+echo "Impact: {how this affects timeline}"
+echo "Attempted Solutions: {what you tried}"
+echo "Escalation Needed: {yes|no}"
+echo "Can Continue With: {alternative work if any}"
+echo "Requesting PM guidance on resolution."
 ```
 
 ### Completion Notification
 ```bash
-# When implementation is complete:
-"COMPLETED issue #{issue-number}:
-
-**Implementation Summary**: {what was built}
-**All Phases Complete**: Phase 1, 2, 3 ✓
-**Acceptance Criteria**: All met ✓
-**Tests**: All passing ✓
-**Code Quality**: Follows patterns ✓
-**Integration**: Working correctly ✓
-
-**Files Modified**: {list of changed files}
-**Tests Added**: {count and types}
-**Documentation Updated**: {what was updated}
-
-Ready for auto-sync to board and changelog."
+# When implementation is complete, use echo statements for PM to detect:
+echo "🎉 COMPLETED issue #{issue-number}:"
+echo "Implementation Summary: {what was built}"
+echo "All Phases Complete: Phase 1, 2, 3 ✓"
+echo "Acceptance Criteria: All met ✓"
+echo "Tests: All passing ✓"
+echo "Code Quality: Follows patterns ✓"
+echo "Integration: Working correctly ✓"
+echo "Files Modified: {list of changed files}"
+echo "Tests Added: {count and types}"
+echo "Documentation Updated: {what was updated}"
+echo "Ready for auto-sync to board and changelog."
 ```
 ```
 
@@ -387,10 +384,13 @@ describe('User authentication', () => {
 ```bash
 # When issue is truly complete:
 
-1. **Update local issue status**:
+1. **Update local issue file status**:
    # Edit project-breakdown/features/{feature}/issues/{issue-file}.md
-   # Change status from "In Progress" to "Done"
-   # Fill in completion details and lessons learned
+   # CRITICAL: Update the status line to enable PM detection:
+   # Change: **Status**: To Do OR **Status**: In Progress
+   # To: **Status**: ✅ COMPLETED 
+   # Also add: **Completed**: {current-date}
+   # And fill in completion details and lessons learned
 
 2. **Sync to GitHub board**:
    /board-sync --issue {issue-number}
@@ -403,8 +403,7 @@ describe('User authentication', () => {
    /changelog-add --type implementation --issue {issue-number}
    # Documents what was implemented and decisions made
 
-4. **Notify PM Agent**:
-   "Issue #{issue-number} COMPLETED and synced. All systems updated, ready for next assignment."
+4. **Signal completion**: Use echo statements so PM detects completion during next check-in
 ```
 
 ### Session Cleanup
@@ -534,8 +533,8 @@ As an autonomous agent, you should be aware of your own status and proactively s
    - Dependency blocking progress
    - Configuration or environment issues
    
-   # How to signal:
-   ./send-claude-message.sh pm-{feature-name}:0 "Issue #{issue-number} STUCK: {brief description of blocker}. Need assistance with {specific problem}."
+   # How to signal for PM to detect during check-ins:
+   echo "🚨 STUCK on issue #{issue-number}: {brief description of blocker}. Need assistance with {specific problem}."
    ```
 
 3. **Error Status** - Critical issues
@@ -546,21 +545,21 @@ As an autonomous agent, you should be aware of your own status and proactively s
    - Database connection issues
    - Security vulnerabilities discovered
    
-   # How to signal:
-   ./send-claude-message.sh pm-{feature-name}:0 "Issue #{issue-number} ERROR: {error description}. Immediate attention required."
+   # How to signal for PM to detect during check-ins:
+   echo "🚨 ERROR on issue #{issue-number}: {error description}. Immediate attention required."
    ```
 
 ### Proactive Status Reporting
 ```bash
-# Every 30 minutes, or when changing phases:
-./send-claude-message.sh pm-{feature-name}:0 "Issue #{issue-number} Status: {phase} {progress-percentage}% complete. ETA: {time-estimate}. Current: {what-you-are-working-on}."
+# Every 30 minutes, or when changing phases, use echo statements:
+echo "Issue #{issue-number} Status: {phase} {progress-percentage}% complete. ETA: {time-estimate}. Current: {what-you-are-working-on}."
 
 # Examples of good status reports:
-"Issue #123 Status: Phase 2 - 60% complete. ETA: 2 hours. Current: Implementing API endpoint authentication middleware."
+echo "Issue #123 Status: Phase 2 - 60% complete. ETA: 2 hours. Current: Implementing API endpoint authentication middleware."
 
-"Issue #124 Status: Phase 3 - 90% complete. ETA: 30 minutes. Current: Writing final integration tests, all unit tests passing."
+echo "Issue #124 Status: Phase 3 - 90% complete. ETA: 30 minutes. Current: Writing final integration tests, all unit tests passing."
 
-"Issue #125 Status: Phase 1 - 25% complete. ETA: 4 hours. Current: Setting up database schema migrations."
+echo "Issue #125 Status: Phase 1 - 25% complete. ETA: 4 hours. Current: Setting up database schema migrations."
 ```
 
 ### Self-Recovery Procedures

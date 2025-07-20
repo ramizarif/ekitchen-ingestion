@@ -46,7 +46,7 @@ You → /new-feature-breakdown "I want users to search recipes by ingredients"
      ↓
    Enhanced Issue Discovery creates comprehensive feature plan with dependencies
      ↓
-You → ./start-orchestrator.sh
+You → ./scripts/start-orchestrator.sh
      ↓ 
 You → "/orchestrator --feature recipe-search"
      ↓
@@ -56,7 +56,7 @@ You → "/orchestrator --feature recipe-search"
 ### **Flow 2: Targeted Issue Implementation**
 ```bash
 # Start: Specific issue to autonomous completion
-You → ./start-orchestrator.sh
+You → ./scripts/start-orchestrator.sh
      ↓
 You → "/orchestrator --issue 123"
      ↓
@@ -66,7 +66,7 @@ You → "/orchestrator --issue 123"
 ### **Flow 3: Multi-Feature Parallel Development**
 ```bash
 # Start: Multiple features simultaneously
-You → ./start-orchestrator.sh
+You → ./scripts/start-orchestrator.sh
      ↓
 You → "/orchestrator --features 'recipe-search,user-profiles,social-sharing'"
      ↓
@@ -80,7 +80,7 @@ You → /issue-discovery (create detailed issues with implementation plans)
      ↓
    Multiple rounds of issue creation with dependencies
      ↓
-You → ./start-orchestrator.sh → "/orchestrator --feature {feature-name}"
+You → ./scripts/start-orchestrator.sh → "/orchestrator --feature {feature-name}"
      ↓
    Autonomous execution of manually planned work
 ```
@@ -116,7 +116,7 @@ You → Continue with next features or adjust priorities
 **How It Starts:**
 ```bash
 # User runs:
-./start-orchestrator.sh
+./scripts/start-orchestrator.sh
 
 # Script does:
 1. tmux new-session -d -s "orchestrator"              # Creates tmux session
@@ -584,7 +584,7 @@ You: /issue-discovery  # Enhance issues with implementation details
 # System creates detailed implementation plans for each issue
 
 # Day 1 Evening: Start Autonomous Development  
-You: ./start-orchestrator.sh
+You: ./scripts/start-orchestrator.sh
 You: "/orchestrator --feature recipe-search"
 # System spawns PM agent, PM spawns 3 engineers for ready issues
 # You go to sleep
@@ -601,7 +601,7 @@ You: /session-summary
 
 ```bash
 # Start multiple features
-You: ./start-orchestrator.sh
+You: ./scripts/start-orchestrator.sh
 You: "/orchestrator --features 'recipe-search,user-profiles,social-sharing'"
 
 # System coordinates:
@@ -616,7 +616,7 @@ You: "/orchestrator --features 'recipe-search,user-profiles,social-sharing'"
 
 ```bash
 # Fix specific critical bug
-You: ./start-orchestrator.sh
+You: ./scripts/start-orchestrator.sh
 You: "/orchestrator --issue 156"
 # Single engineer spawned for focused implementation
 # No PM overhead for single issue
@@ -638,7 +638,7 @@ You: "/orchestrator --issue 156"
 **Session Recovery:**
 ```bash
 # If system crashes or tmux sessions lost:
-1. ./start-orchestrator.sh  # Restart orchestrator
+1. ./scripts/start-orchestrator.sh  # Restart orchestrator
 2. /project-status         # Assess current state
 3. Resume development with: "/orchestrator --feature {feature-name}"
 4. System reads progress.md and resumes where left off

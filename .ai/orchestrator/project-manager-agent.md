@@ -90,19 +90,93 @@ Analyze all issues in your feature for dependencies:
 - **Maximum 3 engineers** working simultaneously
 - **One issue per engineer** for focused implementation
 - **Critical path issues** get priority for resource allocation
+- **Engineer sessions named by current issue** (eng-{feature}-{issue-number})
 
-### Engineer Spawning Process
+### Engineer Spawning Process with Validation
 ```bash
 # For each ready issue (up to 3):
 
-1. **Create tmux session**
-   tmux new-session -d -s eng-{feature-name}-{issue-number}
-   
-2. **Start Claude in session**
-   tmux send-keys -t eng-{feature-name}-{issue-number}:0 'claude' Enter
-   
-3. **Brief Engineer with context**
-   ./send-claude-message.sh eng-{feature-name}-{issue-number}:0 "You are an Engineer assigned to implement issue #{issue-number}. Read PROJECT_CONTEXT.md and project-breakdown/features/{feature-name}/issues/{issue-file}.md for your implementation plan. Follow the step-by-step guidance, auto-sync progress to GitHub board, and update changelogs when complete."
+spawn_validated_engineer() {
+  local issue_number=$1
+  local session_name="eng-{feature-name}-$issue_number"
+  
+  echo "Spawning engineer for issue #$issue_number..."
+  
+  # 1. Create tmux session
+  tmux new-session -d -s "$session_name"
+  
+  # 2. Start Claude and validate it's responsive
+  tmux send-keys -t "$session_name:0" 'claude' Enter
+  
+  # 3. Validate engineer session is responsive
+  echo "Validating engineer session $session_name is responsive..."
+  
+  # Wait longer for Claude to fully start
+  sleep 5
+  
+  for i in {1..8}; do
+    echo "Validation attempt $i/8 for $session_name..."
+    
+    # Check if there's unsent content in the command line (like what you saw)
+    PANE_CONTENT=$(tmux capture-pane -t "$session_name:0" -p | tail -5)
+    if echo "$PANE_CONTENT" | grep -q "Please respond with"; then
+      echo "⚠️ Detected unsent message - sending Enter key"
+      tmux send-keys -t "$session_name:0" Enter
+      sleep 2
+    fi
+    
+    # Send validation message
+    ./scripts/send-claude-message.sh "$session_name:0" "Please respond with 'ENGINEER_READY' to confirm you are active."
+    sleep 4
+    
+    # Check for response
+    RESPONSE=$(tmux capture-pane -t "$session_name:0" -p | tail -15)
+    if echo "$RESPONSE" | grep -q "ENGINEER_READY"; then
+      echo "✅ Engineer confirmed responsive in $session_name"
+      
+      # 4. Brief the confirmed responsive engineer
+      ./scripts/send-claude-message.sh "$session_name:0" "You are an Engineer assigned to implement issue #$issue_number for the {feature-name} feature.
+
+CONTEXT TO READ FIRST:
+- PROJECT_CONTEXT.md - Application context
+- project-breakdown/features/{feature-name}/issues/{issue-file}.md - Your implementation plan
+- project-breakdown/context/patterns.md - Code patterns to follow
+
+Your session is $session_name - this reflects your current issue assignment.
+
+Begin by reading your issue context and implementation plan, then start Phase 1."
+      
+      echo "✅ Engineer #$issue_number briefed and ready"
+      return 0
+    fi
+    
+    if [ $i -eq 8 ]; then
+      echo "❌ Engineer session $session_name failed to respond - killing and retrying"
+      tmux kill-session -t "$session_name" 2>/dev/null
+      
+      # Retry once
+      echo "Retrying engineer spawn for issue #$issue_number..."
+      tmux new-session -d -s "$session_name"
+      tmux send-keys -t "$session_name:0" 'claude' Enter
+      sleep 5
+      
+      # Final validation attempt
+      ./scripts/send-claude-message.sh "$session_name:0" "Please respond with 'ENGINEER_READY' to confirm you are active."
+      sleep 5
+      FINAL_RESPONSE=$(tmux capture-pane -t "$session_name:0" -p | tail -10)
+      
+      if echo "$FINAL_RESPONSE" | grep -q "ENGINEER_READY"; then
+        echo "✅ Engineer confirmed responsive on retry"
+        ./scripts/send-claude-message.sh "$session_name:0" "You are an Engineer assigned to implement issue #$issue_number. Read your implementation plan and begin."
+        return 0
+      else
+        echo "❌ Engineer session $session_name completely unresponsive - marking issue as blocked"
+        tmux kill-session -t "$session_name" 2>/dev/null
+        return 1
+      fi
+    fi
+  done
+}
 ```
 
 ### Prioritization Logic
@@ -124,6 +198,82 @@ function prioritizeIssues(readyIssues) {
   });
 }
 ```
+
+### **Engineer Reassignment Process**
+```markdown
+## Smart Engineer Reallocation
+
+When an engineer completes an issue, immediately check for newly unblocked issues and reassign:
+
+### Reassignment Logic
+```bash
+# After engineer completes issue #123:
+COMPLETED_ISSUE=123
+COMPLETED_SESSION="eng-{feature-name}-$COMPLETED_ISSUE"
+
+# 1. Kill the completed session
+tmux kill-session -t "$COMPLETED_SESSION"
+echo "✅ Engineer session $COMPLETED_SESSION terminated (issue #$COMPLETED_ISSUE complete)"
+
+# 2. Check for newly unblocked issues
+NEWLY_READY=$(analyze_dependencies_after_completion $COMPLETED_ISSUE)
+
+# 3. If there are newly ready issues, immediately reassign
+if [ -n "$NEWLY_READY" ]; then
+  NEXT_ISSUE=$(echo "$NEWLY_READY" | head -1)  # Get highest priority ready issue
+  NEW_SESSION="eng-{feature-name}-$NEXT_ISSUE"
+  
+  echo "🔄 Reassigning engineer resource to newly unblocked issue #$NEXT_ISSUE"
+  
+  # Create new session with correct issue number
+  tmux new-session -d -s "$NEW_SESSION"
+  tmux send-keys -t "$NEW_SESSION:0" 'claude' Enter
+  
+  # Brief engineer with new issue context
+  sleep 3
+  ./scripts/send-claude-message.sh "$NEW_SESSION:0" "You are an Engineer assigned to implement issue #$NEXT_ISSUE for the {feature-name} feature.
+
+CONTEXT TO READ FIRST:
+- PROJECT_CONTEXT.md - Application context
+- project-breakdown/features/{feature-name}/issues/{issue-file}.md - Your implementation plan
+- project-breakdown/context/patterns.md - Code patterns to follow
+
+Your session is $NEW_SESSION - this reflects your current issue assignment.
+
+Begin by reading your issue context and implementation plan, then start Phase 1."
+
+  echo "✅ Engineer reassigned to issue #$NEXT_ISSUE in session $NEW_SESSION"
+fi
+
+# Function to analyze dependencies after completion
+analyze_dependencies_after_completion() {
+  local completed_issue=$1
+  
+  # Find all issues that were blocked by the completed issue
+  find project-breakdown/features/{feature-name}/issues/ -name "*.md" -exec grep -l "Blocked by.*#$completed_issue\|Depends on.*#$completed_issue" {} \; | while read issue_file; do
+    
+    # Extract issue number from filename
+    issue_num=$(basename "$issue_file" | grep -o '[0-9]\+')
+    
+    # Check if ALL dependencies are now met
+    all_deps_met=true
+    while read dep_issue; do
+      if [ -n "$dep_issue" ]; then
+        # Check if dependency is completed
+        if ! find project-breakdown/features/{feature-name}/issues/ -name "*$dep_issue*" -exec grep -q "\*\*Status\*\*.*COMPLETED" {} \; 2>/dev/null; then
+          all_deps_met=false
+          break
+        fi
+      fi
+    done < <(grep -o '#[0-9]\+' "$issue_file" | sed 's/#//')
+    
+    # If all dependencies met, this issue is now ready
+    if [ "$all_deps_met" = true ]; then
+      echo "$issue_num"
+    fi
+  done | sort -n  # Return ready issues sorted by number
+}
+```
 ```
 
 ## Autonomous Operations
@@ -132,36 +282,127 @@ function prioritizeIssues(readyIssues) {
 ```markdown
 ## Automated Check-in Process
 
-### 1. **Enhanced Engineer Status Check**
+### 1. **Enhanced Engineer Status Check with Response Handling**
 ```bash
 # Use tmux_utils.py to get real engineer status and health
-ENGINEER_STATUS=$(python3 tmux_utils.py --snapshot | jq --arg feature "{feature-name}" '.engineer_agents[] | select(.feature_name == $feature)')
+ENGINEER_STATUS=$(python3 utils/tmux_utils.py --snapshot | jq --arg feature "{feature-name}" '.engineer_agents[] | select(.feature_name == $feature)')
 
-# Analyze each engineer's actual status
+# Initialize response collection
+declare -A ENGINEER_RESPONSES
+
+# Request status from each engineer and wait for responses
 echo "$ENGINEER_STATUS" | jq -r '.session_name' | while read ENG_SESSION; do
   HEALTH=$(echo "$ENGINEER_STATUS" | jq -r --arg session "$ENG_SESSION" 'select(.session_name == $session) | .estimated_health')
   ISSUE_NUM=$(echo "$ENGINEER_STATUS" | jq -r --arg session "$ENG_SESSION" 'select(.session_name == $session) | .issue_number')
   
+  echo "Requesting status from engineer $ENG_SESSION (issue #$ISSUE_NUM)..."
+  
   case "$HEALTH" in
     "healthy")
-      # Engineer is working normally, just check progress
-      ./send-claude-message.sh "$ENG_SESSION:0" "Quick progress check: What phase are you on for issue #$ISSUE_NUM?"
+      # Request detailed progress report
+      ./scripts/send-claude-message.sh "$ENG_SESSION:0" "PM STATUS REQUEST for issue #$ISSUE_NUM:
+
+Please provide immediate status report:
+1. Current phase and progress percentage
+2. Last commit time (run: git log -1 --format='%cr' --grep='issue-$ISSUE_NUM')
+3. Current branch (run: git branch --show-current)
+4. Any blockers or assistance needed
+5. Estimated time to completion
+
+Format: 'PM REPORT: [your status]'
+Respond within 30 seconds."
+
+      # Wait for engineer response
+      sleep 35
+      
+      # Capture response
+      ENG_RESPONSE=$(tmux capture-pane -t "$ENG_SESSION:0" -p | tail -15 | grep -A 10 "PM REPORT:" || echo "No response")
+      
+      if [[ "$ENG_RESPONSE" == "No response" ]]; then
+        echo "⚠️ Engineer $ENG_SESSION did not respond - may be stuck or unresponsive"
+        ENGINEER_RESPONSES["$ENG_SESSION"]="UNRESPONSIVE: No response to status request"
+      else
+        echo "✅ Response received from $ENG_SESSION"
+        ENGINEER_RESPONSES["$ENG_SESSION"]="$ENG_RESPONSE"
+        
+        # Parse response for issues
+        if echo "$ENG_RESPONSE" | grep -qi "blocked\|stuck\|error\|help"; then
+          echo "🚨 Engineer $ENG_SESSION reports issues - providing assistance..."
+          ./scripts/send-claude-message.sh "$ENG_SESSION:0" "I see you have issues. Let me help:
+
+1. If blocked on technical issue: Check project-breakdown/context/patterns.md for similar implementations
+2. If git issues: Ensure you're on feature branch, not development/main
+3. If environment issues: Verify MCP servers are running
+4. If unclear requirements: Review your issue file's implementation plan
+
+Provide specific details about your blocker for targeted assistance."
+        fi
+      fi
       ;;
+      
     "stuck")
-      # Engineer appears stuck, send help
-      ./send-claude-message.sh "$ENG_SESSION:0" "You appear to be stuck. What's blocking you on issue #$ISSUE_NUM? Need assistance?"
+      # Engineer appears stuck, get details
+      ./scripts/send-claude-message.sh "$ENG_SESSION:0" "PM ASSISTANCE for issue #$ISSUE_NUM:
+
+You appear to be stuck. Please provide:
+1. Specific error or blocker you're encountering  
+2. What you've tried to resolve it
+3. Current git status (branch, last commit)
+4. Whether you need architectural guidance or technical help
+
+Format: 'PM REPORT: [detailed blocker info]'
+I will wait 30 seconds for your response."
+
+      sleep 35
+      ENG_RESPONSE=$(tmux capture-pane -t "$ENG_SESSION:0" -p | tail -15 | grep -A 10 "PM REPORT:" || echo "No response")
+      ENGINEER_RESPONSES["$ENG_SESSION"]="STUCK: $ENG_RESPONSE"
       ;;
+      
     "unresponsive")
-      # Engineer not responding, auto-restart
-      echo "Engineer $ENG_SESSION unresponsive for issue #$ISSUE_NUM - restarting"
-      tmux kill-session -t "$ENG_SESSION"
-      # Mark issue as ready again for reassignment
+      echo "🔄 Engineer $ENG_SESSION unresponsive for issue #$ISSUE_NUM - attempting recovery..."
+      
+      # Try to get response one more time
+      ./scripts/send-claude-message.sh "$ENG_SESSION:0" "URGENT: Are you responsive? Please reply immediately with 'RESPONSIVE' if you can see this message."
+      sleep 15
+      
+      RECOVERY_RESPONSE=$(tmux capture-pane -t "$ENG_SESSION:0" -p | tail -5 | grep "RESPONSIVE" || echo "No response")
+      
+      if [[ "$RECOVERY_RESPONSE" == "No response" ]]; then
+        echo "💀 Engineer $ENG_SESSION confirmed unresponsive - restarting..."
+        tmux kill-session -t "$ENG_SESSION"
+        ENGINEER_RESPONSES["$ENG_SESSION"]="TERMINATED: Unresponsive, session killed for restart"
+        # TODO: Mark issue as ready for reassignment
+      else
+        echo "✅ Engineer $ENG_SESSION recovered - was temporarily unresponsive"
+        ENGINEER_RESPONSES["$ENG_SESSION"]="RECOVERED: Responded after recovery attempt"
+      fi
       ;;
+      
     "error")
-      # Engineer in error state, investigate
-      ./send-claude-message.sh "$ENG_SESSION:0" "Error detected in your session. Please report your current status for issue #$ISSUE_NUM"
+      # Engineer in error state, get error details
+      ./scripts/send-claude-message.sh "$ENG_SESSION:0" "PM ERROR ASSISTANCE for issue #$ISSUE_NUM:
+
+Error detected in your session. Please provide:
+1. Exact error message or exception
+2. What action triggered the error
+3. Current git status and branch
+4. Whether this blocks all progress or just current task
+
+Format: 'PM REPORT: ERROR - [detailed error info]'
+Respond within 30 seconds for immediate assistance."
+
+      sleep 35
+      ENG_RESPONSE=$(tmux capture-pane -t "$ENG_SESSION:0" -p | tail -15 | grep -A 10 "PM REPORT:" || echo "No response")
+      ENGINEER_RESPONSES["$ENG_SESSION"]="ERROR: $ENG_RESPONSE"
       ;;
   esac
+done
+
+# Compile comprehensive status report for orchestrator
+echo ""
+echo "=== ENGINEER STATUS COMPILATION ==="
+for eng_session in "${!ENGINEER_RESPONSES[@]}"; do
+  echo "Engineer $eng_session: ${ENGINEER_RESPONSES[$eng_session]}"
 done
 ```
 
@@ -170,15 +411,53 @@ done
 - **Identify blockers** that need resolution
 - **Check for completed issues** that unblock others
 
-### 3. **Resource Reallocation**
+### 3. **Resource Reallocation with Smart Reassignment**
 ```bash
-# If engineers complete work:
-1. **Update progress.md** with completion status
-2. **Sync to GitHub board**: /board-sync --issue {completed-issue-number}
-3. **Add changelog entry**: /changelog-add --type implementation --issue {completed-issue-number}
-4. **Kill completed engineer session**: tmux kill-session -t eng-{feature-name}-{completed-issue}
-5. **Check for newly unblocked issues**
-6. **Spawn new engineers** for newly ready issues (up to max 3)
+# When engineers complete work, immediately reassign to maintain relevant session names:
+
+# Detect completed issues from terminal output or file status
+COMPLETED_ISSUES=$(echo "$ENGINEER_STATUS" | jq -r '.[] | select(.terminal_content | contains("🎉 COMPLETED issue")) | .issue_number')
+
+for COMPLETED_ISSUE in $COMPLETED_ISSUES; do
+  COMPLETED_SESSION="eng-{feature-name}-$COMPLETED_ISSUE"
+  
+  echo "🎉 Detected completion of issue #$COMPLETED_ISSUE"
+  
+  # 1. Handle completion sync
+  /board-sync --issue $COMPLETED_ISSUE
+  /changelog-add --type implementation --issue $COMPLETED_ISSUE
+  
+  # 2. Kill the completed session
+  tmux kill-session -t "$COMPLETED_SESSION"
+  echo "✅ Session $COMPLETED_SESSION terminated"
+  
+  # 3. Check for newly unblocked issues
+  NEWLY_READY=$(analyze_dependencies_after_completion $COMPLETED_ISSUE)
+  
+  # 4. Immediately reassign engineer resource to next issue
+  if [ -n "$NEWLY_READY" ]; then
+    NEXT_ISSUE=$(echo "$NEWLY_READY" | head -1)
+    NEW_SESSION="eng-{feature-name}-$NEXT_ISSUE"
+    
+    echo "🔄 Reassigning to newly unblocked issue #$NEXT_ISSUE"
+    
+    # Create new session with validation
+    if spawn_validated_engineer "$NEXT_ISSUE"; then
+      echo "✅ Engineer successfully reassigned to $NEW_SESSION"
+    else
+      echo "❌ Failed to reassign engineer to issue #$NEXT_ISSUE - will try again next check-in"
+    fi
+  fi
+done
+
+# 5. Spawn additional engineers for remaining ready issues (maintain max 3)
+CURRENT_ENGINEERS=$(tmux list-sessions | grep "^eng-{feature-name}-" | wc -l)
+AVAILABLE_SLOTS=$((3 - $CURRENT_ENGINEERS))
+
+if [ $AVAILABLE_SLOTS -gt 0 ]; then
+  # Find ready issues not yet assigned
+  # Spawn new engineers up to capacity
+fi
 ```
 
 ### 4. **Sync Operations**
@@ -189,9 +468,97 @@ done
 - /changelog-add --type coordination --summary "PM update: {status summary}"
 ```
 
-### 5. **Schedule Next Check-in**
+### 5. **Prepare Orchestrator Report**
 ```bash
-./schedule_with_note.sh 5 "PM check for {feature-name}: Monitor engineers and coordinate resources"
+# When orchestrator requests status, provide comprehensive report
+prepare_orchestrator_report() {
+  echo "ORCHESTRATOR REPORT for {feature-name}:
+
+## Engineer Status Summary
+$(for eng_session in "${!ENGINEER_RESPONSES[@]}"; do
+  echo "- $eng_session: ${ENGINEER_RESPONSES[$eng_session]}"
+done)
+
+## Feature Progress
+- Issues in progress: $(echo "$ENGINEER_STATUS" | jq -r 'length')
+- Resource utilization: $(echo "$ENGINEER_STATUS" | jq -r 'length')/3 engineers
+- Health summary: $(echo "$ENGINEER_STATUS" | jq -r 'group_by(.estimated_health) | map({health: .[0].estimated_health, count: length}) | .[] | "\(.health): \(.count)"' | tr '\n' ' ')
+
+## Git Compliance
+$(for eng_session in "${!ENGINEER_RESPONSES[@]}"; do
+  if echo "${ENGINEER_RESPONSES[$eng_session]}" | grep -q "commit.*ago\|branch:"; then
+    echo "- $eng_session: $(echo "${ENGINEER_RESPONSES[$eng_session]}" | grep -o 'commit.*ago\|branch:.*' | head -1)"
+  else
+    echo "- $eng_session: Git status not reported"
+  fi
+done)
+
+## Blockers Requiring Assistance
+$(for eng_session in "${!ENGINEER_RESPONSES[@]}"; do
+  if echo "${ENGINEER_RESPONSES[$eng_session]}" | grep -qi "blocked\|stuck\|error\|help"; then
+    echo "- $eng_session: $(echo "${ENGINEER_RESPONSES[$eng_session]}" | grep -oi 'blocked.*\|stuck.*\|error.*' | head -1)"
+  fi
+done)
+
+## Resource Needs
+- Current capacity: $(echo "$ENGINEER_STATUS" | jq -r 'length')/3 engineers active
+- Ready for new engineers: $(if [ $(echo "$ENGINEER_STATUS" | jq -r 'length') -lt 3 ]; then echo "Yes, can spawn $((3 - $(echo "$ENGINEER_STATUS" | jq -r 'length'))) more"; else echo "No, at capacity"; fi)
+- Estimated completion: $(echo "${ENGINEER_RESPONSES[@]}" | grep -o '[0-9]\+.*hours\|[0-9]\+.*minutes' | head -1 || echo "Not reported")
+
+PM Assessment: $(if echo "${ENGINEER_RESPONSES[@]}" | grep -qi "error\|stuck\|blocked"; then echo "Feature has issues requiring orchestrator guidance"; else echo "Feature progressing normally"; fi)
+
+## Completion Status
+$(check_feature_completion)"
+}
+
+# Check if all feature work is complete
+check_feature_completion() {
+  # Count total issues in feature
+  TOTAL_ISSUES=$(find project-breakdown/features/{feature-name}/issues/ -name "*.md" | wc -l)
+  
+  # Count completed issues (check for both completion formats)
+  COMPLETED_ISSUES=$(find project-breakdown/features/{feature-name}/issues/ -name "*.md" -exec grep -l "\*\*Status\*\*.*COMPLETED\|Status: Completed" {} \; | wc -l)
+  
+  # Check if any engineers are still active
+  ACTIVE_ENGINEERS=$(echo "$ENGINEER_STATUS" | jq -r 'length')
+  
+  if [ "$COMPLETED_ISSUES" -eq "$TOTAL_ISSUES" ] && [ "$ACTIVE_ENGINEERS" -eq 0 ]; then
+    echo "🎉 FEATURE COMPLETE: All $TOTAL_ISSUES issues completed, no active engineers"
+    
+    # Signal completion to orchestrator  
+    echo "ORCHESTRATOR REPORT: FEATURE COMPLETE - {feature-name} has finished all issues ($COMPLETED_ISSUES/$TOTAL_ISSUES). No active engineers. PM ready for termination."
+    
+    # Update feature progress to 100%
+    /feature-progress-update --feature {feature-name} --status completed
+    
+    # Final board sync
+    /board-sync --feature {feature-name}
+    
+    # Final changelog entry
+    /changelog-add --type completion --summary "Feature {feature-name} completed: all issues finished and tested"
+    
+    # Mark self for termination
+    PM_READY_FOR_TERMINATION=true
+    return 0
+  else
+    echo "Feature in progress: $COMPLETED_ISSUES/$TOTAL_ISSUES issues complete, $ACTIVE_ENGINEERS engineers active"
+    return 1
+  fi
+}
+
+# Store report function for when orchestrator requests it
+ORCHESTRATOR_REPORT_READY=true
+```
+
+### 6. **Schedule Next Check-in (If Not Complete)**
+```bash
+# Only schedule next check-in if feature is not complete
+if [ "$PM_READY_FOR_TERMINATION" != "true" ]; then
+  ./scripts/schedule_with_note.sh 5 "PM check for {feature-name}: Monitor engineers and coordinate resources"
+  echo "Next check-in scheduled for {feature-name} PM agent"
+else
+  echo "🛑 Feature complete - no further check-ins scheduled. Waiting for orchestrator termination."
+fi
 ```
 ```
 
@@ -223,9 +590,10 @@ Report back to me every 30 minutes or when you hit blockers.
 **COMPLETION REQUIREMENTS**:
 1. All acceptance criteria met
 2. Tests passing
-3. Auto-sync to board: /board-sync --issue {issue-number}
-4. Add changelog: /changelog-add --type implementation --issue {issue-number}
-5. Notify me when complete
+3. Update issue file status to "✅ COMPLETED" with completion date
+4. Auto-sync to board: /board-sync --issue {issue-number}
+5. Add changelog: /changelog-add --type implementation --issue {issue-number}
+6. Use echo statements so I can detect completion during check-ins
 
 **ARCHITECTURE ALIGNMENT**:
 - Follow existing patterns from project-breakdown/context/patterns.md

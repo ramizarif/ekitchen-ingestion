@@ -18,7 +18,7 @@ Parse the arguments above to determine the monitoring action (--agents, --health
 
 ## What This Command Does
 
-This command uses the enhanced `tmux_utils.py` to provide deep monitoring capabilities that our bash-based system lacks:
+This command uses the enhanced `utils/tmux_utils.py` to provide deep monitoring capabilities that our bash-based system lacks:
 
 1. **Programmatic Agent Monitoring** - Capture actual terminal content from agents
 2. **Health Detection** - Analyze agent output to detect stuck/error states
@@ -32,7 +32,7 @@ This command uses the enhanced `tmux_utils.py` to provide deep monitoring capabi
 #!/bin/bash
 
 # Enhanced system monitoring with Python utilities
-MONITOR_SCRIPT="/Users/ramiz/ekitchen/ekitchen-ingestion/tmux_utils.py"
+MONITOR_SCRIPT="/Users/ramiz/ekitchen/ekitchen-ingestion/utils/tmux_utils.py"
 
 case "$1" in
   --agents|--detailed)

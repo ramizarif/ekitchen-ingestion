@@ -1,0 +1,1 @@
+"""Unit tests for Recipe Discovery MCP components"""

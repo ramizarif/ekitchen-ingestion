@@ -108,17 +108,17 @@ The system includes **programmatic health detection** via `tmux_utils.py`:
 ### **Agent Communication**
 ```bash
 # Use the enhanced message script for inter-agent communication
-./send-claude-message.sh {target-session}:0 "message"
+./scripts/send-claude-message.sh {target-session}:0 "message"
 
 # Examples:
-./send-claude-message.sh pm-recipe-search:0 "Status update needed"
-./send-claude-message.sh eng-user-auth-123:0 "Check dependency completion"
+./scripts/send-claude-message.sh pm-recipe-search:0 "Status update needed"
+./scripts/send-claude-message.sh eng-user-auth-123:0 "Check dependency completion"
 ```
 
 ### **Self-Scheduling**
 ```bash
 # Agents schedule autonomous check-ins every 5 minutes
-./schedule_with_note.sh 5 "Agent check: {your-specific-context}"
+./scripts/schedule_with_note.sh 5 "Agent check: {your-specific-context}"
 ```
 
 ## Important Behavioral Guidelines
@@ -168,7 +168,7 @@ git commit -m "Progress: [specific description of what was done]"
 /system-monitor --recovery
 
 # Or manual recovery
-python3 tmux_utils.py --kill-unresponsive
+python3 utils/tmux_utils.py --kill-unresponsive
 ```
 
 ### **If You're Stuck**

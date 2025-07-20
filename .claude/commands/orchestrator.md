@@ -34,9 +34,11 @@ You are the **entry point** for autonomous development. Users interact with you 
 # User tells you: "Work on issue #123"
 # You automatically:
 1. Read issue context from GitHub and local files
-2. Spawn Engineer agent directly for focused implementation
-3. Schedule check-ins every 5 minutes
-4. Auto-sync progress to boards and changelogs
+2. Determine feature from issue file location
+3. Spawn PM agent for the feature (NEVER skip PM layer)
+4. PM agent spawns and manages Engineer for the issue
+5. Schedule orchestrator check-ins every 5 minutes for strategic oversight
+6. PM handles tactical monitoring, Engineer handles implementation
 ```
 
 ## Usage Commands
@@ -104,9 +106,50 @@ tmux new-session -d -s pm-recipe-search
 tmux send-keys -t pm-recipe-search:0 'claude' Enter
 ```
 
-### Brief PM Agent
+### Brief PM Agent with Validation
 ```bash
-./send-claude-message.sh pm-recipe-search:0 "You are a Project Manager for the recipe-search feature. Read PROJECT_CONTEXT.md and project-breakdown/features/recipe-search/ then spawn engineers for ready issues. Schedule check-ins every 5 minutes."
+# Start Claude in PM session and validate it's working
+tmux send-keys -t pm-recipe-search:0 'claude' Enter
+
+# Wait for Claude to start and validate session is responsive
+echo "Validating PM agent is responsive..."
+
+# Wait longer for Claude to fully start
+sleep 5
+
+for i in {1..10}; do
+  echo "PM validation attempt $i/10..."
+  
+  # Check if there's unsent content in the command line
+  PANE_CONTENT=$(tmux capture-pane -t pm-recipe-search:0 -p | tail -5)
+  if echo "$PANE_CONTENT" | grep -q "Please respond with"; then
+    echo "⚠️ Detected unsent message - sending Enter key"
+    tmux send-keys -t pm-recipe-search:0 Enter
+    sleep 2
+  fi
+  
+  # Send a test message and check for response
+  ./scripts/send-claude-message.sh pm-recipe-search:0 "Please respond with 'PM_READY' to confirm you are active."
+  sleep 4
+  
+  # Check if Claude responded
+  RESPONSE=$(tmux capture-pane -t pm-recipe-search:0 -p | tail -15)
+  if echo "$RESPONSE" | grep -q "PM_READY"; then
+    echo "✅ PM agent confirmed responsive in pm-recipe-search:0"
+    break
+  fi
+  
+  if [ $i -eq 10 ]; then
+    echo "❌ PM agent failed to respond after 10 attempts - restarting session"
+    tmux kill-session -t pm-recipe-search 2>/dev/null
+    tmux new-session -d -s pm-recipe-search
+    tmux send-keys -t pm-recipe-search:0 'claude' Enter
+    sleep 5
+  fi
+done
+
+# Brief the confirmed responsive PM agent
+./scripts/send-claude-message.sh pm-recipe-search:0 "You are a Project Manager for the recipe-search feature. Read PROJECT_CONTEXT.md and project-breakdown/features/recipe-search/ then spawn engineers for ready issues. Schedule check-ins every 5 minutes."
 ```
 
 ### Create Engineer Session  
@@ -144,10 +187,11 @@ YOUR RESPONSIBILITIES:
 7. Schedule your own check-ins: ./schedule_with_note.sh 5 'PM check: {feature-name}'
 
 ENGINEER SPAWNING:
-- Use: tmux new-session -d -s eng-{feature}-{issue-number}
-- Brief engineers with issue context and implementation plans
+- Use: spawn_validated_engineer {issue-number} function for reliability
+- Validate each engineer is responsive before briefing
 - Maximum 3 engineers working simultaneously
 - Prioritize critical path issues first
+- Retry failed spawns once before marking as blocked
 
 INTEGRATION WITH EXISTING SYSTEMS:
 - Use /board-sync after engineer completions
@@ -188,6 +232,7 @@ COMPLETION CRITERIA:
 - All acceptance criteria met
 - Tests passing
 - Code follows established patterns
+- Issue file status updated to "✅ COMPLETED"
 - Board status synced to 'Done'
 - Changelog entry added
 
@@ -202,7 +247,7 @@ Begin by reading your issue file and implementation plan, then start coding."
 ### Your Check-in Schedule
 ```bash
 # Schedule yourself to check in every 5 minutes
-./schedule_with_note.sh 5 "Orchestrator check: Monitor all features and coordinate resources"
+./scripts/schedule_with_note.sh 5 "Orchestrator check: Monitor all features and coordinate resources"
 ```
 
 ### Check-in Tasks (Every 5 Minutes)
@@ -217,12 +262,12 @@ Begin by reading your issue file and implementation plan, then start coding."
 ### Cross-Feature Coordination with Enhanced Monitoring
 ```bash
 # Smart check-in: only do work if there are active agents
-SYSTEM_STATUS=$(python3 tmux_utils.py --snapshot)
+SYSTEM_STATUS=$(python3 utils/tmux_utils.py --snapshot)
 TOTAL_ACTIVE_AGENTS=$(echo "$SYSTEM_STATUS" | jq -r '.pm_agents | length + (.engineer_agents | length)')
 
 if [ "$TOTAL_ACTIVE_AGENTS" -eq 0 ]; then
   echo "No active autonomous agents detected. Scheduling longer check-in interval..."
-  ./schedule_with_note.sh 15 "Orchestrator check: Monitor for new autonomous work (extended interval - no active work)"
+  ./scripts/schedule_with_note.sh 15 "Orchestrator check: Monitor for new autonomous work (extended interval - no active work)"
   exit 0
 fi
 
@@ -240,7 +285,7 @@ UNRESPONSIVE=$(echo "$SYSTEM_STATUS" | jq -r '.pm_agents[] | select(.estimated_h
 if [ -n "$UNRESPONSIVE" ]; then
   echo "Detected unresponsive PM agents: $UNRESPONSIVE"
   # Auto-recovery: kill and restart unresponsive agents
-  python3 tmux_utils.py --kill-unresponsive
+  python3 utils/tmux_utils.py --kill-unresponsive
 fi
 
 # Intelligent resource coordination based on real data
@@ -251,7 +296,7 @@ if [ "$ENGINEERS_ACTIVE" -lt 3 ]; then
   
   # Send targeted messages to PM agents based on actual status
   echo "$PM_AGENTS" | jq -r '.[] | select(.estimated_health == "healthy") | .session_name' | while read PM_SESSION; do
-    ./send-claude-message.sh "$PM_SESSION:0" "Resource available: You can spawn $AVAILABLE_SLOTS more engineers. Check for ready issues."
+    ./scripts/send-claude-message.sh "$PM_SESSION:0" "Resource available: You can spawn $AVAILABLE_SLOTS more engineers. Check for ready issues."
   done
 fi
 
@@ -298,55 +343,50 @@ for ISSUE_NUM in $COMPLETED_ISSUES; do
   fi
 done
 
-# Intelligent feedback and guidance for engineers
-echo "Analyzing engineer progress and providing guidance..."
-echo "$ENGINEER_STATUS" | jq -r '.[] | select(.estimated_health != "unresponsive") | .session_name' | while read ENG_SESSION; do
-  ISSUE_NUM=$(echo "$ENGINEER_STATUS" | jq -r --arg session "$ENG_SESSION" 'select(.session_name == $session) | .issue_number')
-  HEALTH=$(echo "$ENGINEER_STATUS" | jq -r --arg session "$ENG_SESSION" 'select(.session_name == $session) | .estimated_health')
-  FEATURE=$(echo "$ENGINEER_STATUS" | jq -r --arg session "$ENG_SESSION" 'select(.session_name == $session) | .feature_name')
+# Monitor PM agents by reading their terminal output (passive monitoring)
+echo "Reading PM agent terminal output for status updates..."
+echo "$PM_AGENTS" | jq -r '.[] | select(.estimated_health != "unresponsive") | .session_name' | while read PM_SESSION; do
+  FEATURE=$(echo "$PM_AGENTS" | jq -r --arg session "$PM_SESSION" 'select(.session_name == $session) | .feature_name')
   
-  # MANDATORY GIT WORKFLOW CHECK - Every Check-in
-  echo "Enforcing git workflow for engineer $ENG_SESSION (issue #$ISSUE_NUM)..."
-  ./send-claude-message.sh "$ENG_SESSION:0" "ORCHESTRATOR GIT CHECK (every check-in):
-
-1. **Check your last commit time**: Run 'git log -1 --format=\"%cr\" --grep=\"issue-$ISSUE_NUM\"' 
-2. **If >30 minutes since last commit**: You MUST commit your current progress
-3. **Branch safety check**: Run 'git branch --show-current'
-   - If you're on 'development' or 'main': Create feature branch first with 'git checkout -b feature/issue-$ISSUE_NUM' 
-   - Then commit your work: 'git add -A && git commit -m \"feat(issue-$ISSUE_NUM): [describe your progress]\"'
-4. **If <30 minutes**: Continue working, but commit at next logical stopping point
-
-This check happens every 5 minutes to maintain proper git discipline."
-
-  # Health-based guidance
-  case "$HEALTH" in
-    "stuck")
-      echo "Engineer $ENG_SESSION appears stuck on issue #$ISSUE_NUM. Providing guidance..."
-      ./send-claude-message.sh "$ENG_SESSION:0" "ORCHESTRATOR GUIDANCE: You appear to be stuck. Please:
-1. Review the implementation plan in your issue file - are you following the step-by-step approach?
-2. Check project-breakdown/context/patterns.md for similar implementations
-3. Ensure you're following FastMCP async patterns from PROJECT_CONTEXT.md
-4. If blocked >15 minutes, describe your specific blocker for assistance
-5. Remember to commit your current progress every 15 minutes"
-      ;;
-    "healthy")
-      # Check if engineer has been working for >30 minutes without commits
-      LAST_COMMIT=$(cd . && git log --oneline --grep="issue-$ISSUE_NUM" -1 --since="30 minutes ago" || echo "")
-      if [ -z "$LAST_COMMIT" ]; then
-        echo "Engineer $ENG_SESSION working >30min without commits. Reinforcing git discipline..."
-        ./send-claude-message.sh "$ENG_SESSION:0" "ORCHESTRATOR REMINDER: Please commit your current progress. You should commit every 15 minutes or after completing logical units of work. Use: git add -A && git commit -m 'feat(issue-$ISSUE_NUM): [progress description]'"
-      fi
-      ;;
-    "error")
-      echo "Engineer $ENG_SESSION in error state. Providing troubleshooting guidance..."
-      ./send-claude-message.sh "$ENG_SESSION:0" "ORCHESTRATOR ASSISTANCE: Error detected. Please:
-1. Share the specific error you're encountering
-2. Check if you're following the eKitchen architectural patterns
-3. Verify your environment setup (MCP servers, dependencies)
-4. Review the acceptance criteria in your issue file
-5. If this is a blocking error, report details for immediate assistance"
-      ;;
-  esac
+  echo "Reading terminal output from $PM_SESSION for feature $FEATURE..."
+  # Passive monitoring - read PM terminal output instead of requesting status
+  PM_OUTPUT=$(tmux capture-pane -t "$PM_SESSION:0" -p | tail -50)
+  
+  echo "Recent PM activity from $PM_SESSION:"
+  echo "$PM_OUTPUT" | tail -10  # Show last 10 lines for orchestrator awareness
+  
+  # Parse output for important signals without disrupting PM workflow
+  if echo "$PM_OUTPUT" | grep -q "BLOCKED\|STUCK\|ERROR\|assistance"; then
+    echo "⚠️ $PM_SESSION shows signs of issues - analyzing..."
+    ISSUE_CONTEXT=$(echo "$PM_OUTPUT" | grep -A 3 -B 3 "BLOCKED\|STUCK\|ERROR\|assistance" | tail -5)
+    echo "Issue context: $ISSUE_CONTEXT"
+    
+    # Provide strategic guidance without disrupting PM workflow
+    ./scripts/send-claude-message.sh "$PM_SESSION:0" "ORCHESTRATOR GUIDANCE: I noticed potential issues in your recent output. Focus on architectural decisions, resource allocation, or cross-feature dependencies. Use existing patterns from project-breakdown/context/patterns.md."
+  fi
+  
+  # Check if PM reports feature completion
+  if echo "$PM_OUTPUT" | grep -q "FEATURE COMPLETE\|ALL ISSUES COMPLETE\|WORK FINISHED\|PM ready for termination"; then
+    echo "🎉 $PM_SESSION shows feature completion signals - terminating PM agent"
+    
+    # Kill the PM session
+    tmux kill-session -t "$PM_SESSION" 2>/dev/null
+    
+    # Kill any scheduled check-ins for this PM
+    # Find and kill background processes that target this PM session
+    pkill -f "tmux send-keys -t $PM_SESSION"
+    
+    echo "✅ PM agent $PM_SESSION terminated and check-ins stopped"
+    
+    # Update feature status to completed
+    echo "Feature $FEATURE marked as completed"
+  fi
+  
+  # Check for resource allocation requests
+  if echo "$PM_OUTPUT" | grep -q "need.*engineer\|capacity.*available\|spawn.*engineer"; then
+    echo "📊 $PM_SESSION requesting resource allocation"
+    # Resource availability already handled above in the allocation section
+  fi
 done
 ```
 ```
@@ -442,7 +482,7 @@ Would you like me to provide periodic updates or shall I work autonomously until
 "I'll start focused development on issue #123.
 
 1. **Reading issue context** from GitHub issue and local issue file
-2. **Spawning Engineer agent** directly in tmux session eng-issue-123:0  
+2. **Spawning PM agent for proper chain of command in tmux session eng-issue-123:0  
 3. **Briefing Engineer** with implementation plan and context
 4. **Scheduling check-ins** every 5 minutes
 

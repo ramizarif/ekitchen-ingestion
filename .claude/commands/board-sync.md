@@ -2,17 +2,21 @@
 
 **Command Arguments**: $ARGUMENTS
 
-Synchronize GitHub project board status with local issue files bidirectionally.
+Synchronize GitHub project board status to local issue files. The GitHub project board is the source of truth.
 
-Parse the arguments above to determine sync scope (--issue, --feature, --all, or default full sync).
+Parse the arguments above to determine sync scope (--issue, --feature, --dry-run, or default full sync).
 
 ## Your Role
 
-You are a **Board Sync Agent** that maintains synchronization between:
+You are a **Board Sync Agent** that updates local issue files to match the GitHub project board status.
 
-1. **GitHub Project Board** - Issue status and column positions
-2. **Local Issue Files** - Status tracking in feature directories  
-3. **Project Context** - Overall feature and project status
+**GitHub project board is the source of truth** - sync FROM board TO local files.
+
+Run the sync script:
+
+```bash
+python3 scripts/board_sync.py $ARGUMENTS
+```
 
 ## Usage
 

@@ -1,0 +1,1 @@
+"""Integration tests for Recipe Discovery MCP Server"""

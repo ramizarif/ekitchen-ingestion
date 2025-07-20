@@ -1,0 +1,88 @@
+{
+  "sites": {
+    "allrecipes.com": {
+      "name": "AllRecipes",
+      "base_url": "https://www.allrecipes.com",
+      "rate_limit": 1.0,
+      "timeout": 30,
+      "max_concurrent": 3,
+      "search_paths": [
+        "/search/results/?search={query}",
+        "/recipes/search/?q={query}"
+      ],
+      "recipe_url_patterns": [
+        "/recipe/\\d+/.*",
+        "/recipes/.*"
+      ],
+      "priority": "high",
+      "enabled": true
+    },
+    "foodnetwork.com": {
+      "name": "Food Network", 
+      "base_url": "https://www.foodnetwork.com",
+      "rate_limit": 0.5,
+      "timeout": 45,
+      "max_concurrent": 2,
+      "search_paths": [
+        "/search/results?q={query}"
+      ],
+      "recipe_url_patterns": [
+        "/recipes/.*"
+      ],
+      "priority": "high",
+      "enabled": true
+    },
+    "epicurious.com": {
+      "name": "Epicurious",
+      "base_url": "https://www.epicurious.com", 
+      "rate_limit": 2.0,
+      "timeout": 30,
+      "max_concurrent": 5,
+      "search_paths": [
+        "/search/{query}"
+      ],
+      "recipe_url_patterns": [
+        "/recipes/.*"
+      ],
+      "priority": "medium",
+      "enabled": true
+    },
+    "bbcgoodfood.com": {
+      "name": "BBC Good Food",
+      "base_url": "https://www.bbcgoodfood.com", 
+      "rate_limit": 1.5,
+      "timeout": 30,
+      "max_concurrent": 3,
+      "search_paths": [
+        "/search/recipes?q={query}"
+      ],
+      "recipe_url_patterns": [
+        "/recipes/.*"
+      ],
+      "priority": "medium",
+      "enabled": true
+    },
+    "taste.com.au": {
+      "name": "Taste.com.au",
+      "base_url": "https://www.taste.com.au", 
+      "rate_limit": 1.0,
+      "timeout": 30,
+      "max_concurrent": 2,
+      "search_paths": [
+        "/search/recipes?q={query}"
+      ],
+      "recipe_url_patterns": [
+        "/recipes/.*"
+      ],
+      "priority": "low",
+      "enabled": true
+    }
+  },
+  "global_settings": {
+    "max_total_concurrent": 10,
+    "default_timeout": 30,
+    "default_rate_limit": 2.0,
+    "max_urls_per_site": 50,
+    "user_agent": "eKitchen Recipe Discovery Bot 1.0"
+  }
+}
