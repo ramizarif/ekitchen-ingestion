@@ -9,9 +9,10 @@ You are now conducting an issue discovery session to create a well-defined GitHu
 ## Instructions
 
 ### Step 1: Load Questions and Template
-1. Read the questionnaire from `.ai/orchestrator/issue-discovery-questions.md`
-2. Load the issue template from `.ai/orchestrator/issue-creation-template.md`
-3. Prepare to conduct a thorough discovery session
+1. **Check existing features**: `ls project-breakdown/features/` to show available features
+2. Read the questionnaire from `.ai/orchestrator/issue-discovery-questions.md`
+3. Load the issue template from `.ai/orchestrator/issue-creation-template.md`
+4. Prepare to conduct a thorough discovery session
 
 ### Step 2: Conduct Discovery Session
 Follow the structured phases from the questionnaire:
@@ -47,11 +48,89 @@ Follow the structured phases from the questionnaire:
 
 ### Step 4: Create Issue Structure with Dependencies & Implementation Plan
 Using the responses, create a comprehensive issue following the enhanced template structure:
+
+**Feature Placement:**
+1. **If existing feature**: Place issue file in `project-breakdown/features/{feature-name}/issues/`
+2. **If new feature**: Create feature directory structure first:
+   - `project-breakdown/features/{feature-name}/`
+   - `project-breakdown/features/{feature-name}/issues/`
+   - `project-breakdown/features/{feature-name}/feature-summary.md`
+   - `project-breakdown/features/{feature-name}/progress.md`
+
+**Issue File Structure:**
 - Clear title with type and priority
 - Detailed overview and requirements
 - **Implementation Plan** - Step-by-step technical approach
 - **Dependencies Analysis** - Which issues must be completed first
-- **Technical specifications** 
+- **Technical specifications**
+
+### Step 5: Create GitHub Issue
+```bash
+# Create the GitHub issue to get URL for linking
+# Use: /create-issue --title "{title}" --body "{issue content}"
+# Capture the issue number and URL returned
+```
+
+### Step 6: Update Feature Files
+After creating the issue file and GitHub issue, update the feature tracking files:
+
+**1. Update issue-breakdown.md**
+```bash
+# Add new issue to: project-breakdown/features/{feature-name}/issue-breakdown.md
+# Add to appropriate sprint/priority section:
+- [ ] **Issue #{number}**: [Title](GitHub-URL) - Status: To Do
+
+# Update issue count totals
+```
+
+**2. Analyze Dependencies**
+```bash
+# Check existing issues in feature for dependencies:
+# Read: project-breakdown/features/{feature-name}/issues/*.md
+# Look for potential dependencies or blockers
+# Update both new issue and existing issues if dependencies found
+```
+
+**3. Update progress.md**
+```bash
+# Add to: project-breakdown/features/{feature-name}/progress.md
+# Update:
+- Total issue count
+- Current sprint backlog
+- Ready vs blocked issue counts
+- Overall completion percentage
+
+# Example addition:
+## Issue #{number}: {Title}
+- **Status**: To Do
+- **Priority**: {High/Medium/Low}
+- **Effort**: {Small/Medium/Large}
+- **Dependencies**: {List or None}
+- **Assigned**: Unassigned
+- **ETA**: TBD
+```
+
+**4. Update feature-summary.md (if scope changes)**
+```bash
+# Only if issue significantly changes feature scope:
+# Update: project-breakdown/features/{feature-name}/feature-summary.md
+# Add to scope or modify objectives if needed
+```
+
+### Step 7: Final Validation
+```bash
+# Verify all files are consistent:
+1. Issue file created in correct feature directory
+2. GitHub issue created and linked
+3. issue-breakdown.md updated with new issue
+4. progress.md reflects new total and status
+5. Dependencies analyzed and documented
+6. Feature scope updated if needed
+
+# Commit all changes:
+git add project-breakdown/features/{feature-name}/
+git commit -m "feat: add issue #{number} - {title}"
+```
 - Acceptance criteria with checkboxes
 - Testing requirements
 - **Autonomous Engineering Guidance** - Context for engineering agents

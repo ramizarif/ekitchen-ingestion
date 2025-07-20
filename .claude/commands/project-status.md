@@ -1,6 +1,6 @@
 # Project Status Command
 
-**Command Arguments**: $ARGUMENTS
+**Command Arguments**: #$ARGUMENTS
 
 Provide real-time status reports for projects, features, and autonomous development sessions.
 

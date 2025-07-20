@@ -1,6 +1,6 @@
 # System Monitor - Advanced Agent Health & Status Analysis
 
-**Command Arguments**: $ARGUMENTS
+**Command Arguments**: #$ARGUMENTS
 
 Provides comprehensive monitoring and health analysis of the autonomous development system using enhanced tmux utilities.
 

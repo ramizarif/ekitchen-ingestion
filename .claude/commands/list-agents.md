@@ -1,6 +1,6 @@
 # List Agents - View All Active Autonomous Agents
 
-**Command Arguments**: $ARGUMENTS
+**Command Arguments**: #$ARGUMENTS
 
 List all active autonomous agents with their health status, current work, and session information.
 

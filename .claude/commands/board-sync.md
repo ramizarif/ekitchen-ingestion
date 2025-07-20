@@ -1,6 +1,6 @@
 # Board Sync Command
 
-**Command Arguments**: $ARGUMENTS
+**Command Arguments**: #$ARGUMENTS
 
 Synchronize GitHub project board status to local issue files. The GitHub project board is the source of truth.
 
@@ -15,7 +15,7 @@ You are a **Board Sync Agent** that updates local issue files to match the GitHu
 Run the sync script:
 
 ```bash
-python3 scripts/board_sync.py $ARGUMENTS
+python3 scripts/board_sync.py #$ARGUMENTS
 ```
 
 ## Usage

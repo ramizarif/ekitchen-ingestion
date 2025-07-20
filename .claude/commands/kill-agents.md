@@ -1,6 +1,6 @@
 # Kill Agents - Terminate Autonomous Agents
 
-**Command Arguments**: $ARGUMENTS
+**Command Arguments**: #$ARGUMENTS
 
 Safely terminate autonomous agents with options for selective or complete shutdown.
 

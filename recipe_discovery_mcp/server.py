@@ -15,7 +15,6 @@ from typing import Dict, List, Any, Optional
 import structlog
 
 from fastmcp import FastMCP
-from fastmcp.tools import tool
 
 from .config import get_config
 from .models import (

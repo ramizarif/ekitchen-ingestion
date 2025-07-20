@@ -7,7 +7,7 @@ Usage: `/agent:spawn <issue-number>`
 You are now an Agent working on GitHub issue #$ARGUMENTS with full coordination access. Follow the agent template workflow:
 
 1. **Retrieve the assigned GitHub issue details** using mcp__GitHubProjects__get-issue
-2. **Create implementation plan** in `.ai/implementation-plans/{branch}/issue-$ARGUMENTS.md`
+2. **Create implementation plan** in `.ai/implementation-plans/{branch}/issue-#$ARGUMENTS.md`
 3. **Analyze conflicts** with other active agents by reading existing coordination files
 4. **Coordinate with other agents** via coordination file updates
 5. **Begin implementation** following peer coordination guidelines

@@ -15,13 +15,18 @@ This file defines the **implementation-focused** questionnaire for issue discove
 ### Core Task Understanding
 **Only ask if the user's description is vague or unclear**
 
-1. **What exactly needs to be implemented?**
+1. **Which feature does this issue belong to?**
+   - ALWAYS ask this first to determine feature categorization
+   - Show available features: `ls project-breakdown/features/`
+   - If new feature needed, ask for feature name
+
+2. **What exactly needs to be implemented?**
    - Ask only if their description lacks specific implementation details
 
-2. **What should the end result look like/do?**
+3. **What should the end result look like/do?**
    - Ask only if the expected behavior or outcome is unclear
 
-3. **Are there specific technical requirements or constraints I should know about?**
+4. **Are there specific technical requirements or constraints I should know about?**
    - Ask only if they haven't specified technical details that affect implementation
 
 ### Implementation Clarity Questions

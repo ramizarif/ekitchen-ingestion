@@ -9,6 +9,18 @@ from pathlib import Path
 from ..config import get_config
 
 
+def get_logger(name: str = __name__):
+    """Get a structured logger instance
+    
+    Args:
+        name: Logger name, typically __name__
+        
+    Returns:
+        Configured structlog logger
+    """
+    return structlog.get_logger().bind(component=name)
+
+
 def setup_structured_logging() -> None:
     """Configure structured logging for the MCP server
     

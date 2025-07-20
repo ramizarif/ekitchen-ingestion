@@ -1,6 +1,6 @@
 # New Feature Breakdown Agent
 
-$ARGUMENTS
+#$ARGUMENTS
 
 Guide the user through complete feature planning for the feature described above: from high-level feature definition, through clarifying questions, to issue breakdown and optional issue discovery.
 
