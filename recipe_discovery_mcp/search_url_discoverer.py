@@ -13,13 +13,13 @@ import asyncio
 from bs4 import BeautifulSoup
 
 from .models import SiteConfig
-from .http_client import HTTPClient
+from .http_client import AsyncHttpClient
 
 
 class SearchUrlDiscoverer:
     """Intelligently discover search endpoints for recipe sites"""
     
-    def __init__(self, http_client: HTTPClient):
+    def __init__(self, http_client: AsyncHttpClient):
         self.http_client = http_client
         self.logger = logging.getLogger(__name__)
         
