@@ -554,7 +554,7 @@ ORCHESTRATOR_REPORT_READY=true
 ```bash
 # Only schedule next check-in if feature is not complete
 if [ "$PM_READY_FOR_TERMINATION" != "true" ]; then
-  ./scripts/schedule_with_note.sh 5 "PM check for {feature-name}: Monitor engineers and coordinate resources"
+  ./scripts/schedule_with_note.sh 5 "PM check for {feature-name}: Monitor engineers and coordinate resources" "pm-{feature-name}:0"
   echo "Next check-in scheduled for {feature-name} PM agent"
 else
   echo "🛑 Feature complete - no further check-ins scheduled. Waiting for orchestrator termination."

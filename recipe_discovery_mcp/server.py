@@ -3,10 +3,13 @@
 Provides conversational AI interface for recipe scraping and data collection
 using the recipe-scrapers library with comprehensive error handling and
 structured logging.
+
+Enhanced with multi-site discovery engine for Issue #7.
 """
 
 import asyncio
 import uuid
+import time
 from datetime import datetime
 from typing import Dict, List, Any, Optional
 import structlog
@@ -15,8 +18,15 @@ from fastmcp import FastMCP
 from fastmcp.tools import tool
 
 from .config import get_config
-from .models import RecipeData, ScrapingRequest, ScrapingResponse, ServerHealth
+from .models import (
+    RecipeData, ScrapingRequest, ScrapingResponse, ServerHealth,
+    DiscoveryConfig, DiscoveryResult, BatchDiscoveryRequest, BatchDiscoveryResponse
+)
 from .scraper import RecipeScrapingService
+from .site_manager import SiteManager
+from .url_manager import UrlManager
+from .discovery_engine import MultiSiteDiscoveryEngine
+from .http_client import AsyncHttpClient
 from .utils.error_handling import (
     handle_scraping_errors,
     MCPError,
@@ -52,9 +62,22 @@ class RecipeDiscoveryMCP:
         # Setup logging
         setup_structured_logging()
         
-        # Initialize scraping service
+        # Initialize services
         self.scraping_service = RecipeScrapingService(
             max_concurrent=self.config.max_concurrent_requests
+        )
+        
+        # Initialize multi-site discovery components (Issue #7)
+        self.http_client = AsyncHttpClient(
+            timeout=self.config.request_timeout,
+            max_concurrent=self.config.max_concurrent_requests
+        )
+        self.site_manager = SiteManager()
+        self.url_manager = UrlManager(self.site_manager, self.http_client)
+        self.discovery_engine = MultiSiteDiscoveryEngine(
+            self.site_manager, 
+            self.url_manager, 
+            self.scraping_service
         )
         
         # Register MCP tools
@@ -75,6 +98,13 @@ class RecipeDiscoveryMCP:
         self.server.register_tool(self.scrape_recipe_batch)
         self.server.register_tool(self.test_scraping_service)
         self.server.register_tool(self.get_scraping_stats)
+        
+        # Multi-site discovery tools (Issue #7)
+        self.server.register_tool(self.discover_recipes)
+        self.server.register_tool(self.get_available_sites)
+        self.server.register_tool(self.discover_urls_only)
+        self.server.register_tool(self.test_discovery_engine)
+        self.server.register_tool(self.batch_discover_recipes)
         
         self.logger.info("MCP tools registered successfully")
     
@@ -469,6 +499,432 @@ class RecipeDiscoveryMCP:
             tracker.log_error(e)
             return create_error_response(e, {"operation": "get_scraping_stats"})
     
+    # Multi-site discovery tools (Issue #7)
+    
+    @tool(
+        name="discover_recipes",
+        description="Discover and scrape recipes across multiple sites for a query"
+    )
+    @handle_scraping_errors
+    async def discover_recipes(
+        self,
+        query: str,
+        max_urls_per_site: int = 50,
+        sites: Optional[List[str]] = None,
+        validate_urls: bool = True,
+        max_total_concurrent: int = 10
+    ) -> Dict[str, Any]:
+        """Discover recipes across multiple sites for a query
+        
+        Args:
+            query: Search query for recipe discovery
+            max_urls_per_site: Maximum URLs to discover per site
+            sites: Specific site domains to search (None for all enabled)
+            validate_urls: Whether to validate discovered URLs
+            max_total_concurrent: Maximum concurrent operations
+            
+        Returns:
+            Discovery results with recipes and metadata
+        """
+        tracker = create_request_tracker(str(uuid.uuid4()), "discover_recipes")
+        tracker.log_start()
+        
+        try:
+            self.active_requests += 1
+            self.total_requests += 1
+            
+            # Create discovery configuration
+            config = DiscoveryConfig(
+                max_urls_per_site=max_urls_per_site,
+                target_sites=sites,
+                validate_urls=validate_urls,
+                max_total_concurrent=max_total_concurrent
+            )
+            
+            # Execute discovery
+            start_time = time.time()
+            result = await self.discovery_engine.discover_recipes(query, config)
+            processing_time = time.time() - start_time
+            
+            # Prepare response
+            response_data = {
+                "success": True,
+                "job_id": result.job.job_id,
+                "query": query,
+                "summary": result.summary,
+                "recipes": [recipe.to_json() for recipe in result.recipes],
+                "site_summaries": result.site_summaries,
+                "url_discovery_results": {
+                    domain: {
+                        "discovered_urls": url_result.discovered_urls,
+                        "url_count": url_result.url_count,
+                        "success": url_result.success
+                    }
+                    for domain, url_result in result.url_discovery_results.items()
+                },
+                "processing_time": processing_time,
+                "timestamp": datetime.now().isoformat()
+            }
+            
+            tracker.log_success(
+                total_recipes=len(result.recipes),
+                successful_recipes=len(result.get_successful_recipes()),
+                sites_processed=len(result.site_summaries),
+                processing_time=processing_time
+            )
+            
+            return response_data
+            
+        except Exception as e:
+            tracker.log_error(e)
+            return create_error_response(e, {
+                "operation": "discover_recipes", 
+                "query": query,
+                "max_urls_per_site": max_urls_per_site
+            })
+        finally:
+            self.active_requests -= 1
+    
+    @tool(
+        name="get_available_sites",
+        description="Get list of available recipe sites and their configurations"
+    )
+    @handle_scraping_errors
+    async def get_available_sites(self) -> Dict[str, Any]:
+        """Get list of available recipe sites
+        
+        Returns:
+            Dictionary with available sites and their configurations
+        """
+        tracker = create_request_tracker(str(uuid.uuid4()), "get_available_sites")
+        tracker.log_start()
+        
+        try:
+            enabled_sites = self.site_manager.get_enabled_sites()
+            all_sites = self.site_manager.sites
+            
+            site_info = []
+            for site in enabled_sites:
+                site_info.append({
+                    "domain": site.domain,
+                    "name": site.name,
+                    "priority": site.priority,
+                    "rate_limit": site.rate_limit,
+                    "max_concurrent": site.max_concurrent,
+                    "search_paths_count": len(site.search_paths),
+                    "recipe_patterns_count": len(site.recipe_url_patterns),
+                    "enabled": site.enabled
+                })
+            
+            disabled_sites = []
+            for domain, site in all_sites.items():
+                if not site.enabled:
+                    disabled_sites.append({
+                        "domain": site.domain,
+                        "name": site.name,
+                        "enabled": site.enabled
+                    })
+            
+            result = {
+                "success": True,
+                "enabled_sites": site_info,
+                "disabled_sites": disabled_sites,
+                "total_sites": len(all_sites),
+                "enabled_count": len(enabled_sites),
+                "disabled_count": len(disabled_sites),
+                "site_manager_stats": self.site_manager.get_stats(),
+                "timestamp": datetime.now().isoformat()
+            }
+            
+            tracker.log_success(
+                enabled_sites=len(enabled_sites),
+                total_sites=len(all_sites)
+            )
+            
+            return result
+            
+        except Exception as e:
+            tracker.log_error(e)
+            return create_error_response(e, {"operation": "get_available_sites"})
+    
+    @tool(
+        name="discover_urls_only",
+        description="Discover recipe URLs without scraping content (faster for URL exploration)"
+    )
+    @handle_scraping_errors
+    async def discover_urls_only(
+        self,
+        query: str,
+        max_urls_per_site: int = 50,
+        sites: Optional[List[str]] = None
+    ) -> Dict[str, Any]:
+        """Discover recipe URLs without scraping content
+        
+        Args:
+            query: Search query for URL discovery
+            max_urls_per_site: Maximum URLs to discover per site
+            sites: Specific site domains to search (None for all enabled)
+            
+        Returns:
+            Dictionary with discovered URLs by site
+        """
+        tracker = create_request_tracker(str(uuid.uuid4()), "discover_urls_only")
+        tracker.log_start()
+        
+        try:
+            self.active_requests += 1
+            
+            start_time = time.time()
+            discovered_urls = await self.url_manager.discover_recipe_urls(
+                query=query,
+                max_urls_per_site=max_urls_per_site,
+                sites=sites
+            )
+            processing_time = time.time() - start_time
+            
+            total_urls = sum(len(urls) for urls in discovered_urls.values())
+            sites_with_results = len([urls for urls in discovered_urls.values() if urls])
+            
+            result = {
+                "success": True,
+                "query": query,
+                "discovered_urls": discovered_urls,
+                "summary": {
+                    "total_urls": total_urls,
+                    "sites_searched": len(discovered_urls),
+                    "sites_with_results": sites_with_results,
+                    "avg_urls_per_site": total_urls / len(discovered_urls) if discovered_urls else 0,
+                    "processing_time": processing_time
+                },
+                "url_manager_stats": self.url_manager.get_stats(),
+                "timestamp": datetime.now().isoformat()
+            }
+            
+            tracker.log_success(
+                total_urls=total_urls,
+                sites_searched=len(discovered_urls),
+                processing_time=processing_time
+            )
+            
+            return result
+            
+        except Exception as e:
+            tracker.log_error(e)
+            return create_error_response(e, {
+                "operation": "discover_urls_only",
+                "query": query,
+                "max_urls_per_site": max_urls_per_site
+            })
+        finally:
+            self.active_requests -= 1
+    
+    @tool(
+        name="test_discovery_engine",
+        description="Test multi-site discovery engine with a simple query"
+    )
+    @handle_scraping_errors
+    async def test_discovery_engine(self) -> Dict[str, Any]:
+        """Test discovery engine with a simple query
+        
+        Returns:
+            Test results with engine status and performance data
+        """
+        tracker = create_request_tracker(str(uuid.uuid4()), "test_discovery_engine")
+        tracker.log_start()
+        
+        try:
+            self.active_requests += 1
+            
+            test_query = "chicken recipe"
+            config = DiscoveryConfig(
+                max_urls_per_site=5,
+                target_sites=["allrecipes.com"],
+                validate_urls=False,
+                max_total_concurrent=3
+            )
+            
+            start_time = time.time()
+            result = await self.discovery_engine.discover_recipes(test_query, config)
+            test_time = time.time() - start_time
+            
+            successful_recipes = result.get_successful_recipes()
+            engine_stats = self.discovery_engine.get_stats()
+            
+            test_report = {
+                "success": True,
+                "test_query": test_query,
+                "test_config": {
+                    "max_urls_per_site": config.max_urls_per_site,
+                    "target_sites": config.target_sites,
+                    "validate_urls": config.validate_urls
+                },
+                "test_results": {
+                    "total_recipes": len(result.recipes),
+                    "successful_recipes": len(successful_recipes),
+                    "failed_recipes": len(result.get_failed_recipes()),
+                    "success_rate": f"{len(successful_recipes)/len(result.recipes)*100:.1f}%" if result.recipes else "0%",
+                    "sites_processed": len(result.site_summaries),
+                    "test_duration_seconds": round(test_time, 2)
+                },
+                "engine_status": "operational" if successful_recipes else "degraded",
+                "engine_stats": engine_stats,
+                "sample_recipes": [
+                    {
+                        "url": recipe.url,
+                        "title": recipe.title,
+                        "site_domain": recipe.site_domain,
+                        "ingredients_count": len(recipe.ingredients),
+                        "quality_score": recipe.get_quality_score()
+                    }
+                    for recipe in successful_recipes[:3]  # First 3 successful recipes
+                ],
+                "timestamp": datetime.now().isoformat()
+            }
+            
+            tracker.log_success(
+                engine_status=test_report["engine_status"],
+                successful_recipes=len(successful_recipes),
+                test_duration=test_time
+            )
+            
+            return test_report
+            
+        except Exception as e:
+            tracker.log_error(e)
+            return create_error_response(e, {"operation": "test_discovery_engine"})
+        finally:
+            self.active_requests -= 1
+    
+    @tool(
+        name="batch_discover_recipes",
+        description="Discover recipes for multiple queries in batch"
+    )
+    @handle_scraping_errors
+    async def batch_discover_recipes(
+        self,
+        queries: List[str],
+        max_urls_per_site: int = 25,
+        sites: Optional[List[str]] = None,
+        validate_urls: bool = True,
+        parallel_jobs: int = 3
+    ) -> Dict[str, Any]:
+        """Discover recipes for multiple queries in batch
+        
+        Args:
+            queries: List of search queries
+            max_urls_per_site: Maximum URLs to discover per site per query
+            sites: Specific site domains to search (None for all enabled)
+            validate_urls: Whether to validate discovered URLs
+            parallel_jobs: Number of parallel discovery jobs
+            
+        Returns:
+            Batch discovery results with statistics
+        """
+        tracker = create_request_tracker(str(uuid.uuid4()), "batch_discover_recipes")
+        tracker.log_start()
+        
+        try:
+            self.active_requests += 1
+            
+            if not queries:
+                raise MCPError("No queries provided for batch discovery")
+            
+            if len(queries) > 20:  # Reasonable limit
+                raise MCPError(f"Too many queries ({len(queries)}). Maximum 20 queries per batch.")
+            
+            # Create discovery configuration
+            config = DiscoveryConfig(
+                max_urls_per_site=max_urls_per_site,
+                target_sites=sites,
+                validate_urls=validate_urls,
+                max_total_concurrent=min(8, parallel_jobs * 2)  # Adjust concurrency
+            )
+            
+            # Execute batch discovery with concurrency control
+            start_time = time.time()
+            semaphore = asyncio.Semaphore(parallel_jobs)
+            
+            async def discover_single_query(query: str) -> DiscoveryResult:
+                async with semaphore:
+                    return await self.discovery_engine.discover_recipes(query, config)
+            
+            # Execute all queries concurrently
+            discovery_tasks = [discover_single_query(query) for query in queries]
+            results = await asyncio.gather(*discovery_tasks, return_exceptions=True)
+            
+            processing_time = time.time() - start_time
+            
+            # Process results
+            successful_results = []
+            failed_results = []
+            total_recipes = 0
+            
+            for i, result in enumerate(results):
+                query = queries[i]
+                if isinstance(result, Exception):
+                    failed_results.append({
+                        "query": query,
+                        "error": str(result)
+                    })
+                else:
+                    successful_results.append(result)
+                    total_recipes += len(result.recipes)
+            
+            # Create batch response
+            batch_response = {
+                "success": True,
+                "batch_summary": {
+                    "total_queries": len(queries),
+                    "successful_queries": len(successful_results),
+                    "failed_queries": len(failed_results),
+                    "success_rate": f"{len(successful_results)/len(queries)*100:.1f}%",
+                    "total_recipes": total_recipes,
+                    "avg_recipes_per_query": total_recipes / len(successful_results) if successful_results else 0,
+                    "processing_time": processing_time
+                },
+                "query_results": [
+                    {
+                        "query": result.job.query,
+                        "job_id": result.job.job_id,
+                        "summary": result.summary,
+                        "recipe_count": len(result.recipes),
+                        "successful_recipes": len(result.get_successful_recipes())
+                    }
+                    for result in successful_results
+                ],
+                "failed_queries": failed_results,
+                "aggregated_stats": {
+                    "total_sites_processed": len(set(
+                        site_domain 
+                        for result in successful_results 
+                        for site_domain in result.site_summaries.keys()
+                    )),
+                    "total_urls_discovered": sum(
+                        result.summary.get("total_urls_discovered", 0)
+                        for result in successful_results
+                    )
+                },
+                "timestamp": datetime.now().isoformat()
+            }
+            
+            tracker.log_success(
+                total_queries=len(queries),
+                successful_queries=len(successful_results),
+                total_recipes=total_recipes,
+                processing_time=processing_time
+            )
+            
+            return batch_response
+            
+        except Exception as e:
+            tracker.log_error(e)
+            return create_error_response(e, {
+                "operation": "batch_discover_recipes",
+                "query_count": len(queries) if queries else 0
+            })
+        finally:
+            self.active_requests -= 1
+    
     async def start(self) -> None:
         """Start the MCP server with stdio transport
         
@@ -496,10 +952,23 @@ class RecipeDiscoveryMCP:
         """
         try:
             self.logger.info("Shutting down MCP server")
-            log_server_shutdown()
             
-            # Cleanup any resources if needed
-            # (Currently no explicit cleanup required for stdio transport)
+            # Cleanup discovery engine resources
+            if hasattr(self, 'http_client'):
+                await self.http_client.close()
+            
+            if hasattr(self, 'scraping_service'):
+                await self.scraping_service.close()
+            
+            # Log final statistics
+            if hasattr(self, 'discovery_engine'):
+                engine_stats = self.discovery_engine.get_stats()
+                self.logger.info(
+                    "Discovery engine final statistics",
+                    **engine_stats
+                )
+            
+            log_server_shutdown()
             
         except Exception as e:
             self.logger.error(
