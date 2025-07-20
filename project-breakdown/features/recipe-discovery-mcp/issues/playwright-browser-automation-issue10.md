@@ -4,9 +4,10 @@
 **Feature**: Recipe Discovery MCP  
 **Type**: Feature Enhancement  
 **Priority**: High  
-**Status**: 🔄 In Progress  
+**Status**: ✅ COMPLETED  
 **Effort**: Medium (1 day)  
 **Created**: 2025-07-20  
+**Completed**: 2025-07-20  
 
 ## Overview
 
@@ -156,6 +157,51 @@ No Hanging, No HTTP Discovery
 5. **Integration**: Smooth coordination with external Playwright MCP for cache population
 
 ## Post-Implementation
+
+### External Playwright MCP Setup Guide
+
+#### 1. Install Microsoft Playwright MCP
+```bash
+# Add to your Claude Desktop MCP configuration
+{
+  "mcpServers": {
+    "playwright": {
+      "command": "npx",
+      "args": ["-y", "@microsoft/mcp-server-playwright"]
+    },
+    "recipe-discovery": {
+      "command": "python",
+      "args": ["-m", "recipe_discovery_mcp.server"]
+    }
+  }
+}
+```
+
+#### 2. Cache Population Workflow
+```bash
+# Step 1: Get uncached sites
+recipe_discovery_mcp.populate_search_url_cache()
+
+# Step 2: For each uncached site, use Playwright MCP:
+playwright.navigate_to(url="https://allrecipes.com")
+playwright.find_element(selector="input[type='search']")
+playwright.type_text(text="pasta recipes")
+playwright.click_element(selector="button[type='submit']")
+# Capture resulting URL pattern
+
+# Step 3: Store discovered URLs back in Recipe Discovery MCP
+recipe_discovery_mcp.update_search_url_cache(domain="allrecipes.com", urls=["discovered_pattern"])
+```
+
+#### 3. Usage Examples
+```bash
+# Cache-only recipe discovery (no hanging)
+recipe_discovery_mcp.discover_recipes(query="pasta recipes", cached_only=True)
+
+# Check cache status
+recipe_discovery_mcp.get_cached_sites()
+recipe_discovery_mcp.get_search_url_cache_stats()
+```
 
 ### Monitoring
 - Recipe discovery success rates
