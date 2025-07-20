@@ -30,16 +30,39 @@ spawn_validated_engineer() {
   tmux send-keys -t "$session_name:0" 'claude' Enter
   sleep 5
   
-  # Validate responsive
+  # Validate responsive with robust error checking
   for i in {1..8}; do
     ./scripts/send-claude-message.sh "$session_name:0" "Please respond with 'ENGINEER_READY'"
     sleep 3
-    if tmux capture-pane -t "$session_name:0" -p | grep -q "ENGINEER_READY"; then
+    
+    # Capture full terminal output
+    TERMINAL_OUTPUT=$(tmux capture-pane -t "$session_name:0" -p)
+    
+    # Check for error conditions first
+    if echo "$TERMINAL_OUTPUT" | grep -qi "error\|failed\|exception\|command not found\|no such file"; then
+      echo "❌ Engineer session has errors: $session_name"
+      tmux kill-session -t "$session_name"
+      return 1
+    fi
+    
+    # Check for Claude not running
+    if echo "$TERMINAL_OUTPUT" | grep -qi "bash.*\$\|zsh.*\$" && ! echo "$TERMINAL_OUTPUT" | grep -q "claude"; then
+      echo "❌ Claude not running in engineer session: $session_name"
+      tmux kill-session -t "$session_name"
+      return 1
+    fi
+    
+    # Check for successful response
+    if echo "$TERMINAL_OUTPUT" | grep -q "ENGINEER_READY"; then
+      echo "✅ Engineer session validated: $session_name"
       # Send slash command with issue number
       ./scripts/send-claude-message.sh "$session_name:0" "/engineer-agent --issue $issue_number"
       return 0
     fi
   done
+  
+  echo "❌ Engineer session failed validation after 8 attempts: $session_name"
+  tmux kill-session -t "$session_name"
   return 1
 }
 ```
@@ -51,61 +74,37 @@ spawn_validated_engineer() {
 
 ## Check-in Process (Every 5 minutes)
 
-### 1. Engineer Status Check
+### 1. Engineer Status Check  
 ```bash
-# For each engineer session:
-./scripts/send-claude-message.sh "$ENG_SESSION:0" "PM STATUS REQUEST: Report phase, progress %, blockers, ETA. Format: 'PM REPORT: [status]'"
-sleep 35
+# For each engineer session - send structured status request
+echo "📊 Requesting engineer status reports..."
 
-ENG_RESPONSE=$(tmux capture-pane -t "$ENG_SESSION:0" -p | tail -15 | grep -A 10 "PM REPORT:")
-FULL_TERMINAL=$(tmux capture-pane -t "$ENG_SESSION:0" -p | tail -50)
+for ENG_SESSION in $(tmux list-sessions 2>/dev/null | grep "eng-$FEATURE_NAME" | cut -d: -f1); do
+  echo "Requesting structured report from: $ENG_SESSION"
+  ./scripts/send-claude-message.sh "$ENG_SESSION:0" "/engineer-status-request"
+done
+
+# Engineer will receive slash command with clear instructions on:
+# 1. What status information to provide
+# 2. How to capture terminal context
+# 3. Exact command format to send upstream report
+# 4. Example of proper response format
+
+echo "✅ Status request commands sent - engineers have clear instructions"
+echo "⏳ Awaiting engineer reports via /engineer-report slash commands"
 ```
 
-### 2. Implementation Plan Alignment  
+### 2. Awaiting Engineer Reports
 ```bash
-# Read implementation plan and check engineer alignment
-ISSUE_FILE="project-breakdown/features/$FEATURE_NAME/issues/issue$ISSUE_NUM.md"
-IMPLEMENTATION_PLAN=$(grep -A 50 "## Implementation Plan" "$ISSUE_FILE")
+# Status check and analysis now handled by /engineer-report slash command
+# This command will:
+# 1. Receive engineer status and 300 lines of context
+# 2. Analyze engineer state (completed/blocked/in_progress/unclear)  
+# 3. Send appropriate guidance via /engineer-guidance or /engineer-validation
+# 4. Handle completion workflow automatically
+# 5. Schedule next check-in
 
-# Send course correction if misaligned
-```
-
-### 3. Completion Detection & Validation
-```bash
-if echo "$FULL_TERMINAL" | grep -q "🎉 COMPLETED issue #"; then
-  # MANDATORY: Test validation before accepting completion
-  ./scripts/send-claude-message.sh "$ENG_SESSION:0" "PM VALIDATION REQUIRED:
-
-Your work is NOT complete until you prove it works.
-
-MANDATORY TESTING:
-1. Run the full test suite and show ALL tests pass
-2. Manually test the functionality you implemented  
-3. Verify ALL acceptance criteria from your issue file
-4. Show the feature working end-to-end
-
-Report back with: 'PM VALIDATION: All tests pass, functionality verified, acceptance criteria met'
-
-DO NOT claim completion until you prove it works."
-
-  sleep 45
-  
-  VALIDATION_RESPONSE=$(tmux capture-pane -t "$ENG_SESSION:0" -p | tail -20)
-  
-  if echo "$VALIDATION_RESPONSE" | grep -q "PM VALIDATION.*tests pass.*functionality verified"; then
-    # Accept completion, sync, and reassign
-    tmux kill-session -t "$ENG_SESSION"
-    /board-sync --issue $ISSUE_NUM
-    /changelog-add --type implementation --issue $ISSUE_NUM
-    
-    # Spawn engineer for next ready issue
-    if spawn_validated_engineer "$NEXT_READY_ISSUE"; then
-      echo "Engineer reassigned to next issue"
-    fi
-  else
-    ./scripts/send-claude-message.sh "$ENG_SESSION:0" "COMPLETION REJECTED: You must test and validate your work before claiming completion."
-  fi
-fi
+echo "✅ Check-in complete - status analysis handled by engineer reports"
 ```
 
 ### 4. Feature Completion Check

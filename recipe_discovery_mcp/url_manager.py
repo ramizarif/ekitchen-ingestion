@@ -174,55 +174,52 @@ class UrlManager:
         )
         
         try:
-            # Get search URLs for this site
-            search_urls = self.site_manager.build_search_urls(site, query)
+            # Get search URLs for this site (use enhanced method if available)
+            if hasattr(self.site_manager, 'build_search_urls_enhanced'):
+                search_urls = await self.site_manager.build_search_urls_enhanced(site, query)
+            else:
+                search_urls = self.site_manager.build_search_urls(site, query)
             if not search_urls:
-                self.logger.warning(
-                    "No search URLs generated for site",
-                    site_domain=site.domain
-                )
-                return []
+                self.logger.warning(f"No search URLs available for {site.domain}")
+                return await self._heuristic_recipe_discovery(site, query, max_urls)
                 
-            # Search each search URL and collect recipe URLs
-            all_recipe_urls = set()
-            for search_url in search_urls:
-                if len(all_recipe_urls) >= max_urls:
-                    break
-                    
+            # Try each search URL until one succeeds
+            for i, search_url in enumerate(search_urls):
                 try:
-                    recipe_urls = await self._extract_recipe_urls_from_search(
-                        search_url, site, max_urls - len(all_recipe_urls)
-                    )
-                    all_recipe_urls.update(recipe_urls)
+                    self.logger.debug(f"Trying search URL {i+1}/{len(search_urls)}: {search_url}")
                     
+                    recipe_urls = await self._extract_recipe_urls_from_search(
+                        search_url, site, max_urls
+                    )
+                    
+                    if recipe_urls:
+                        # Success - mark URL as working and return results
+                        await self.site_manager.mark_search_url_success(site, search_url)
+                        
+                        self.logger.info(
+                            f"Successful discovery from {site.domain}",
+                            search_url=search_url,
+                            urls_found=len(recipe_urls)
+                        )
+                        return list(recipe_urls)
+                        
                 except Exception as e:
-                    self.logger.error(
-                        "Failed to extract URLs from search page",
+                    # Mark this search URL as failed
+                    await self.site_manager.mark_search_url_failed(site, search_url)
+                    
+                    self.logger.warning(
+                        f"Search URL failed for {site.domain}",
                         search_url=search_url,
-                        site_domain=site.domain,
                         error=str(e)
                     )
                     continue
                     
-            # Convert to list and limit to max_urls
-            result_urls = list(all_recipe_urls)[:max_urls]
-            
-            self.logger.info(
-                "URL discovery completed for site",
-                site_domain=site.domain,
-                urls_discovered=len(result_urls),
-                search_pages_processed=len(search_urls)
-            )
-            
-            return result_urls
+            # All configured search URLs failed - try heuristic discovery
+            self.logger.warning(f"All search URLs failed for {site.domain}, trying heuristic discovery")
+            return await self._heuristic_recipe_discovery(site, query, max_urls)
             
         except Exception as e:
-            self.logger.error(
-                "Failed to discover URLs for site",
-                site_domain=site.domain,
-                error_type=type(e).__name__,
-                error_message=str(e)
-            )
+            self.logger.error(f"Complete discovery failure for {site.domain}: {e}")
             return []
             
     async def _extract_recipe_urls_from_search(
@@ -656,6 +653,110 @@ class UrlManager:
                 error=str(e)
             )
             return False
+            
+    async def _heuristic_recipe_discovery(
+        self, 
+        site: SiteConfig, 
+        query: str, 
+        max_urls: int
+    ) -> List[str]:
+        """Fallback heuristic recipe discovery when all else fails"""
+        
+        self.logger.info(f"Starting heuristic discovery for {site.domain}")
+        
+        try:
+            # Strategy 1: Try to find recipes from homepage or category pages
+            homepage_recipes = await self._discover_from_homepage(site, max_urls // 2)
+            
+            # Strategy 2: Try common recipe category paths
+            category_recipes = await self._discover_from_categories(site, max_urls // 2)
+            
+            # Combine and deduplicate results
+            all_recipes = set(homepage_recipes + category_recipes)
+            
+            # Filter by query relevance if possible
+            relevant_recipes = self._filter_by_query_relevance(list(all_recipes), query)
+            
+            return relevant_recipes[:max_urls]
+            
+        except Exception as e:
+            self.logger.error(f"Heuristic discovery failed for {site.domain}: {e}")
+            return []
+            
+    async def _discover_from_homepage(self, site: SiteConfig, max_urls: int) -> List[str]:
+        """Discover recipes from site homepage"""
+        try:
+            response = await self.http_client.get(site.base_url)
+            soup = BeautifulSoup(response, 'html.parser')
+            
+            # Look for recipe links on homepage
+            recipe_urls = set()
+            for link in soup.find_all('a', href=True):
+                href = link['href']
+                if href.startswith('/'):
+                    href = urljoin(site.base_url, href)
+                    
+                if self.site_manager.is_recipe_url(href) and len(recipe_urls) < max_urls:
+                    recipe_urls.add(href)
+                    
+            return list(recipe_urls)
+            
+        except Exception as e:
+            self.logger.error(f"Homepage discovery failed for {site.domain}: {e}")
+            return []
+            
+    async def _discover_from_categories(self, site: SiteConfig, max_urls: int) -> List[str]:
+        """Discover recipes from common category pages"""
+        category_paths = [
+            '/recipes', '/recipes/', '/recipe', '/cooking', '/food',
+            '/categories', '/category', '/browse', '/all-recipes'
+        ]
+        
+        recipe_urls = set()
+        
+        for path in category_paths:
+            if len(recipe_urls) >= max_urls:
+                break
+                
+            try:
+                category_url = urljoin(site.base_url, path)
+                response = await self.http_client.get(category_url, timeout=10)
+                soup = BeautifulSoup(response, 'html.parser')
+                
+                # Extract recipe links from category page
+                for link in soup.find_all('a', href=True):
+                    if len(recipe_urls) >= max_urls:
+                        break
+                        
+                    href = link['href']
+                    if href.startswith('/'):
+                        href = urljoin(site.base_url, href)
+                        
+                    if self.site_manager.is_recipe_url(href):
+                        recipe_urls.add(href)
+                        
+            except Exception:
+                continue
+                
+        return list(recipe_urls)
+        
+    def _filter_by_query_relevance(self, urls: List[str], query: str) -> List[str]:
+        """Filter URLs by query relevance"""
+        if not query:
+            return urls
+            
+        query_words = query.lower().split()
+        scored_urls = []
+        
+        for url in urls:
+            # Simple scoring based on query terms in URL
+            url_lower = url.lower()
+            score = sum(1 for word in query_words if word in url_lower)
+            scored_urls.append((score, url))
+            
+        # Sort by relevance score (descending) and return URLs
+        scored_urls.sort(key=lambda x: x[0], reverse=True)
+        return [url for score, url in scored_urls]
             
     def get_stats(self) -> Dict[str, any]:
         """Get URL manager statistics

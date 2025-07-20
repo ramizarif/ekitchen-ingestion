@@ -1,0 +1,30 @@
+{
+  "test.com": {
+    "search_urls": [
+      "/search?q={query}"
+    ],
+    "discovered_at": "2025-07-20T12:31:30.569424",
+    "last_verified": "2025-07-20T12:31:30.569426",
+    "success_rate": 1.0,
+    "verification_count": 1
+  },
+  "newsite.com": {
+    "search_urls": [
+      "https://newsite.com/search?q={query}",
+      "/recipe-search?q={query}",
+      "/s?q={query}",
+      "/query?q={query}",
+      "/lookup?q={query}",
+      "/find/?q={query}",
+      "/find?q={query}",
+      "/recipes/search?q={query}",
+      "/search/recipes?q={query}",
+      "/search/?q={query}",
+      "/search?q={query}"
+    ],
+    "discovered_at": "2025-07-20T12:31:30.570646",
+    "last_verified": "2025-07-20T12:31:30.570648",
+    "success_rate": 1.0,
+    "verification_count": 1
+  }
+}

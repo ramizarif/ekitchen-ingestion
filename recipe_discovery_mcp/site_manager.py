@@ -7,6 +7,8 @@ for multi-site recipe discovery operations.
 import json
 import re
 import os
+import asyncio
+import urllib.parse
 from typing import Dict, List, Optional, Set
 from urllib.parse import urlparse, urljoin
 from pathlib import Path
@@ -14,6 +16,8 @@ import structlog
 
 from .models import SiteConfig, DiscoveryResult
 from .utils.logging import get_logger
+from .search_url_discoverer import SearchUrlDiscoverer
+from .search_url_cache import SearchUrlCache
 
 logger = get_logger(__name__)
 
@@ -26,11 +30,12 @@ class SiteManager:
     and search URL generation.
     """
     
-    def __init__(self, config_path: str = None):
+    def __init__(self, config_path: str = None, http_client=None):
         """Initialize site manager with configuration
         
         Args:
             config_path: Path to sites.json configuration file
+            http_client: HTTP client for discovery operations
         """
         if config_path is None:
             # Default to config/sites.json relative to this file
@@ -42,7 +47,24 @@ class SiteManager:
         self.global_settings: Dict[str, any] = {}
         self.logger = structlog.get_logger().bind(component="site_manager")
         
+        # Initialize search discovery and caching components
+        self.http_client = http_client
+        self.search_discoverer = None
+        self.search_cache = SearchUrlCache()
+        
+        # Initialize components if http_client is available
+        if self.http_client:
+            self.search_discoverer = SearchUrlDiscoverer(self.http_client)
+            
         self.load_site_configs()
+        
+        # Load cache on startup (only if event loop is running)
+        if self.search_cache:
+            try:
+                asyncio.create_task(self.search_cache.load_cache())
+            except RuntimeError:
+                # No event loop running, cache will load when needed
+                pass
         
     def load_site_configs(self):
         """Load site configurations from JSON file"""
@@ -231,7 +253,7 @@ class SiteManager:
             return True
         
     def build_search_urls(self, site: SiteConfig, query: str) -> List[str]:
-        """Build search URLs for a site and query
+        """Build search URLs for a site and query (ORIGINAL SYNC METHOD)
         
         Args:
             site: Site configuration
@@ -251,7 +273,6 @@ class SiteManager:
         
         try:
             # URL-encode the query for safe inclusion in URLs
-            import urllib.parse
             encoded_query = urllib.parse.quote_plus(query)
             
             for path_template in site.search_paths:
@@ -287,6 +308,99 @@ class SiteManager:
         )
         
         return search_urls
+        
+    async def build_search_urls_enhanced(self, site: SiteConfig, query: str) -> List[str]:
+        """Enhanced search URL building with intelligent discovery (NEW ASYNC METHOD)
+        
+        Args:
+            site: Site configuration
+            query: Search query string
+            
+        Returns:
+            List of complete search URLs
+        """
+        
+        # 1. Check cache first
+        if self.search_cache:
+            cached_urls = await self.search_cache.get_cached_search_urls(site.domain)
+            if cached_urls:
+                self.logger.debug(f"Using cached search URLs for {site.domain}")
+                return self._format_search_urls(cached_urls, query)
+            
+        # 2. Use configured paths if available
+        if site.search_paths:
+            self.logger.debug(f"Using configured search paths for {site.domain}")
+            
+            # Test configured paths and cache successful ones
+            valid_paths = await self._validate_search_paths(site)
+            if valid_paths:
+                if self.search_cache:
+                    await self.search_cache.cache_search_urls(site.domain, valid_paths)
+                return self._format_search_urls(valid_paths, query)
+                
+        # 3. Trigger discovery if needed
+        if self.search_discoverer:
+            self.logger.info(f"Discovering search URLs for {site.domain}")
+            discovered_urls = await self.search_discoverer.discover_search_endpoint(site)
+            
+            if discovered_urls:
+                if self.search_cache:
+                    await self.search_cache.cache_search_urls(site.domain, discovered_urls)
+                return self._format_search_urls(discovered_urls, query)
+        
+        # 4. Fallback to generic patterns
+        self.logger.warning(f"Using fallback search URLs for {site.domain}")
+        return self._get_fallback_search_urls(site, query)
+            
+    async def _validate_search_paths(self, site: SiteConfig) -> List[str]:
+        """Validate configured search paths"""
+        if not self.http_client:
+            # If no HTTP client, assume all paths are valid
+            return site.search_paths
+            
+        valid_paths = []
+        
+        for path_template in site.search_paths:
+            try:
+                # Extract base path without query parameters
+                base_path = path_template.split('?')[0]
+                test_url = urljoin(site.base_url, base_path)
+                
+                response = await self.http_client.head(test_url, timeout=10)
+                if response.status_code == 200:
+                    valid_paths.append(path_template)
+            except Exception:
+                continue
+                
+        return valid_paths
+        
+    def _format_search_urls(self, url_templates: List[str], query: str) -> List[str]:
+        """Format URL templates with query parameter"""
+        encoded_query = urllib.parse.quote_plus(query)
+        return [template.format(query=encoded_query) for template in url_templates]
+        
+    def _get_fallback_search_urls(self, site: SiteConfig, query: str) -> List[str]:
+        """Generate fallback search URLs using heuristics"""
+        encoded_query = urllib.parse.quote_plus(query)
+        
+        fallback_patterns = [
+            f"/search?q={encoded_query}",
+            f"/search/?q={encoded_query}",
+            f"/recipes/search?query={encoded_query}",
+            f"/?s={encoded_query}"
+        ]
+        
+        return [urljoin(site.base_url, pattern) for pattern in fallback_patterns]
+        
+    async def mark_search_url_success(self, site: SiteConfig, search_url: str):
+        """Mark a search URL as successful"""
+        if self.search_cache:
+            await self.search_cache.update_success_rate(site.domain, search_url, True)
+        
+    async def mark_search_url_failed(self, site: SiteConfig, search_url: str):
+        """Mark a search URL as failed"""
+        if self.search_cache:
+            await self.search_cache.update_success_rate(site.domain, search_url, False)
         
     def get_sites_by_priority(self, priority: str) -> List[SiteConfig]:
         """Get sites filtered by priority level
