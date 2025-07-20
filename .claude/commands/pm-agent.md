@@ -30,16 +30,39 @@ spawn_validated_engineer() {
   tmux send-keys -t "$session_name:0" 'claude' Enter
   sleep 5
   
-  # Validate responsive
+  # Validate responsive with robust error checking
   for i in {1..8}; do
     ./scripts/send-claude-message.sh "$session_name:0" "Please respond with 'ENGINEER_READY'"
     sleep 3
-    if tmux capture-pane -t "$session_name:0" -p | grep -q "ENGINEER_READY"; then
+    
+    # Capture full terminal output
+    TERMINAL_OUTPUT=$(tmux capture-pane -t "$session_name:0" -p)
+    
+    # Check for error conditions first
+    if echo "$TERMINAL_OUTPUT" | grep -qi "error\|failed\|exception\|command not found\|no such file"; then
+      echo "❌ Engineer session has errors: $session_name"
+      tmux kill-session -t "$session_name"
+      return 1
+    fi
+    
+    # Check for Claude not running
+    if echo "$TERMINAL_OUTPUT" | grep -qi "bash.*\$\|zsh.*\$" && ! echo "$TERMINAL_OUTPUT" | grep -q "claude"; then
+      echo "❌ Claude not running in engineer session: $session_name"
+      tmux kill-session -t "$session_name"
+      return 1
+    fi
+    
+    # Check for successful response
+    if echo "$TERMINAL_OUTPUT" | grep -q "ENGINEER_READY"; then
+      echo "✅ Engineer session validated: $session_name"
       # Send slash command with issue number
       ./scripts/send-claude-message.sh "$session_name:0" "/engineer-agent --issue $issue_number"
       return 0
     fi
   done
+  
+  echo "❌ Engineer session failed validation after 8 attempts: $session_name"
+  tmux kill-session -t "$session_name"
   return 1
 }
 ```
