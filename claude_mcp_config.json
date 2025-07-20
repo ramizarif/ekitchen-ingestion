@@ -1,0 +1,12 @@
+{
+  "mcpServers": {
+    "recipe-discovery": {
+      "command": "/Users/ramiz/ekitchen/ekitchen-ingestion/venv/bin/python3",
+      "args": ["/Users/ramiz/ekitchen/ekitchen-ingestion/run_mcp_server.py"],
+      "cwd": "/Users/ramiz/ekitchen/ekitchen-ingestion",
+      "env": {
+        "PYTHONPATH": "/Users/ramiz/ekitchen/ekitchen-ingestion"
+      }
+    }
+  }
+}

@@ -249,3 +249,34 @@ class SearchUrlCache:
                     
         await self.save_cache()
         self.logger.info(f"Bulk updated success rates for {len(updates)} entries")
+        
+    async def clear_domain_cache(self, domain: str) -> int:
+        """Clear cached search URLs for a specific domain
+        
+        Args:
+            domain: Domain to clear from cache
+            
+        Returns:
+            Number of cached URLs that were removed
+        """
+        async with self._lock:
+            if domain in self.cache_data:
+                cached_urls_count = len(self.cache_data[domain].get('search_urls', []))
+                del self.cache_data[domain]
+                await self.save_cache()
+                self.logger.info(f"Cleared cache for domain: {domain}, removed {cached_urls_count} URLs")
+                return cached_urls_count
+            return 0
+            
+    async def clear_all_cache(self) -> List[str]:
+        """Clear all cached search URLs
+        
+        Returns:
+            List of domains that had cached data removed
+        """
+        async with self._lock:
+            cleared_domains = list(self.cache_data.keys())
+            self.cache_data.clear()
+            await self.save_cache()
+            self.logger.info(f"Cleared all cache data for {len(cleared_domains)} domains")
+            return cleared_domains

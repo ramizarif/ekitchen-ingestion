@@ -84,7 +84,7 @@ class SearchUrlDiscoverer:
         try:
             # Test with a simple query
             test_query_url = test_url + "?q=test"
-            response = await self.http_client.get(test_query_url, timeout=10)
+            response = await self.http_client.get(test_query_url)
             
             # Consider 200 or 302 as valid (redirects are common for search)
             if response.status_code in [200, 302]:
@@ -98,7 +98,7 @@ class SearchUrlDiscoverer:
     async def _analyze_search_forms(self, site: SiteConfig) -> List[str]:
         """Parse homepage for search forms and extract action URLs"""
         try:
-            response = await self.http_client.get(site.base_url, timeout=15)
+            response = await self.http_client.get(site.base_url)
             soup = BeautifulSoup(response.text, 'html.parser')
             
             search_forms = soup.find_all('form')
@@ -152,7 +152,7 @@ class SearchUrlDiscoverer:
     async def _parse_navigation_links(self, site: SiteConfig) -> List[str]:
         """Parse navigation for search-related links"""
         try:
-            response = await self.http_client.get(site.base_url, timeout=15)
+            response = await self.http_client.get(site.base_url)
             soup = BeautifulSoup(response.text, 'html.parser')
             
             search_urls = []
@@ -194,7 +194,7 @@ class SearchUrlDiscoverer:
             # Check robots.txt for sitemap references
             robots_url = urljoin(site.base_url, '/robots.txt')
             try:
-                response = await self.http_client.get(robots_url, timeout=10)
+                response = await self.http_client.get(robots_url)
                 if response.status_code == 200:
                     # Look for search-related paths in robots.txt
                     for line in response.text.split('\n'):
@@ -213,7 +213,7 @@ class SearchUrlDiscoverer:
             for sitemap_path in sitemap_urls:
                 try:
                     sitemap_url = urljoin(site.base_url, sitemap_path)
-                    response = await self.http_client.get(sitemap_url, timeout=10)
+                    response = await self.http_client.get(sitemap_url)
                     if response.status_code == 200:
                         # Parse XML sitemap for search URLs
                         soup = BeautifulSoup(response.text, 'xml')
@@ -254,7 +254,7 @@ class SearchUrlDiscoverer:
                 test_url = url_template.format(query="test")
                 full_url = urljoin(site.base_url, test_url) if not test_url.startswith('http') else test_url
                 
-                response = await self.http_client.get(full_url, timeout=10)
+                response = await self.http_client.get(full_url)
                 
                 # Rank by status code quality
                 if response.status_code == 200:

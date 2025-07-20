@@ -1,30 +1,38 @@
 {
-  "test.com": {
+  "allrecipes.com": {
     "search_urls": [
       "/search?q={query}"
     ],
-    "discovered_at": "2025-07-20T12:31:30.569424",
-    "last_verified": "2025-07-20T12:31:30.569426",
-    "success_rate": 1.0,
-    "verification_count": 1
+    "discovered_at": "2025-07-20T16:21:01.164096",
+    "last_verified": "2025-07-20T16:56:06.981966",
+    "success_rate": 0.5,
+    "verification_count": 4
   },
-  "newsite.com": {
+  "foodnetwork.com": {
     "search_urls": [
-      "https://newsite.com/search?q={query}",
-      "/recipe-search?q={query}",
-      "/s?q={query}",
-      "/query?q={query}",
-      "/lookup?q={query}",
-      "/find/?q={query}",
-      "/find?q={query}",
-      "/recipes/search?q={query}",
-      "/search/recipes?q={query}",
-      "/search/?q={query}",
       "/search?q={query}"
     ],
-    "discovered_at": "2025-07-20T12:31:30.570646",
-    "last_verified": "2025-07-20T12:31:30.570648",
+    "discovered_at": "2025-07-20T16:21:02.562017",
+    "last_verified": "2025-07-20T16:56:07.551432",
     "success_rate": 1.0,
-    "verification_count": 1
+    "verification_count": 3
+  },
+  "epicurious.com": {
+    "search_urls": [
+      "/search?q={query}"
+    ],
+    "discovered_at": "2025-07-20T16:21:02.562895",
+    "last_verified": "2025-07-20T16:56:08.490891",
+    "success_rate": 0.3333333333333333,
+    "verification_count": 3
+  },
+  "bbcgoodfood.com": {
+    "search_urls": [
+      "/search?q={query}"
+    ],
+    "discovered_at": "2025-07-20T16:21:00.887984",
+    "last_verified": "2025-07-20T16:56:08.098334",
+    "success_rate": 1.0,
+    "verification_count": 3
   }
 }

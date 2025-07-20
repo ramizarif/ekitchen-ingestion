@@ -252,7 +252,6 @@ class UrlManager:
             # Fetch search results page with site-specific timeout
             response = await self.http_client.get(
                 search_url, 
-                timeout=site.timeout,
                 headers={
                     'User-Agent': self.site_manager.get_global_setting(
                         'user_agent', 
@@ -336,9 +335,25 @@ class UrlManager:
                     # Skip non-HTTP links (mailto, javascript, etc.)
                     continue
                 
-                # Check if URL matches recipe patterns for this site
-                if self.site_manager.is_recipe_url(href):
-                    recipe_urls.add(href)
+                # Only accept URLs from the same domain as the site being searched
+                from urllib.parse import urlparse
+                parsed_href = urlparse(href)
+                parsed_site = urlparse(site.base_url)
+                
+                # Check domain match (handle www. prefix)
+                href_domain = parsed_href.netloc.lower()
+                site_domain = parsed_site.netloc.lower()
+                
+                if href_domain.startswith('www.'):
+                    href_domain = href_domain[4:]
+                if site_domain.startswith('www.'):
+                    site_domain = site_domain[4:]
+                
+                # Only process URLs from the target domain
+                if href_domain == site_domain:
+                    # Check if URL matches recipe patterns for this site
+                    if self.site_manager.is_recipe_url(href):
+                        recipe_urls.add(href)
                     
         except Exception as e:
             self.logger.error(
@@ -435,20 +450,63 @@ class UrlManager:
         recipe_urls = set()
         
         try:
-            # Common recipe-related CSS classes and attributes
-            recipe_selectors = [
-                'a[href*="recipe"]',
-                'a.recipe-link',
-                'a.recipe-card',
-                '.recipe-title a',
-                '.recipe-item a',
-                '.recipe-search-result a',
-                '[data-recipe-id] a',
-                '.entry-title a',  # Common for WordPress recipe sites
-                '.post-title a'    # Another WordPress pattern
+            # First, try to find search results container and target links within it
+            search_result_containers = [
+                '.search-results', '.search-result', '.results', '.recipe-results',
+                '.search-content', '.content-search', '.search-items', '.search-list',
+                '.recipe-search-results', '.recipe-list', '.recipes-list',
+                '.grid', '.recipe-grid', '.search-grid', '.result-grid',
+                'main', '.main-content', '.content-main', '#main-content',
+                '.search-page', '.search-container'
             ]
             
-            for selector in recipe_selectors:
+            # Look for recipe links within search result containers first
+            for container_selector in search_result_containers:
+                container = soup.select_one(container_selector)
+                if container:
+                    self.logger.debug(f"Found search container: {container_selector}")
+                    # Target specific recipe links within the container
+                    container_recipe_selectors = [
+                        'a[href*="/recipe/"]',  # Individual recipe pages (with /recipe/ in path)
+                        'a[href*="/recipes/"][href*="/recipe"]',  # Recipe details pages
+                        'a.recipe-link', 'a.recipe-card', 'a.recipe-item',
+                        '.recipe-title a', '.recipe-name a', '.recipe-card-title a',
+                        '.recipe-item a', '.recipe-search-result a',
+                        '[data-recipe-id] a', '[data-recipe-url] a',
+                        '.entry-title a[href*="/recipe"]',  # WordPress recipe posts
+                        '.post-title a[href*="/recipe"]'
+                    ]
+                    
+                    for selector in container_recipe_selectors:
+                        if len(recipe_urls) >= max_urls:
+                            break
+                        try:
+                            links = container.select(selector)
+                            for link in links:
+                                if len(recipe_urls) >= max_urls:
+                                    break
+                                href = link.get('href')
+                                if href and self._process_recipe_link(href, site, recipe_urls):
+                                    continue
+                        except Exception as e:
+                            self.logger.debug(f"Error with container selector {selector}: {e}")
+                            continue
+                    
+                    # If we found recipes in a container, prefer those
+                    if recipe_urls:
+                        return recipe_urls
+            
+            # Fallback: Search the entire page but with more specific selectors
+            fallback_selectors = [
+                'a[href*="/recipe/"][href*="/"][href*="-"]',  # Individual recipes with IDs/slugs
+                'a[href*="/recipe/\\d"]',  # Recipes with numeric IDs
+                'a.recipe-card', 'a.recipe-link', 'a.recipe-item',
+                '.recipe-title a', '.recipe-name a', '.recipe-card-title a',
+                '.recipe-search-result a', '.search-result a[href*="recipe"]',
+                '[data-recipe-id] a', '[data-recipe-url] a'
+            ]
+            
+            for selector in fallback_selectors:
                 if len(recipe_urls) >= max_urls:
                     break
                     
@@ -459,22 +517,12 @@ class UrlManager:
                             break
                             
                         href = link.get('href')
-                        if not href:
+                        if href and self._process_recipe_link(href, site, recipe_urls):
                             continue
-                            
-                        # Convert to absolute URL
-                        if href.startswith('/'):
-                            href = urljoin(site.base_url, href)
-                        elif not href.startswith(('http://', 'https://')):
-                            continue
-                            
-                        # Additional validation that this looks like a recipe URL
-                        if self._looks_like_recipe_url(href):
-                            recipe_urls.add(href)
                             
                 except Exception as e:
                     self.logger.debug(
-                        "Error with selector",
+                        "Error with fallback selector",
                         selector=selector,
                         error=str(e)
                     )
@@ -489,6 +537,99 @@ class UrlManager:
             
         return recipe_urls
         
+    def _process_recipe_link(self, href: str, site: SiteConfig, recipe_urls: Set[str]) -> bool:
+        """Process a potential recipe link and add to recipe_urls if valid
+        
+        Args:
+            href: The href attribute from the link
+            site: Site configuration
+            recipe_urls: Set to add valid URLs to
+            
+        Returns:
+            True if URL was processed (regardless of whether added), False if should skip
+        """
+        try:
+            # Convert to absolute URL
+            if href.startswith('/'):
+                href = urljoin(site.base_url, href)
+            elif not href.startswith(('http://', 'https://')):
+                return True  # Skip non-HTTP links
+                
+            # Only accept URLs from the same domain as the site being searched
+            from urllib.parse import urlparse
+            parsed_href = urlparse(href)
+            parsed_site = urlparse(site.base_url)
+            
+            # Check domain match (handle www. prefix)
+            href_domain = parsed_href.netloc.lower()
+            site_domain = parsed_site.netloc.lower()
+            
+            if href_domain.startswith('www.'):
+                href_domain = href_domain[4:]
+            if site_domain.startswith('www.'):
+                site_domain = site_domain[4:]
+            
+            # Only process URLs from the target domain
+            if href_domain == site_domain:
+                # Additional validation that this looks like a recipe URL
+                if self._looks_like_recipe_url(href) and self._is_individual_recipe_url(href):
+                    recipe_urls.add(href)
+                    
+            return True
+            
+        except Exception as e:
+            self.logger.debug(f"Error processing recipe link {href}: {e}")
+            return True
+        
+    def _is_individual_recipe_url(self, url: str) -> bool:
+        """Check if URL appears to be an individual recipe page (not a category)
+        
+        Args:
+            url: URL to check
+            
+        Returns:
+            True if URL appears to be individual recipe page
+        """
+        from urllib.parse import urlparse
+        parsed = urlparse(url)
+        path_lower = parsed.path.lower()
+        
+        # Exclude category/listing pages
+        category_patterns = [
+            '/recipes/', '/recipes$', '/recipe-search', '/search',
+            '/category/', '/categories/', '/browse/', '/collection/',
+            '/cuisine/', '/dietary/', '/meal-type/', '/cooking-method/',
+            '/breakfast', '/lunch', '/dinner', '/dessert', '/appetizer',
+            '/vegetarian', '/vegan', '/gluten-free', '/healthy'
+        ]
+        
+        # If URL matches category patterns, reject it
+        for pattern in category_patterns:
+            if pattern in path_lower and not '/recipe/' in path_lower:
+                return False
+        
+        # Prefer URLs with individual recipe indicators
+        individual_indicators = [
+            '/recipe/', '/recipes/detail', '/recipes/view',
+            'recipe-id', 'recipeId', 'recipe_id'
+        ]
+        
+        # Strong preference for URLs with numeric IDs or specific recipe paths
+        if any(indicator in path_lower for indicator in individual_indicators):
+            return True
+            
+        # Check for numeric patterns that suggest individual recipes
+        import re
+        if re.search(r'/recipe/\d+', path_lower) or re.search(r'/recipes/\d+', path_lower):
+            return True
+            
+        # Check for slug patterns (recipe names with hyphens)
+        if '/recipe/' in path_lower and '-' in path_lower:
+            return True
+            
+        # Default to accepting if no clear category indicators
+        return True
+        
     def _looks_like_recipe_url(self, url: str) -> bool:
         """Heuristic check if URL looks like a recipe URL
         
@@ -500,13 +641,31 @@ class UrlManager:
         """
         url_lower = url.lower()
         
-        # Common recipe URL indicators
-        recipe_indicators = [
-            'recipe', 'recipes', 'cooking', 'dish', 'meal',
-            'food', 'kitchen', 'cuisine', 'ingredient'
+        # Exclude obvious non-recipe patterns first
+        exclude_patterns = [
+            'magazine', 'subscription', 'subscribe', 'support', 'help',
+            'contact', 'about', 'privacy', 'terms', 'login', 'signup',
+            'facebook.com', 'twitter.com', 'instagram.com', 'youtube.com',
+            'pinterest.com', 'tiktok.com', 'linkedin.com',
+            'newsletter', 'email', 'marketing', 'affiliate'
         ]
         
-        return any(indicator in url_lower for indicator in recipe_indicators)
+        # Reject URLs that match exclusion patterns
+        if any(pattern in url_lower for pattern in exclude_patterns):
+            return False
+        
+        # Require recipe-specific indicators in the path (not just domain)
+        from urllib.parse import urlparse
+        parsed = urlparse(url)
+        path_lower = parsed.path.lower()
+        
+        # Strong recipe indicators in the URL path
+        recipe_indicators = [
+            '/recipe/', '/recipes/', '/cooking/', '/dish/', '/meal/',
+            'recipe-', 'recipes-', '-recipe', '-recipes'  
+        ]
+        
+        return any(indicator in path_lower for indicator in recipe_indicators)
         
     def _get_target_sites(self, sites: Optional[List[str]]) -> List[SiteConfig]:
         """Get target sites for discovery
@@ -611,7 +770,7 @@ class UrlManager:
             
             # Make a HEAD request first to check if URL exists
             try:
-                await self.http_client.head(url, timeout=10)
+                await self.http_client.head(url)
             except Exception:
                 # If HEAD fails, try GET with limited content
                 pass
@@ -619,7 +778,6 @@ class UrlManager:
             # Fetch partial content to check for recipe indicators
             response = await self.http_client.get(
                 url, 
-                timeout=15,
                 headers={'Range': 'bytes=0-4096'}  # Only get first 4KB
             )
             
@@ -720,7 +878,7 @@ class UrlManager:
                 
             try:
                 category_url = urljoin(site.base_url, path)
-                response = await self.http_client.get(category_url, timeout=10)
+                response = await self.http_client.get(category_url)
                 soup = BeautifulSoup(response, 'html.parser')
                 
                 # Extract recipe links from category page

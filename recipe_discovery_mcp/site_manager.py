@@ -224,8 +224,8 @@ class SiteManager:
         """
         site = self.get_site_for_url(url)
         if not site:
-            # If no site config, assume it could be a recipe URL
-            return True
+            # If no site config, this is an external domain - reject it
+            return False
             
         if not site.recipe_url_patterns:
             # If no patterns defined, assume all URLs are recipe URLs
@@ -325,7 +325,7 @@ class SiteManager:
             cached_urls = await self.search_cache.get_cached_search_urls(site.domain)
             if cached_urls:
                 self.logger.debug(f"Using cached search URLs for {site.domain}")
-                return self._format_search_urls(cached_urls, query)
+                return self._format_search_urls(site, cached_urls, query)
             
         # 2. Use configured paths if available
         if site.search_paths:
@@ -336,7 +336,7 @@ class SiteManager:
             if valid_paths:
                 if self.search_cache:
                     await self.search_cache.cache_search_urls(site.domain, valid_paths)
-                return self._format_search_urls(valid_paths, query)
+                return self._format_search_urls(site, valid_paths, query)
                 
         # 3. Trigger discovery if needed
         if self.search_discoverer:
@@ -346,7 +346,7 @@ class SiteManager:
             if discovered_urls:
                 if self.search_cache:
                     await self.search_cache.cache_search_urls(site.domain, discovered_urls)
-                return self._format_search_urls(discovered_urls, query)
+                return self._format_search_urls(site, discovered_urls, query)
         
         # 4. Fallback to generic patterns
         self.logger.warning(f"Using fallback search URLs for {site.domain}")
@@ -366,7 +366,7 @@ class SiteManager:
                 base_path = path_template.split('?')[0]
                 test_url = urljoin(site.base_url, base_path)
                 
-                response = await self.http_client.head(test_url, timeout=10)
+                response = await self.http_client.head(test_url)
                 if response.status_code == 200:
                     valid_paths.append(path_template)
             except Exception:
@@ -374,10 +374,22 @@ class SiteManager:
                 
         return valid_paths
         
-    def _format_search_urls(self, url_templates: List[str], query: str) -> List[str]:
-        """Format URL templates with query parameter"""
+    def _format_search_urls(self, site: SiteConfig, url_templates: List[str], query: str) -> List[str]:
+        """Format URL templates with query parameter and convert to absolute URLs"""
         encoded_query = urllib.parse.quote_plus(query)
-        return [template.format(query=encoded_query) for template in url_templates]
+        formatted_urls = []
+        
+        for template in url_templates:
+            # Format the query placeholder
+            formatted_url = template.format(query=encoded_query)
+            
+            # Convert relative URLs to absolute URLs
+            if formatted_url.startswith('/'):
+                formatted_url = urljoin(site.base_url, formatted_url)
+                
+            formatted_urls.append(formatted_url)
+                
+        return formatted_urls
         
     def _get_fallback_search_urls(self, site: SiteConfig, query: str) -> List[str]:
         """Generate fallback search URLs using heuristics"""
@@ -393,9 +405,38 @@ class SiteManager:
         return [urljoin(site.base_url, pattern) for pattern in fallback_patterns]
         
     async def mark_search_url_success(self, site: SiteConfig, search_url: str):
-        """Mark a search URL as successful"""
+        """Mark a search URL as successful and cache the URL pattern"""
         if self.search_cache:
             await self.search_cache.update_success_rate(site.domain, search_url, True)
+            
+            # Extract and cache the URL pattern for future use
+            from urllib.parse import urlparse, parse_qs
+            parsed = urlparse(search_url)
+            
+            # Convert the successful search URL back to a template pattern
+            # e.g., https://www.allrecipes.com/search?q=chicken+recipe -> /search?q={query}
+            if 'q=' in search_url:
+                # Most common pattern: ?q=value
+                pattern = f"{parsed.path}?q={{query}}"
+            elif 'search=' in search_url:
+                # Alternative pattern: ?search=value  
+                pattern = f"{parsed.path}?search={{query}}"
+            elif 'query=' in search_url:
+                # Another pattern: ?query=value
+                pattern = f"{parsed.path}?query={{query}}"
+            else:
+                # Fallback: just the path
+                pattern = f"{parsed.path}?q={{query}}"
+            
+            # Cache this working pattern
+            await self.search_cache.cache_search_urls(site.domain, [pattern])
+            
+            self.logger.info(
+                "Cached successful search URL pattern",
+                site_domain=site.domain,
+                original_url=search_url,
+                cached_pattern=pattern
+            )
         
     async def mark_search_url_failed(self, site: SiteConfig, search_url: str):
         """Mark a search URL as failed"""

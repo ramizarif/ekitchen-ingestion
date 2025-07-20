@@ -1,0 +1,13 @@
+{
+  "demo-recipes.com": {
+    "search_urls": [
+      "/search?q={query}",
+      "/recipes/search?query={query}",
+      "/find?term={query}"
+    ],
+    "discovered_at": "2025-07-20T13:18:31.255121",
+    "last_verified": "2025-07-20T13:18:31.255129",
+    "success_rate": 0.85,
+    "verification_count": 1
+  }
+}

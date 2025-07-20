@@ -12,8 +12,9 @@
 
 ### Phase 3: Enhancements & Reliability
 - [ ] **Issue #8**: [Intelligent Search URL Discovery and Caching System](https://github.com/ramizarif/ekitchen-ingestion/issues/8) - Status: To Do
+- [ ] **Issue #10**: [Add Playwright MCP for AI-led Browser Automation Search URL Discovery](https://github.com/ramizarif/ekitchen-ingestion/issues/10) - Status: To Do
 - [ ] **Issue 9**: Comprehensive Error Recovery - Implement retry logic, graceful degradation, detailed error reporting
-- [ ] **Issue 10**: Progress Reporting System - Real-time progress tracking with detailed status updates
+- [ ] **Issue 11**: Progress Reporting System - Real-time progress tracking with detailed status updates
 
 ### Phase 4: Integration & Polish (Future)
 - [ ] **Issue 11**: JSON Output Standardization - Ensure consistent output format for downstream processing
@@ -48,12 +49,13 @@ Issue #7 (Multi-site Engine)
 
 ### Enhancement Sprint (Issue 8+)
 - [ ] **Issue #8**: [Intelligent Search URL Discovery and Caching System](https://github.com/ramizarif/ekitchen-ingestion/issues/8) - Status: To Do
+- [ ] **Issue #10**: [Add Playwright MCP for AI-led Browser Automation Search URL Discovery](https://github.com/ramizarif/ekitchen-ingestion/issues/10) - Status: To Do
 
 ### Future Issues (Not Yet Created)
 - [ ] **Issue 9**: Comprehensive Error Recovery - [Not created yet]
-- [ ] **Issue 10**: Progress Reporting System - [Not created yet]
-- [ ] **Issue 11**: JSON Output Standardization - [Not created yet]
-- [ ] **Issue 12**: Performance Optimization - [Not created yet]
+- [ ] **Issue 11**: Progress Reporting System - [Not created yet]
+- [ ] **Issue 12**: JSON Output Standardization - [Not created yet]
+- [ ] **Issue 13**: Performance Optimization - [Not created yet]
 
 ## Local Issue Files
 
@@ -68,7 +70,8 @@ project-breakdown/features/recipe-discovery-mcp/
     ├── mcp-server-setup-foundation-issue5.md           ✅ COMPLETED
     ├── recipe-scraping-library-integration-issue6.md   ✅ COMPLETED
     ├── multi-site-discovery-engine-issue7.md           ✅ COMPLETED
-    └── intelligent-search-url-discovery-issue8.md      ✅ Created
+    ├── intelligent-search-url-discovery-issue8.md      ✅ Created
+    └── playwright-browser-automation-issue10.md        ✅ Created
 ```
 
 ### Issue File Status
@@ -77,6 +80,7 @@ project-breakdown/features/recipe-discovery-mcp/
 - [x] **Issue #6**: recipe-scraping-library-integration-issue6.md - Status: ✅ COMPLETED  
 - [x] **Issue #7**: multi-site-discovery-engine-issue7.md - Status: ✅ COMPLETED
 - [ ] **Issue #8**: intelligent-search-url-discovery-issue8.md - Status: ✅ Created, To Do
+- [ ] **Issue #10**: playwright-browser-automation-issue10.md - Status: ✅ Created, To Do
 
 ## Implementation Sequence
 

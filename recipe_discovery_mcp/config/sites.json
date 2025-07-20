@@ -7,8 +7,8 @@
       "timeout": 30,
       "max_concurrent": 3,
       "search_paths": [
-        "/search/results/?search={query}",
-        "/recipes/search/?q={query}"
+        "/search?q={query}",
+        "/search/results?search={query}"
       ],
       "recipe_url_patterns": [
         "/recipe/\\d+/.*",
@@ -39,7 +39,8 @@
       "timeout": 30,
       "max_concurrent": 5,
       "search_paths": [
-        "/search/{query}"
+        "/search?q={query}",
+        "/recipes/search?term={query}"
       ],
       "recipe_url_patterns": [
         "/recipes/.*"
@@ -75,7 +76,7 @@
         "/recipes/.*"
       ],
       "priority": "low",
-      "enabled": true
+      "enabled": false
     }
   },
   "global_settings": {

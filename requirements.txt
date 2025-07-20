@@ -10,6 +10,8 @@ recipe-scrapers>=15.8.0
 httpx>=0.24.0
 beautifulsoup4>=4.12.0
 
+# Claude-powered smart extraction (no external APIs needed)
+
 # Async utilities
 asyncio-extras
 

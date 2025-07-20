@@ -44,6 +44,13 @@
 - **Scope**: Automatic search endpoint discovery with persistent caching
 - **Benefits**: Eliminates hardcoded search path failures, improves site compatibility
 
+#### Issue #10: Add Playwright MCP for AI-led Browser Automation Search URL Discovery 📋 TO DO
+- **Status**: 📋 TO DO (2025-07-20)
+- **GitHub**: [Issue #10](https://github.com/ramizarif/ekitchen-ingestion/issues/10)
+- **Priority**: High - Resolves critical system hanging issue
+- **Scope**: Browser automation MCP to replace problematic HTTP-based URL discovery
+- **Benefits**: Eliminates hanging during URL discovery, enables reliable visual search form detection
+
 **Core MVP Components Status**: ALL COMPLETED ✅
 - ✅ Site Configuration System (sites.json) - DONE
 - ✅ Site Manager (site_manager.py) - DONE  
