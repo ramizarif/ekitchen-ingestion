@@ -19,7 +19,7 @@ tmux send-keys -t "$WINDOW" "$MESSAGE"
 # Wait 0.5 seconds for UI to register
 sleep 0.5
 
-# Send Enter to submit
-tmux send-keys -t "$WINDOW" Enter
+# Send Enter to submit (using C-m for better compatibility)
+tmux send-keys -t "$WINDOW" C-m
 
 echo "Message sent to $WINDOW: $MESSAGE"

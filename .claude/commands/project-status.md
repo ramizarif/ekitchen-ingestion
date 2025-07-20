@@ -1,6 +1,10 @@
 # Project Status Command
 
+**Command Arguments**: $ARGUMENTS
+
 Provide real-time status reports for projects, features, and autonomous development sessions.
+
+Parse the arguments above to determine the status scope (--feature, --autonomous, --detailed, or default overview).
 
 ## Your Role
 

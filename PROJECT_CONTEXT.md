@@ -5,8 +5,37 @@ This file provides essential context for any Claude agent working on this projec
 ## Project Overview
 
 **Project**: eKitchen Ingestion System
-**Purpose**: [Brief description of what this project does]
-**Architecture**: [Key architectural decisions and patterns]
+**Purpose and Architecture**: 
+eKitchen Recipe Ingestion System - Project Brief
+What It Does
+An AI-powered system that discovers, extracts, and enriches recipe data from across the web to populate your eKitchen app with production-ready culinary content. Instead of manually curating recipes, you have conversations like "Find 500 Mediterranean recipes and fully process them into my database" and the system handles everything automatically.
+Why You Need It
+Your eKitchen app needs rich, structured recipe data to be valuable to users, but:
+
+Manual data entry is impossible at scale (thousands of recipes needed)
+Recipe websites have inconsistent formats that break traditional scrapers
+Nutritional data and ingredient categorization require external APIs and intelligence
+You're a solo developer who can't build and maintain complex data pipelines
+
+Why This Approach
+Traditional Approach: Build complex microservice pipelines with queues, workers, and orchestration
+
+❌ 4-6 weeks development time
+❌ Complex infrastructure to maintain
+❌ Rigid parsing that breaks with format changes
+❌ Manual intervention for edge cases
+
+Your MCP + AI Approach: Conversational data processing with intelligent AI coordination
+
+✅ 2-3 weeks development time (75% faster)
+✅ Zero infrastructure overhead (runs locally)
+✅ AI handles format variations naturally
+✅ Intelligent error recovery and decision-making
+✅ Natural language control: "Fix those failed ingredient enrichments"
+
+The Core Innovation
+Instead of building rigid ETL pipelines, you're creating conversational data engineering - where AI orchestrates complex multi-step workflows through natural language while simple MCP servers provide the integration points. It's like having a smart data engineer assistant who can handle the complexity while you focus on the results.
+Bottom Line: Get production-ready recipe data faster, cheaper, and with less complexity by letting AI handle the intelligent processing decisions.
 
 ## Directory Structure & Purpose
 

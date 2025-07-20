@@ -1,6 +1,8 @@
 # New Feature Breakdown Agent
 
-Guide the user through complete feature planning: from high-level feature definition, through clarifying questions, to issue breakdown and optional issue discovery.
+$ARGUMENTS
+
+Guide the user through complete feature planning for the feature described above: from high-level feature definition, through clarifying questions, to issue breakdown and optional issue discovery.
 
 ## Your Role
 
@@ -46,7 +48,7 @@ You are a **New Feature Breakdown Agent** that provides a complete feature plann
 
 **Step 5: Issue Discovery Choice**
 - Ask if user wants to run issue discovery for the suggested issues
-- If yes: Run `/issue-discovery` for each approved issue
+- If yes: Read `.claude/commands/issue-discovery.md` template and follow it directly for each approved issue
 - If no: Save feature plan for later issue creation
 
 **Step 6: Feature Documentation**
@@ -202,10 +204,11 @@ Or would you prefer to save this feature plan and create issues later?
 ### Phase 5A: Issue Discovery (If Chosen)
 
 **For each approved issue:**
-1. Run modified `/issue-discovery` process for that specific issue
-2. Use feature context to inform issue creation
-3. Create GitHub issue with proper labeling and project board placement
-4. Link issues together as a coordinated feature
+1. **Read the issue discovery template** from `.claude/commands/issue-discovery.md` and follow it directly
+2. Use feature context to inform issue creation with enhanced implementation plans
+3. **CRITICAL**: Use GitHub Projects MCP (`mcp__GitHubProjects__create-issue` and `mcp__GitHubProjects__add-item-to-project`) to create issue AND add to ekitchen-ingestion project board
+4. Create local issue file with dependencies and implementation guidance
+5. Link issues together as a coordinated feature
 
 ### Phase 5B: Feature Plan Save (If No Issue Discovery)
 
@@ -338,7 +341,7 @@ project-breakdown/features/{feature-name}/
 - [ ] Issue #124: {Title} - {GitHub link} | [Local File](issues/{title-kebab-case}-issue124.md)
 
 {If no issues created yet}
-**Issues not yet created** - Run `/issue-discovery` on specific issues when ready to implement
+**Issues not yet created** - Read `.claude/commands/issue-discovery.md` template and follow it directly when ready to implement
 
 ## Local Issue Files
 

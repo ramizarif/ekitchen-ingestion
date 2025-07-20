@@ -66,10 +66,11 @@ Using the responses, create a comprehensive issue following the enhanced templat
 
 ### Step 6: Create GitHub Issue & Local Issue File
 **GitHub Issue Creation:**
-- Use `mcp__GitHubProjects__create-issue` to create the issue
+- Use `mcp__GitHubProjects__create-issue` to create the issue in ekitchen-ingestion repo
 - Apply appropriate labels (type, priority, component, effort)
-- Use `mcp__GitHubProjects__add-item-to-project` to add to project board
+- **CRITICAL**: Use `mcp__GitHubProjects__add-item-to-project` to add to the ekitchen-ingestion project board
 - Place in the appropriate column (To Do/Backlog)
+- Verify the issue appears on both the repo and the project board
 
 **Local Issue File Creation:**
 1. Create `issues/` directory in feature folder if it doesn't exist

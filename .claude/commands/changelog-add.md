@@ -1,6 +1,10 @@
 # Changelog Add Command
 
+**Command Arguments**: $ARGUMENTS
+
 Add entries to the branch changelog to track work progress and maintain context for conversation compaction.
+
+Parse the arguments above to determine the entry type and content (--type, --issue, --summary, etc.).
 
 ## Your Role
 

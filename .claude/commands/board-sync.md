@@ -1,6 +1,10 @@
 # Board Sync Command
 
+**Command Arguments**: $ARGUMENTS
+
 Synchronize GitHub project board status with local issue files bidirectionally.
+
+Parse the arguments above to determine sync scope (--issue, --feature, --all, or default full sync).
 
 ## Your Role
 

@@ -1,6 +1,10 @@
 # Orchestrator Agent - Autonomous Development Interface
 
+**Command Arguments**: $ARGUMENTS
+
 You are the **Orchestrator Agent** - the main interface for autonomous development sessions. You coordinate Project Manager agents and oversee autonomous feature development using tmux orchestration.
+
+Parse the arguments above to determine the specific orchestration action requested (--feature, --issue, --status, --features, etc.).
 
 ## Your Role
 
@@ -202,17 +206,29 @@ Begin by reading your issue file and implementation plan, then start coding."
 ```
 
 ### Check-in Tasks (Every 5 Minutes)
-1. **Enhanced Health Monitoring**: Use tmux_utils.py to get real agent status
-2. **Resource Allocation**: Ensure max 3 engineers across all features
-3. **Progress Updates**: Generate feature progress summaries
-4. **Conflict Resolution**: Handle resource conflicts or blockers
-5. **User Updates**: Prepare progress summary for user review
-6. **Next Schedule**: Schedule your next check-in
+1. **Active Work Check**: Determine if any engineers or PM agents are currently working
+2. **Enhanced Health Monitoring**: Use tmux_utils.py to get real agent status (if work active)
+3. **Resource Allocation**: Ensure max 3 engineers across all features (if work active)
+4. **Progress Updates**: Generate feature progress summaries (if work active)
+5. **Conflict Resolution**: Handle resource conflicts or blockers (if work active)
+6. **User Updates**: Prepare progress summary for user review (if work active)
+7. **Next Schedule**: Schedule appropriate check-in (longer interval if no work active)
 
 ### Cross-Feature Coordination with Enhanced Monitoring
 ```bash
-# Get comprehensive system status using enhanced monitoring
+# Smart check-in: only do work if there are active agents
 SYSTEM_STATUS=$(python3 tmux_utils.py --snapshot)
+TOTAL_ACTIVE_AGENTS=$(echo "$SYSTEM_STATUS" | jq -r '.pm_agents | length + (.engineer_agents | length)')
+
+if [ "$TOTAL_ACTIVE_AGENTS" -eq 0 ]; then
+  echo "No active autonomous agents detected. Scheduling longer check-in interval..."
+  ./schedule_with_note.sh 15 "Orchestrator check: Monitor for new autonomous work (extended interval - no active work)"
+  exit 0
+fi
+
+echo "Active agents detected: $TOTAL_ACTIVE_AGENTS. Performing full monitoring check..."
+
+# Get comprehensive system status using enhanced monitoring
 
 # Extract real agent health data
 ENGINEERS_ACTIVE=$(echo "$SYSTEM_STATUS" | jq -r '.resource_utilization.engineers_active')
@@ -245,6 +261,93 @@ if [ -n "$POTENTIAL_ISSUES" ]; then
   echo "$POTENTIAL_ISSUES" | jq -r '.[]'
   # Handle specific issue types automatically
 fi
+
+# Smart board synchronization - check before moving
+echo "Checking GitHub board status synchronization..."
+
+# For each active engineer, ensure issue is in 'In Progress' column
+echo "$ENGINEER_STATUS" | jq -r '.[] | select(.estimated_health == "healthy") | .issue_number' | while read ISSUE_NUM; do
+  if [ -n "$ISSUE_NUM" ]; then
+    # Check current board status first
+    echo "Checking board status for issue #$ISSUE_NUM"
+    CURRENT_BOARD_STATUS=$(mcp__GitHubProjects__get-project-items --id {ekitchen-ingestion-project-id} --filter "issue:$ISSUE_NUM" 2>/dev/null | jq -r '.items[0].fieldValues.status // "To Do"')
+    
+    if [ "$CURRENT_BOARD_STATUS" != "In Progress" ]; then
+      echo "Moving issue #$ISSUE_NUM from '$CURRENT_BOARD_STATUS' to 'In Progress' (engineer actively working)"
+      # Use board-sync command to handle the move
+      /board-sync --issue $ISSUE_NUM --status "In Progress"
+    else
+      echo "✓ Issue #$ISSUE_NUM already in 'In Progress' status"
+    fi
+  fi
+done
+
+# Check for completed issues that need to move to 'Done'
+COMPLETED_ISSUES=$(find project-breakdown/features/*/issues/ -name "*.md" -exec grep -l "Status: Completed" {} \; 2>/dev/null | sed -n 's/.*issue\([0-9]\+\)\.md/\1/p')
+for ISSUE_NUM in $COMPLETED_ISSUES; do
+  if [ -n "$ISSUE_NUM" ]; then
+    echo "Checking completion status for issue #$ISSUE_NUM"
+    CURRENT_BOARD_STATUS=$(mcp__GitHubProjects__get-project-items --id {ekitchen-ingestion-project-id} --filter "issue:$ISSUE_NUM" 2>/dev/null | jq -r '.items[0].fieldValues.status // "unknown"')
+    
+    if [ "$CURRENT_BOARD_STATUS" != "Done" ]; then
+      echo "Moving completed issue #$ISSUE_NUM from '$CURRENT_BOARD_STATUS' to 'Done'"
+      /board-sync --issue $ISSUE_NUM --status "Done"
+    else
+      echo "✓ Issue #$ISSUE_NUM already in 'Done' status"
+    fi
+  fi
+done
+
+# Intelligent feedback and guidance for engineers
+echo "Analyzing engineer progress and providing guidance..."
+echo "$ENGINEER_STATUS" | jq -r '.[] | select(.estimated_health != "unresponsive") | .session_name' | while read ENG_SESSION; do
+  ISSUE_NUM=$(echo "$ENGINEER_STATUS" | jq -r --arg session "$ENG_SESSION" 'select(.session_name == $session) | .issue_number')
+  HEALTH=$(echo "$ENGINEER_STATUS" | jq -r --arg session "$ENG_SESSION" 'select(.session_name == $session) | .estimated_health')
+  FEATURE=$(echo "$ENGINEER_STATUS" | jq -r --arg session "$ENG_SESSION" 'select(.session_name == $session) | .feature_name')
+  
+  # MANDATORY GIT WORKFLOW CHECK - Every Check-in
+  echo "Enforcing git workflow for engineer $ENG_SESSION (issue #$ISSUE_NUM)..."
+  ./send-claude-message.sh "$ENG_SESSION:0" "ORCHESTRATOR GIT CHECK (every check-in):
+
+1. **Check your last commit time**: Run 'git log -1 --format=\"%cr\" --grep=\"issue-$ISSUE_NUM\"' 
+2. **If >30 minutes since last commit**: You MUST commit your current progress
+3. **Branch safety check**: Run 'git branch --show-current'
+   - If you're on 'development' or 'main': Create feature branch first with 'git checkout -b feature/issue-$ISSUE_NUM' 
+   - Then commit your work: 'git add -A && git commit -m \"feat(issue-$ISSUE_NUM): [describe your progress]\"'
+4. **If <30 minutes**: Continue working, but commit at next logical stopping point
+
+This check happens every 5 minutes to maintain proper git discipline."
+
+  # Health-based guidance
+  case "$HEALTH" in
+    "stuck")
+      echo "Engineer $ENG_SESSION appears stuck on issue #$ISSUE_NUM. Providing guidance..."
+      ./send-claude-message.sh "$ENG_SESSION:0" "ORCHESTRATOR GUIDANCE: You appear to be stuck. Please:
+1. Review the implementation plan in your issue file - are you following the step-by-step approach?
+2. Check project-breakdown/context/patterns.md for similar implementations
+3. Ensure you're following FastMCP async patterns from PROJECT_CONTEXT.md
+4. If blocked >15 minutes, describe your specific blocker for assistance
+5. Remember to commit your current progress every 15 minutes"
+      ;;
+    "healthy")
+      # Check if engineer has been working for >30 minutes without commits
+      LAST_COMMIT=$(cd . && git log --oneline --grep="issue-$ISSUE_NUM" -1 --since="30 minutes ago" || echo "")
+      if [ -z "$LAST_COMMIT" ]; then
+        echo "Engineer $ENG_SESSION working >30min without commits. Reinforcing git discipline..."
+        ./send-claude-message.sh "$ENG_SESSION:0" "ORCHESTRATOR REMINDER: Please commit your current progress. You should commit every 15 minutes or after completing logical units of work. Use: git add -A && git commit -m 'feat(issue-$ISSUE_NUM): [progress description]'"
+      fi
+      ;;
+    "error")
+      echo "Engineer $ENG_SESSION in error state. Providing troubleshooting guidance..."
+      ./send-claude-message.sh "$ENG_SESSION:0" "ORCHESTRATOR ASSISTANCE: Error detected. Please:
+1. Share the specific error you're encountering
+2. Check if you're following the eKitchen architectural patterns
+3. Verify your environment setup (MCP servers, dependencies)
+4. Review the acceptance criteria in your issue file
+5. If this is a blocking error, report details for immediate assistance"
+      ;;
+  esac
+done
 ```
 ```
 

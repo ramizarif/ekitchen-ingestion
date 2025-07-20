@@ -249,7 +249,14 @@ Ready for auto-sync to board and changelog."
 
 ### Git Commit Standards
 ```bash
-# Commit every 30 minutes with descriptive messages:
+# CRITICAL: Check branch safety BEFORE every commit
+CURRENT_BRANCH=$(git branch --show-current)
+if [ "$CURRENT_BRANCH" = "development" ] || [ "$CURRENT_BRANCH" = "main" ]; then
+  echo "SAFETY: Creating feature branch for issue #{issue-number}"
+  git checkout -b feature/issue-{issue-number}
+fi
+
+# Commit EVERY 15 MINUTES or after completing any logical unit of work:
 git add -A
 git commit -m "feat(issue-{number}): {brief description of progress}
 
@@ -265,6 +272,31 @@ Issue #{issue-number}"
 - **refactor**: code refactoring
 - **test**: test additions/modifications
 - **docs**: documentation updates
+
+# Branch workflow:
+- NEVER commit directly to 'development' or 'main'
+- Always create feature branch: feature/issue-{number}
+- Work on feature branch throughout implementation
+```
+
+### Responding to Orchestrator Git Checks
+```bash
+# The Orchestrator will check your git discipline every 5 minutes
+# When you receive "ORCHESTRATOR GIT CHECK", immediately:
+
+1. **Check your last commit time**:
+   git log -1 --format="%cr" --grep="issue-{issue-number}"
+   
+2. **If output shows >30 minutes ago, commit immediately**:
+   - Check current branch: git branch --show-current
+   - If on development/main: git checkout -b feature/issue-{issue-number}
+   - Commit your work: git add -A && git commit -m "feat(issue-{issue-number}): [current progress]"
+   
+3. **If <30 minutes, acknowledge and continue**:
+   echo "Last commit was recent, continuing work on issue #{issue-number}"
+
+# Example response pattern:
+"Orchestrator check received. Last commit: 45 minutes ago. Creating feature branch and committing current progress on API endpoint implementation."
 ```
 ```
 
