@@ -174,8 +174,11 @@ class UrlManager:
         )
         
         try:
-            # Get search URLs for this site (now includes intelligent discovery)
-            search_urls = await self.site_manager.build_search_urls(site, query)
+            # Get search URLs for this site (use enhanced method if available)
+            if hasattr(self.site_manager, 'build_search_urls_enhanced'):
+                search_urls = await self.site_manager.build_search_urls_enhanced(site, query)
+            else:
+                search_urls = self.site_manager.build_search_urls(site, query)
             if not search_urls:
                 self.logger.warning(f"No search URLs available for {site.domain}")
                 return await self._heuristic_recipe_discovery(site, query, max_urls)

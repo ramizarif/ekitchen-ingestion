@@ -58,9 +58,13 @@ class SiteManager:
             
         self.load_site_configs()
         
-        # Load cache on startup
+        # Load cache on startup (only if event loop is running)
         if self.search_cache:
-            asyncio.create_task(self.search_cache.load_cache())
+            try:
+                asyncio.create_task(self.search_cache.load_cache())
+            except RuntimeError:
+                # No event loop running, cache will load when needed
+                pass
         
     def load_site_configs(self):
         """Load site configurations from JSON file"""
@@ -248,8 +252,65 @@ class SiteManager:
             # Default to True on error to avoid false negatives
             return True
         
-    async def build_search_urls(self, site: SiteConfig, query: str) -> List[str]:
-        """Enhanced search URL building with intelligent discovery
+    def build_search_urls(self, site: SiteConfig, query: str) -> List[str]:
+        """Build search URLs for a site and query (ORIGINAL SYNC METHOD)
+        
+        Args:
+            site: Site configuration
+            query: Search query string
+            
+        Returns:
+            List of complete search URLs
+        """
+        if not site.search_paths:
+            self.logger.warning(
+                "No search paths configured for site",
+                site_domain=site.domain
+            )
+            return []
+            
+        search_urls = []
+        
+        try:
+            # URL-encode the query for safe inclusion in URLs
+            encoded_query = urllib.parse.quote_plus(query)
+            
+            for path_template in site.search_paths:
+                try:
+                    # Replace {query} placeholder with encoded query
+                    path = path_template.format(query=encoded_query)
+                    full_url = urljoin(site.base_url, path)
+                    search_urls.append(full_url)
+                    
+                except Exception as e:
+                    self.logger.error(
+                        "Failed to build search URL",
+                        site_domain=site.domain,
+                        path_template=path_template,
+                        query=query,
+                        error=str(e)
+                    )
+                    continue
+                    
+        except Exception as e:
+            self.logger.error(
+                "Error building search URLs",
+                site_domain=site.domain,
+                query=query,
+                error=str(e)
+            )
+            
+        self.logger.debug(
+            "Built search URLs for site",
+            site_domain=site.domain,
+            query=query,
+            url_count=len(search_urls)
+        )
+        
+        return search_urls
+        
+    async def build_search_urls_enhanced(self, site: SiteConfig, query: str) -> List[str]:
+        """Enhanced search URL building with intelligent discovery (NEW ASYNC METHOD)
         
         Args:
             site: Site configuration
