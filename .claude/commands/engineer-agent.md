@@ -54,12 +54,17 @@ echo "Blockers: {any blockers or 'None'}"
 echo "========================================"
 ```
 
-### When PM Requests Status
+### When PM Requests Status  
 ```bash
-# PM will ask: "PM STATUS REQUEST"
-# Respond with: "PM REPORT: Phase {X} {%} complete. ETA: {time}. Current: {specific step from implementation plan}. Blockers: {none/details}"
+# PM will send: "/engineer-status-request"
+# This slash command provides clear instructions on:
+# 1. What status information to include
+# 2. How to format your response
+# 3. How to capture and send terminal context
+# 4. Exact upstream command syntax
 
-# ALWAYS reference which specific step from implementation plan you're on
+# Follow the instructions in the /engineer-status-request command
+# It will guide you through sending a proper /engineer-report upstream
 ```
 
 ### When PM Provides Guidance
