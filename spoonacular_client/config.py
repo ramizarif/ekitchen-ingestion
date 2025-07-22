@@ -7,6 +7,8 @@ from pathlib import Path
 from typing import Optional
 import structlog
 
+from .exceptions import SpoonacularConfigError
+
 logger = structlog.get_logger()
 
 
@@ -47,7 +49,7 @@ def load_config(config_path: Optional[str] = None) -> SpoonacularConfig:
     config_file = Path(config_path)
     
     if not config_file.exists():
-        raise FileNotFoundError(
+        raise SpoonacularConfigError(
             f"Spoonacular config file not found: {config_file}. "
             "Please create config/spoonacular.json with your API key."
         )
@@ -56,12 +58,12 @@ def load_config(config_path: Optional[str] = None) -> SpoonacularConfig:
         with open(config_file, 'r') as f:
             config_data = json.load(f)
     except json.JSONDecodeError as e:
-        raise ValueError(f"Invalid JSON in config file: {e}")
+        raise SpoonacularConfigError(f"Invalid JSON in config file: {e}")
     
     # Validate API key
     api_key = config_data.get('api_key', '').strip()
     if not api_key or api_key == "YOUR_SPOONACULAR_API_KEY_HERE":
-        raise ValueError(
+        raise SpoonacularConfigError(
             "Please set a valid Spoonacular API key in config/spoonacular.json. "
             "Get your API key from https://spoonacular.com/food-api"
         )

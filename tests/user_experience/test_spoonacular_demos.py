@@ -25,7 +25,8 @@ from spoonacular_client import (
     SpoonacularRateLimitError,
     SpoonacularNotFoundError
 )
-from spoonacular_client.config import get_config, SpoonacularConfigError
+from spoonacular_client.config import get_config
+from spoonacular_client.exceptions import SpoonacularConfigError
 from spoonacular_client.models import (
     IngredientSearchResult,
     IngredientInformation,
