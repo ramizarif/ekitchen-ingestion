@@ -172,6 +172,9 @@ tmux send-keys -t eng-recipe-search-123:0 'claude' Enter
 ```bash
 "You are a Project Manager for the {feature-name} feature.
 
+YOUR SESSION: {pm-session-name}
+IMPORTANT: Use your exact session name for scheduling: {pm-session-name}
+
 CONTEXT TO READ FIRST:
 - PROJECT_CONTEXT.md - Understand the application
 - project-breakdown/features/{feature-name}/ - Your feature scope
@@ -184,7 +187,7 @@ YOUR RESPONSIBILITIES:
 4. Monitor engineer progress every 5 minutes
 5. Update feature progress.md after status changes
 6. Auto-sync GitHub board and changelog entries
-7. Schedule your own check-ins: ./schedule_with_note.sh 5 'PM check: {feature-name}'
+7. Schedule your own check-ins: ./schedule_with_note.sh 5 'PM check: {feature-name}' '{pm-session-name}'
 
 ENGINEER SPAWNING:
 - Use: spawn_validated_engineer {issue-number} function for reliability

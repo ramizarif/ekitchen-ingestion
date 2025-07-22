@@ -14,6 +14,11 @@ from urllib.parse import urlparse, urljoin
 from pathlib import Path
 import structlog
 
+try:
+    from recipe_scrapers import SCRAPERS
+except ImportError:
+    SCRAPERS = {}
+
 from .models import SiteConfig, DiscoveryResult
 from .utils.logging import get_logger
 from .search_url_discoverer import SearchUrlDiscoverer
@@ -34,15 +39,11 @@ class SiteManager:
         """Initialize site manager with configuration
         
         Args:
-            config_path: Path to sites.json configuration file
+            config_path: Path to sites.json configuration file (deprecated - now uses recipe_scrapers)
             http_client: HTTP client for discovery operations
         """
-        if config_path is None:
-            # Default to config/sites.json relative to this file
-            current_dir = Path(__file__).parent
-            config_path = current_dir / "config" / "sites.json"
-        
-        self.config_path = Path(config_path)
+        # Keep config_path for backward compatibility, but it's no longer used
+        self.config_path = Path(config_path) if config_path else None
         self.sites: Dict[str, SiteConfig] = {}
         self.global_settings: Dict[str, any] = {}
         self.logger = structlog.get_logger().bind(component="site_manager")
@@ -67,51 +68,134 @@ class SiteManager:
                 pass
         
     def load_site_configs(self):
-        """Load site configurations from JSON file"""
+        """Load site configurations from recipe-scrapers library"""
         try:
-            if not self.config_path.exists():
-                self.logger.warning(
-                    "Site configuration file not found, using defaults",
-                    config_path=str(self.config_path)
-                )
+            # Load global settings (defaults)
+            self.global_settings = {
+                "max_total_concurrent": 10,
+                "default_timeout": 30,
+                "default_rate_limit": 2.0,
+                "max_urls_per_site": 50,
+                "user_agent": "eKitchen Recipe Discovery Bot 1.0"
+            }
+            
+            # Load sites from recipe-scrapers
+            if not SCRAPERS:
+                self.logger.warning("recipe-scrapers not available, using fallback sites")
                 self._load_default_configs()
                 return
                 
-            with open(self.config_path, 'r') as f:
-                config_data = json.load(f)
-                
-            # Load global settings
-            self.global_settings = config_data.get("global_settings", {})
-            
-            # Load site configurations
-            sites_data = config_data.get("sites", {})
-            for domain, site_data in sites_data.items():
+            # Create site configs for all recipe-scrapers supported sites
+            sites_loaded = 0
+            for domain in SCRAPERS.keys():
                 try:
-                    self.sites[domain] = SiteConfig(
-                        domain=domain,
-                        **site_data
+                    # Clean up domain (remove www. prefix if present)
+                    clean_domain = domain.replace('www.', '') if domain.startswith('www.') else domain
+                    
+                    # Create a human-readable name from domain
+                    name_parts = clean_domain.split('.')
+                    if len(name_parts) >= 2:
+                        # Take the main domain part and capitalize
+                        name = name_parts[0].replace('-', ' ').replace('_', ' ').title()
+                    else:
+                        name = clean_domain.title()
+                    
+                    # Determine priority based on popularity (simplified heuristic)
+                    priority = self._get_site_priority(clean_domain)
+                    
+                    # Create default search paths (will be discovered/cached later)
+                    search_paths = [
+                        "/search?q={query}",
+                        "/search/?q={query}",
+                        "/recipes/search?query={query}",
+                        "/?s={query}"
+                    ]
+                    
+                    # Default recipe URL patterns
+                    recipe_patterns = [
+                        "/recipe/.*",
+                        "/recipes/.*",
+                        r"/\d{4}/\d{2}/.*",  # Date-based URLs
+                        r"/[^/]+/\d+/.*"      # Generic recipe URLs
+                    ]
+                    
+                    self.sites[clean_domain] = SiteConfig(
+                        domain=clean_domain,
+                        name=name,
+                        base_url=f"https://{clean_domain}",
+                        search_paths=search_paths,
+                        recipe_url_patterns=recipe_patterns,
+                        priority=priority,
+                        enabled=True,  # All sites enabled by default
+                        rate_limit=self._get_default_rate_limit(priority),
+                        max_concurrent=self._get_default_concurrent(priority)
                     )
+                    sites_loaded += 1
+                    
                 except Exception as e:
-                    self.logger.error(
-                        "Failed to load site configuration",
+                    self.logger.debug(
+                        "Failed to create site configuration",
                         domain=domain,
                         error=str(e)
                     )
                     continue
                 
             self.logger.info(
-                "Site configurations loaded successfully",
-                total_sites=len(self.sites),
+                "Site configurations loaded from recipe-scrapers",
+                total_scrapers_available=len(SCRAPERS),
+                sites_loaded=sites_loaded,
                 enabled_sites=len(self.get_enabled_sites())
             )
             
         except Exception as e:
             self.logger.error(
-                "Failed to load site configurations",
-                config_path=str(self.config_path),
+                "Failed to load site configurations from recipe-scrapers",
                 error=str(e)
             )
             self._load_default_configs()
+    
+    def _get_site_priority(self, domain: str) -> str:
+        """Determine site priority based on domain popularity"""
+        # High priority sites (popular, reliable)
+        high_priority = {
+            'allrecipes.com', 'foodnetwork.com', 'epicurious.com', 
+            'bbcgoodfood.com', 'delish.com', 'tasteofhome.com',
+            'bettycrocker.com', 'pillsbury.com', 'food.com',
+            'yummly.com', 'cookingchanneltv.com'
+        }
+        
+        # Medium priority sites 
+        medium_priority = {
+            'simplyrecipes.com', 'foodandwine.com', 'thekitchn.com',
+            'eatingwell.com', 'myrecipes.com', 'countryliving.com',
+            'realsimple.com', 'southernliving.com', 'bhg.com',
+            'marthastewart.com', 'bonappetit.com'
+        }
+        
+        if domain in high_priority:
+            return "high"
+        elif domain in medium_priority:
+            return "medium"
+        else:
+            return "low"
+    
+    def _get_default_rate_limit(self, priority: str) -> float:
+        """Get default rate limit based on priority"""
+        rate_limits = {
+            "high": 1.0,     # 1 second between requests
+            "medium": 1.5,   # 1.5 seconds between requests  
+            "low": 2.0       # 2 seconds between requests
+        }
+        return rate_limits.get(priority, 2.0)
+    
+    def _get_default_concurrent(self, priority: str) -> int:
+        """Get default concurrent requests based on priority"""
+        concurrent_limits = {
+            "high": 3,       # 3 concurrent requests
+            "medium": 2,     # 2 concurrent requests
+            "low": 1         # 1 concurrent request
+        }
+        return concurrent_limits.get(priority, 1)
             
     def _load_default_configs(self):
         """Load minimal default configurations for fallback"""
@@ -531,6 +615,6 @@ class SiteManager:
             "disabled_sites": len(self.sites) - len(enabled_sites),
             "priority_distribution": priority_counts,
             "global_settings": self.global_settings,
-            "config_path": str(self.config_path),
-            "config_loaded": self.config_path.exists()
+            "source": "recipe_scrapers_library",
+            "recipe_scrapers_available": len(SCRAPERS) if SCRAPERS else 0
         }

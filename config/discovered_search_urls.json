@@ -10,12 +10,66 @@
   },
   "foodnetwork.com": {
     "search_urls": [
+      "/search/{query}"
+    ],
+    "discovered_at": "2025-07-21T12:30:00.000000",
+    "last_verified": "2025-07-21T12:30:00.000000",
+    "success_rate": 1.0,
+    "verification_count": 1
+  },
+  "delish.com": {
+    "search_urls": [
+      "/search/?q={query}"
+    ],
+    "discovered_at": "2025-07-21T12:30:00.000000",
+    "last_verified": "2025-07-21T12:30:00.000000",
+    "success_rate": 1.0,
+    "verification_count": 1
+  },
+  "tasteofhome.com": {
+    "search_urls": [
+      "/?s={query}"
+    ],
+    "discovered_at": "2025-07-21T12:30:00.000000",
+    "last_verified": "2025-07-21T12:30:00.000000",
+    "success_rate": 1.0,
+    "verification_count": 1
+  },
+  "simplyrecipes.com": {
+    "search_urls": [
       "/search?q={query}"
     ],
-    "discovered_at": "2025-07-20T16:21:02.562017",
-    "last_verified": "2025-07-20T16:56:07.551432",
+    "discovered_at": "2025-07-21T12:30:00.000000",
+    "last_verified": "2025-07-21T12:30:00.000000",
     "success_rate": 1.0,
-    "verification_count": 3
+    "verification_count": 1
+  },
+  "foodandwine.com": {
+    "search_urls": [
+      "/search?q={query}"
+    ],
+    "discovered_at": "2025-07-21T12:30:00.000000",
+    "last_verified": "2025-07-21T12:30:00.000000",
+    "success_rate": 1.0,
+    "verification_count": 1
+  },
+  "thekitchn.com": {
+    "search_urls": [
+      "/search?q={query}"
+    ],
+    "discovered_at": "2025-07-21T12:30:00.000000",
+    "last_verified": "2025-07-21T12:30:00.000000",
+    "success_rate": 1.0,
+    "verification_count": 1
+  },
+  "eatingwell.com": {
+    "search_urls": [
+      "/search?q={query}"
+    ],
+    "discovered_at": "2025-07-21T12:30:00.000000",
+    "last_verified": "2025-07-21T12:30:00.000000",
+    "success_rate": 1.0,
+    "verification_count": 1
   },
   "epicurious.com": {
     "search_urls": [

@@ -628,7 +628,7 @@ ORCHESTRATOR_REPORT_READY=true
 ```bash
 # Only schedule next check-in if feature is not complete
 if [ "$PM_READY_FOR_TERMINATION" != "true" ]; then
-  ./scripts/schedule_with_note.sh 5 "PM check for {feature-name}: Monitor engineers and coordinate resources" "pm-{feature-name}:0"
+  ./scripts/schedule_with_note.sh 5 "PM check for {feature-name}: Monitor engineers and coordinate resources" "{pm-session-name}"
   echo "Next check-in scheduled for {feature-name} PM agent"
 else
   echo "🛑 Feature complete - no further check-ins scheduled. Waiting for orchestrator termination."
@@ -985,8 +985,15 @@ Everything proceeding autonomously. No user intervention required."
 ## Current Session Context
 
 **Your Feature**: {feature-name}
-**Tmux Session**: pm-{feature-name}:0
+**Your Tmux Session**: {pm-session-name}
 **Active Engineers**: {count}/3
 **Current Phase**: {initialization|development|completion}
+
+**IMPORTANT**: When scheduling check-ins, always use your exact session name: {pm-session-name}
+
+Example scheduling command:
+```bash
+./scripts/schedule_with_note.sh 5 "PM check for {feature-name}: Monitor engineers" "{pm-session-name}"
+```
 
 Begin by reading PROJECT_CONTEXT.md and your feature context files, then analyze dependencies and start spawning engineers for ready issues.

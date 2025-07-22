@@ -854,8 +854,17 @@ def _looks_like_recipe_url(href: str, text: str, site_domain: str) -> bool:
 
 
 @mcp.tool
-async def get_available_sites() -> Dict[str, Any]:
+async def get_available_sites(
+    limit: int = 50,
+    offset: int = 0,
+    names_only: bool = False
+) -> Dict[str, Any]:
     """Get list of available recipe sites and their configurations
+    
+    Args:
+        limit: Maximum number of sites to return (default: 50)
+        offset: Number of sites to skip (default: 0)
+        names_only: If True, return only site names/domains (default: False)
     
     Returns:
         Dictionary with available sites and their configurations
@@ -867,8 +876,41 @@ async def get_available_sites() -> Dict[str, Any]:
         enabled_sites = state.site_manager.get_enabled_sites()
         all_sites = state.site_manager.sites
         
+        if names_only:
+            # Return simple list of site names
+            enabled_domains = sorted([site.domain for site in enabled_sites])
+            disabled_domains = sorted([site.domain for domain, site in all_sites.items() if not site.enabled])
+            
+            # Apply pagination to names
+            start_idx = offset
+            end_idx = offset + limit
+            enabled_page = enabled_domains[start_idx:end_idx]
+            
+            result = {
+                "success": True,
+                "enabled_sites": enabled_page,
+                "disabled_sites": disabled_domains if offset == 0 else [],
+                "total_enabled": len(enabled_domains),
+                "total_disabled": len(disabled_domains),
+                "pagination": {
+                    "limit": limit,
+                    "offset": offset,
+                    "has_more": end_idx < len(enabled_domains)
+                },
+                "timestamp": datetime.now().isoformat()
+            }
+            
+            tracker.log_success(
+                enabled_sites=len(enabled_page),
+                names_only=True
+            )
+            return result
+        
+        # Full details with pagination
         site_info = []
-        for site in enabled_sites:
+        paginated_sites = enabled_sites[offset:offset + limit]
+        
+        for site in paginated_sites:
             site_info.append({
                 "domain": site.domain,
                 "name": site.name,
@@ -880,14 +922,16 @@ async def get_available_sites() -> Dict[str, Any]:
                 "enabled": site.enabled
             })
         
+        # Only include disabled sites on first page to reduce response size
         disabled_sites = []
-        for domain, site in all_sites.items():
-            if not site.enabled:
-                disabled_sites.append({
-                    "domain": site.domain,
-                    "name": site.name,
-                    "enabled": site.enabled
-                })
+        if offset == 0:
+            for domain, site in all_sites.items():
+                if not site.enabled:
+                    disabled_sites.append({
+                        "domain": site.domain,
+                        "name": site.name,
+                        "enabled": site.enabled
+                    })
         
         result = {
             "success": True,
@@ -895,13 +939,19 @@ async def get_available_sites() -> Dict[str, Any]:
             "disabled_sites": disabled_sites,
             "total_sites": len(all_sites),
             "enabled_count": len(enabled_sites),
-            "disabled_count": len(disabled_sites),
-            "site_manager_stats": state.site_manager.get_stats(),
+            "disabled_count": len([s for s in all_sites.values() if not s.enabled]),
+            "pagination": {
+                "limit": limit,
+                "offset": offset,
+                "returned_count": len(site_info),
+                "has_more": (offset + limit) < len(enabled_sites)
+            },
+            "site_manager_stats": state.site_manager.get_stats() if offset == 0 else {},
             "timestamp": datetime.now().isoformat()
         }
         
         tracker.log_success(
-            enabled_sites=len(enabled_sites),
+            enabled_sites=len(site_info),
             total_sites=len(all_sites)
         )
         
@@ -923,6 +973,10 @@ async def get_search_url_cache_stats() -> Dict[str, Any]:
     tracker.log_start()
     
     try:
+        # Ensure we have the latest data from disk
+        state._ensure_services_initialized()
+        await state.search_url_cache.load_cache()
+        
         # Get cache statistics
         cache_stats = await state.search_url_cache.get_cache_stats()
         
@@ -1085,60 +1139,44 @@ async def smart_extract_recipe_urls(
 async def get_cached_sites() -> Dict[str, Any]:
     """Get list of sites that have verified search URLs in cache
     
-    Returns only sites with cached search URLs, useful for cache-only
-    recipe discovery operations.
+    Returns the contents of the discovered_search_urls.json cache file directly.
     
     Returns:
-        Dictionary with cached sites and their cache status
+        Dictionary with cached sites and their cache data
     """
     tracker = create_request_tracker(str(uuid.uuid4()), "get_cached_sites")
     tracker.log_start()
     
     try:
-        # Get all enabled sites
-        enabled_sites = state.site_manager.get_enabled_sites()
+        import json
+        import os
         
-        # Filter to only sites with cached URLs
-        cached_sites = []
-        uncached_sites = []
+        # Read the cache file directly
+        cache_file_path = os.path.join(os.path.dirname(os.path.dirname(__file__)), "config", "discovered_search_urls.json")
         
-        for site in enabled_sites:
-            domain_info = await state.search_url_cache.get_domain_cache_info(site.domain)
-            
-            site_data = {
-                "domain": site.domain,
-                "name": site.name,
-                "priority": site.priority,
-                "rate_limit": site.rate_limit,
-                "max_concurrent": site.max_concurrent,
-                "search_paths_count": len(site.search_paths),
-                "recipe_patterns_count": len(site.recipe_url_patterns)
+        if not os.path.exists(cache_file_path):
+            return {
+                "success": True,
+                "cached_sites": {},
+                "message": "No cache file found - no sites cached yet",
+                "cache_file_path": cache_file_path,
+                "timestamp": datetime.now().isoformat()
             }
-            
-            if domain_info and domain_info.get('cached_urls_count', 0) > 0:
-                site_data.update({
-                    "cached_urls_count": domain_info.get('cached_urls_count', 0),
-                    "last_updated": domain_info.get('last_updated'),
-                    "cache_age_hours": domain_info.get('cache_age_hours', 0)
-                })
-                cached_sites.append(site_data)
-            else:
-                uncached_sites.append(site_data)
+        
+        with open(cache_file_path, 'r') as f:
+            cached_sites_data = json.load(f)
         
         result = {
             "success": True,
-            "cached_sites": cached_sites,
-            "uncached_sites": uncached_sites,
-            "total_sites": len(enabled_sites),
-            "cached_sites_count": len(cached_sites),
-            "cache_coverage_percentage": (len(cached_sites) / len(enabled_sites) * 100) if enabled_sites else 0,
+            "cached_sites": cached_sites_data,
+            "cached_sites_count": len(cached_sites_data),
+            "cache_file_path": cache_file_path,
             "timestamp": datetime.now().isoformat()
         }
         
         tracker.log_success(
-            cached_sites_count=len(cached_sites),
-            total_sites=len(enabled_sites),
-            cache_coverage=result["cache_coverage_percentage"]
+            cached_sites_count=len(cached_sites_data),
+            cache_file_path=cache_file_path
         )
         
         return result
@@ -1149,118 +1187,411 @@ async def get_cached_sites() -> Dict[str, Any]:
 
 
 @mcp.tool
-async def populate_search_url_cache() -> Dict[str, Any]:
-    """Workflow tool to trigger cache population for uncached sites
+async def get_search_url_for_query(
+    query: str,
+    site: str = "allrecipes.com"
+) -> Dict[str, Any]:
+    """Get formatted search URL for a query and provide workflow instructions
     
-    Provides guidance on populating search URL cache using external
-    Playwright MCP for browser automation. Returns list of uncached
-    sites and workflow instructions.
+    Returns the search URL and instructions for Claude to use external tools
+    like Playwright MCP for dynamic content scraping.
     
+    Args:
+        query: Search query (e.g., 'avocado')
+        site: Site domain to search (default: 'allrecipes.com')
+        
     Returns:
-        Dictionary with uncached sites and population workflow instructions
+        Dictionary with formatted URL and workflow instructions
     """
-    tracker = create_request_tracker(str(uuid.uuid4()), "populate_search_url_cache")
+    tracker = create_request_tracker(str(uuid.uuid4()), "get_search_url_for_query")
     tracker.log_start()
     
     try:
-        # Get sites that need cache population
-        enabled_sites = state.site_manager.get_enabled_sites()
-        uncached_sites = []
+        import json
+        import os
         
-        for site in enabled_sites:
-            domain_info = await state.search_url_cache.get_domain_cache_info(site.domain)
-            
-            if not domain_info or domain_info.get('cached_urls_count', 0) == 0:
-                uncached_sites.append({
-                    "domain": site.domain,
-                    "name": site.name,
-                    "base_url": f"https://{site.domain}",
-                    "suggested_search_query": "pasta recipes",  # Generic test query
-                    "search_paths": site.search_paths,
-                    "priority": site.priority
-                })
+        # Read the cache file to get search patterns
+        cache_file_path = os.path.join(os.path.dirname(os.path.dirname(__file__)), "config", "discovered_search_urls.json")
         
-        # Sort by priority (higher priority first)
-        uncached_sites.sort(key=lambda x: x.get('priority', 0), reverse=True)
-        
-        workflow_instructions = {
-            "overview": "Use external Playwright MCP to discover search URLs for uncached sites",
-            "steps": [
-                {
-                    "step": 1,
-                    "action": "Setup Playwright MCP",
-                    "description": "Ensure Microsoft Playwright MCP is configured and running",
-                    "tools_needed": ["Microsoft Playwright MCP"]
-                },
-                {
-                    "step": 2, 
-                    "action": "Browser Navigation",
-                    "description": "For each uncached site, navigate to base_url using Playwright",
-                    "example": "Navigate to https://allrecipes.com"
-                },
-                {
-                    "step": 3,
-                    "action": "Search Form Detection", 
-                    "description": "Use AI to detect search form elements and input fields",
-                    "tip": "Look for search boxes, search buttons, or search icons"
-                },
-                {
-                    "step": 4,
-                    "action": "Test Search Execution",
-                    "description": "Execute test search with suggested_search_query to find search URL pattern",
-                    "example": "Search for 'pasta recipes' and capture resulting URL"
-                },
-                {
-                    "step": 5,
-                    "action": "URL Pattern Extraction",
-                    "description": "Extract search URL pattern from browser navigation",
-                    "format": "Replace query with placeholder like: https://site.com/search?q={query}"
-                },
-                {
-                    "step": 6,
-                    "action": "Cache Update",
-                    "description": "Use update_search_url_cache() tool to store discovered URLs",
-                    "note": "This step must be done through Recipe Discovery MCP tools"
-                }
-            ],
-            "example_workflow": {
-                "site": "allrecipes.com",
-                "process": [
-                    "Playwright: Navigate to https://allrecipes.com",
-                    "Playwright: Find search input (typically id='search-input' or class='search-box')",
-                    "Playwright: Type 'pasta recipes' and submit",
-                    "Playwright: Capture resulting URL (e.g., https://allrecipes.com/search/results/?search=pasta+recipes)",
-                    "Extract pattern: https://allrecipes.com/search/results/?search={query}",
-                    "Recipe MCP: update_search_url_cache() with discovered pattern"
-                ]
+        if not os.path.exists(cache_file_path):
+            return {
+                "success": False,
+                "error": "no_cache_file",
+                "message": "No search URL cache found. Use add_to_cache() to add sites first.",
+                "timestamp": datetime.now().isoformat()
             }
-        }
+        
+        with open(cache_file_path, 'r') as f:
+            cached_sites_data = json.load(f)
+        
+        # Check if site exists in cache
+        if site not in cached_sites_data:
+            available_sites = list(cached_sites_data.keys())
+            return {
+                "success": False,
+                "error": "site_not_cached",
+                "message": f"Site '{site}' not found in cache.",
+                "available_sites": available_sites,
+                "suggestion": f"Use add_to_cache('{site}', '/search?q={{query}}') to add it first",
+                "timestamp": datetime.now().isoformat()
+            }
+        
+        # Get the search URL pattern and format with query
+        search_patterns = cached_sites_data[site]["search_urls"]
+        search_pattern = search_patterns[0]  # Use first pattern
+        
+        # Format the URL
+        if search_pattern.startswith('http'):
+            search_url = search_pattern.format(query=query)
+        else:
+            search_url = f"https://{site}{search_pattern.format(query=query)}"
         
         result = {
             "success": True,
-            "uncached_sites": uncached_sites,
-            "uncached_sites_count": len(uncached_sites),
-            "workflow_instructions": workflow_instructions,
-            "next_actions": [
-                "Setup external Playwright MCP server",
-                "Follow workflow steps for each uncached site",
-                "Use update_search_url_cache() to store discovered URLs",
-                "Verify cache population with get_cached_sites()"
-            ],
-            "estimated_time": f"{len(uncached_sites) * 2-5} minutes per site",
+            "site": site,
+            "query": query,
+            "search_url": search_url,
+            "search_pattern": search_pattern,
+            "workflow_instructions": {
+                "overview": "Use external Playwright MCP to handle dynamic content loading",
+                "steps": [
+                    f"1. Use Playwright MCP to navigate to: {search_url}",
+                    "2. Wait for search results to load completely (use browser_wait_for or similar)",
+                    "3. Take screenshot to verify content loaded (optional)",
+                    "4. Extract the final HTML content after JavaScript execution",
+                    "5. Analyze HTML to extract individual recipe URLs manually",
+                    "6. Use scrape_single_recipe() on each recipe URL found"
+                ],
+                "playwright_commands": [
+                    f"browser_navigate('{search_url}')",
+                    "browser_wait_for(time=3)  # Wait for dynamic content",
+                    "browser_snapshot()  # Get HTML after JS execution"
+                ],
+                "extraction_tips": [
+                    "Look for URLs containing '/recipe/' or '/recipes/'",
+                    "Exclude category pages like '/recipes/dinner/' or '/search/'", 
+                    "Look for links with recipe titles as text content",
+                    "Convert relative URLs to absolute URLs"
+                ]
+            },
+            "alternative_approach": {
+                "description": "If Playwright not available, try smart_extract_recipe_urls",
+                "note": "May not work with dynamic content, but worth trying",
+                "command": f"smart_extract_recipe_urls('{search_url}', '{site}', 5)"
+            },
+            "site_cache_info": {
+                "success_rate": cached_sites_data[site].get("success_rate", "unknown"),
+                "last_verified": cached_sites_data[site].get("last_verified", "unknown"),
+                "verification_count": cached_sites_data[site].get("verification_count", 0)
+            },
             "timestamp": datetime.now().isoformat()
         }
         
         tracker.log_success(
-            uncached_sites_count=len(uncached_sites),
-            total_enabled_sites=len(enabled_sites)
+            site=site,
+            query=query,
+            search_url=search_url
         )
         
         return result
         
     except Exception as e:
         tracker.log_error(e)
-        return create_error_response(e, {"operation": "populate_search_url_cache"})
+        return create_error_response(e, {
+            "operation": "get_search_url_for_query",
+            "site": site,
+            "query": query
+        })
+
+
+@mcp.tool
+async def add_to_cache(
+    domain: str,
+    search_url_pattern: str,
+    success_rate: float = 1.0
+) -> Dict[str, Any]:
+    """Add a site's search URL pattern directly to the cache
+    
+    Takes a domain and search URL pattern and adds it to the discovered_search_urls.json
+    cache file. This is the simple way to add sites found via Playwright or other means.
+    
+    Args:
+        domain: Site domain (e.g., 'testrecipe.com')
+        search_url_pattern: Search URL pattern with {query} placeholder (e.g., '/bigfatsearch?q={query}')
+        success_rate: Initial success rate (default: 1.0)
+        
+    Returns:
+        Dictionary with cache update results
+    """
+    tracker = create_request_tracker(str(uuid.uuid4()), "add_to_cache")
+    tracker.log_start()
+    
+    try:
+        import json
+        import os
+        
+        # Read the cache file directly
+        cache_file_path = os.path.join(os.path.dirname(os.path.dirname(__file__)), "config", "discovered_search_urls.json")
+        
+        # Load existing cache or create empty one
+        if os.path.exists(cache_file_path):
+            with open(cache_file_path, 'r') as f:
+                cached_sites_data = json.load(f)
+        else:
+            cached_sites_data = {}
+        
+        # Add/update the site entry
+        cached_sites_data[domain] = {
+            "search_urls": [search_url_pattern],
+            "discovered_at": datetime.now().isoformat(),
+            "last_verified": datetime.now().isoformat(),
+            "success_rate": success_rate,
+            "verification_count": 1
+        }
+        
+        # Write back to cache file
+        with open(cache_file_path, 'w') as f:
+            json.dump(cached_sites_data, f, indent=2)
+        
+        result = {
+            "success": True,
+            "action": "site_added_to_cache",
+            "domain": domain,
+            "search_url_pattern": search_url_pattern,
+            "success_rate": success_rate,
+            "cache_file_path": cache_file_path,
+            "total_cached_sites": len(cached_sites_data),
+            "message": f"Successfully added {domain} to cache with pattern: {search_url_pattern}",
+            "timestamp": datetime.now().isoformat()
+        }
+        
+        tracker.log_success(
+            domain=domain,
+            search_url_pattern=search_url_pattern,
+            total_cached_sites=len(cached_sites_data)
+        )
+        
+        return result
+        
+    except Exception as e:
+        tracker.log_error(e)
+        return create_error_response(e, {
+            "operation": "add_to_cache",
+            "domain": domain,
+            "search_url_pattern": search_url_pattern
+        })
+
+
+@mcp.tool
+async def get_tools() -> Dict[str, Any]:
+    """Get list of all available tools and their capabilities
+    
+    Returns comprehensive information about all MCP tools provided by this server,
+    including their descriptions, parameters, and usage examples.
+    
+    Returns:
+        Dictionary with all available tools and their detailed specifications
+    """
+    tracker = create_request_tracker(str(uuid.uuid4()), "get_tools")
+    tracker.log_start()
+    
+    try:
+        tools_info = {
+            "health_check": {
+                "description": "Check MCP server health and status",
+                "purpose": "Monitor server uptime, request statistics, and system health",
+                "parameters": [],
+                "returns": "Server health information including uptime and request stats",
+                "category": "system"
+            },
+            "get_server_config": {
+                "description": "Get current server configuration settings", 
+                "purpose": "Retrieve server settings for debugging and optimization",
+                "parameters": [],
+                "returns": "Current configuration including timeouts, rate limits, and debug settings",
+                "category": "system"
+            },
+            "test_connectivity": {
+                "description": "Test server connectivity and basic functionality",
+                "purpose": "Validate MCP communication and basic async operations",
+                "parameters": [],
+                "returns": "Connectivity test results for all major components",
+                "category": "system"
+            },
+            "scrape_single_recipe": {
+                "description": "Scrape a single recipe from URL with comprehensive error handling",
+                "purpose": "Extract recipe data from individual recipe page URLs",
+                "parameters": [
+                    {"name": "url", "type": "str", "required": True, "description": "Recipe URL to scrape"}
+                ],
+                "returns": "Recipe data with ingredients, instructions, and metadata",
+                "category": "scraping",
+                "example": "scrape_single_recipe('https://allrecipes.com/recipe/123/chicken-parmesan')"
+            },
+            "discover_recipes": {
+                "description": "Discover and scrape recipes across multiple sites for a query",
+                "purpose": "Main recipe discovery tool - searches sites, extracts URLs, scrapes recipes",
+                "parameters": [
+                    {"name": "query", "type": "str", "required": True, "description": "Search query for recipe discovery"},
+                    {"name": "max_urls_per_site", "type": "int", "required": False, "default": 50, "description": "Maximum URLs to discover per site"},
+                    {"name": "sites", "type": "str", "required": False, "description": "Comma-separated site domains or None for all"},
+                    {"name": "validate_urls", "type": "bool", "required": False, "default": True, "description": "Whether to validate discovered URLs"},
+                    {"name": "max_total_concurrent", "type": "int", "required": False, "default": 10, "description": "Maximum concurrent operations"},
+                    {"name": "use_smart_extraction", "type": "bool", "required": False, "default": True, "description": "Use AI-powered smart extraction"},
+                    {"name": "cached_only", "type": "bool", "required": False, "default": False, "description": "Only use sites with cached search URLs"}
+                ],
+                "returns": "Discovery results with recipes, site summaries, and metadata",
+                "category": "discovery",
+                "example": "discover_recipes('pasta carbonara', max_urls_per_site=20, sites='allrecipes.com')"
+            },
+            "get_available_sites": {
+                "description": "Get list of available recipe sites and their configurations",
+                "purpose": "View all configured recipe sites with their settings and status",
+                "parameters": [],
+                "returns": "Site configurations including enabled/disabled status, rate limits, patterns",
+                "category": "configuration"
+            },
+            "get_search_url_cache_stats": {
+                "description": "Get search URL cache statistics and discovered URLs",
+                "purpose": "Monitor cache performance and coverage across sites",
+                "parameters": [],
+                "returns": "Cache statistics, per-site cache status, and coverage metrics",
+                "category": "cache"
+            },
+            "smart_extract_recipe_urls": {
+                "description": "Extract recipe URLs from search results using AI analysis",
+                "purpose": "Use AI to intelligently extract individual recipe URLs from search pages",
+                "parameters": [
+                    {"name": "search_url", "type": "str", "required": True, "description": "URL of search results page to analyze"},
+                    {"name": "site_domain", "type": "str", "required": True, "description": "Domain of the site (e.g. 'allrecipes.com')"},
+                    {"name": "max_urls", "type": "int", "required": False, "default": 10, "description": "Maximum URLs to extract"}
+                ],
+                "returns": "Extracted recipe URLs with analysis metadata",
+                "category": "extraction",
+                "example": "smart_extract_recipe_urls('https://allrecipes.com/search/results/?search=pasta', 'allrecipes.com', 15)"
+            },
+            "get_cached_sites": {
+                "description": "Get list of sites with verified cached search URLs",
+                "purpose": "View only sites ready for cached-only recipe discovery",
+                "parameters": [],
+                "returns": "Sites with cached URLs and their cache status",
+                "category": "cache"
+            },
+            "get_search_url_for_query": {
+                "description": "Get formatted search URL for a query and provide workflow instructions",
+                "purpose": "Generate search URLs and provide instructions for external tool integration",
+                "parameters": [
+                    {"name": "query", "type": "str", "required": True, "description": "Search query (e.g. 'avocado')"},
+                    {"name": "site", "type": "str", "required": False, "default": "allrecipes.com", "description": "Site domain to search"}
+                ],
+                "returns": "Formatted search URL with Playwright MCP workflow instructions",
+                "category": "workflow",
+                "example": "get_search_url_for_query('avocado', 'allrecipes.com')"
+            },
+            "add_to_cache": {
+                "description": "Add a site's search URL pattern directly to the cache",
+                "purpose": "Simple way to add sites found via Playwright or manual discovery",
+                "parameters": [
+                    {"name": "domain", "type": "str", "required": True, "description": "Site domain (e.g. 'testrecipe.com')"},
+                    {"name": "search_url_pattern", "type": "str", "required": True, "description": "Search URL pattern with {query} placeholder"},
+                    {"name": "success_rate", "type": "float", "required": False, "default": 1.0, "description": "Initial success rate"}
+                ],
+                "returns": "Cache update results and confirmation",
+                "category": "cache",
+                "example": "add_to_cache('testrecipe.com', '/bigfatsearch?q={query}', 1.0)"
+            },
+            "clear_search_url_cache": {
+                "description": "Clear search URL cache with confirmation requirement",
+                "purpose": "Remove cached search URLs for maintenance and refresh",
+                "parameters": [
+                    {"name": "domain", "type": "str", "required": False, "description": "Specific domain to clear (clears all if not provided)"},
+                    {"name": "confirm", "type": "bool", "required": False, "default": False, "description": "Must be True to actually perform clear operation"}
+                ],
+                "returns": "Cache clear results and impact summary",
+                "category": "cache",
+                "example": "clear_search_url_cache(domain='allrecipes.com', confirm=True)"
+            },
+            "get_tools": {
+                "description": "Get list of all available tools and their capabilities",
+                "purpose": "Provide comprehensive documentation of all MCP tools",
+                "parameters": [],
+                "returns": "Complete tool specifications with parameters, examples, and categories",
+                "category": "documentation"
+            }
+        }
+        
+        # Organize tools by category
+        categories = {}
+        for tool_name, tool_info in tools_info.items():
+            category = tool_info.get('category', 'general')
+            if category not in categories:
+                categories[category] = []
+            categories[category].append({
+                "name": tool_name,
+                **tool_info
+            })
+        
+        # Generate usage recommendations
+        usage_recommendations = {
+            "getting_started": [
+                "Start with health_check() to verify server status",
+                "Use get_available_sites() to see available recipe sites",
+                "Check get_cached_sites() to see sites ready for discovery"
+            ],
+            "recipe_discovery_workflow": [
+                "1. Use discover_recipes(query) for comprehensive recipe search",
+                "2. For cache-only fast discovery: discover_recipes(query, cached_only=True)",
+                "3. For specific sites: discover_recipes(query, sites='allrecipes.com,foodnetwork.com')",
+                "4. For single recipe: scrape_single_recipe(url)"
+            ],
+            "hybrid_workflow_with_playwright": [
+                "1. Use get_search_url_for_query('avocado', 'allrecipes.com') to get search URL",
+                "2. Use Playwright MCP with the returned URL to handle dynamic content",
+                "3. Extract HTML after JavaScript execution via browser_snapshot()",
+                "4. Manually analyze HTML to find individual recipe URLs",
+                "5. Use scrape_single_recipe(url) on each recipe URL found"
+            ],
+            "cache_management": [
+                "Check cache status: get_search_url_cache_stats()",
+                "Add sites to cache: add_to_cache('domain.com', '/search?q={query}')",
+                "View cached sites: get_cached_sites()",
+                "Clear cache: clear_search_url_cache(confirm=True)"
+            ],
+            "troubleshooting": [
+                "Check server health: health_check()",
+                "View configuration: get_server_config()",
+                "Test connectivity: test_connectivity()"
+            ]
+        }
+        
+        result = {
+            "success": True,
+            "total_tools": len(tools_info),
+            "tools_by_category": categories,
+            "all_tools": tools_info,
+            "usage_recommendations": usage_recommendations,
+            "server_capabilities": {
+                "multi_site_discovery": True,
+                "ai_powered_extraction": True,
+                "search_url_caching": True,
+                "concurrent_processing": True,
+                "comprehensive_error_handling": True,
+                "structured_logging": True
+            },
+            "integration_notes": {
+                "playwright_mcp": "Required for populating search URL cache via browser automation",
+                "claude_ai": "Used for smart recipe URL extraction from search pages",
+                "recipe_scrapers": "Core library for parsing recipe data from individual pages"
+            },
+            "timestamp": datetime.now().isoformat()
+        }
+        
+        tracker.log_success(total_tools=len(tools_info))
+        return result
+        
+    except Exception as e:
+        tracker.log_error(e)
+        return create_error_response(e, {"operation": "get_tools"})
 
 
 @mcp.tool

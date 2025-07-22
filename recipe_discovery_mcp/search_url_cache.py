@@ -220,6 +220,18 @@ class SearchUrlCache:
                 entry['age_days'] = None
                 entry['expires_in_days'] = None
                 entry['is_expired'] = True
+            
+            # Add cached URLs count
+            entry['cached_urls_count'] = len(entry.get('search_urls', []))
+            
+            # Add cache age in hours for compatibility
+            if entry.get('age_days') is not None:
+                entry['cache_age_hours'] = entry['age_days'] * 24
+            else:
+                entry['cache_age_hours'] = None
+                
+            # Add last_updated field (same as last_verified for now)
+            entry['last_updated'] = entry.get('last_verified', entry.get('discovered_at'))
                 
             return entry
             
