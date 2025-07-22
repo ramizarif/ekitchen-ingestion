@@ -8,7 +8,7 @@ import os
 from typing import Optional
 from dataclasses import dataclass
 
-from ..spoonacular_client.config import get_config as get_spoonacular_config, SpoonacularConfig
+from spoonacular_client.config import get_config as get_spoonacular_config, SpoonacularConfig
 
 
 @dataclass

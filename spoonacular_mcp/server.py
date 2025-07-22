@@ -25,8 +25,8 @@ from .models import (
     IngredientSubstitutesRequest, IngredientSearchResponse,
     IngredientInfoResponse, IngredientSubstitutesResponse
 )
-from ..spoonacular_client.client import SpoonacularClient
-from ..spoonacular_client.exceptions import (
+from spoonacular_client.client import SpoonacularClient
+from spoonacular_client.exceptions import (
     SpoonacularError,
     SpoonacularAuthError,
     SpoonacularRateLimitError,
