@@ -31,12 +31,15 @@ COPY config/ ./config/
 RUN mkdir -p /app/data/generated-recipe-images/single-recipes \
     && mkdir -p /tmp/video_downloads
 
+# Default port (Railway overrides via PORT env var)
+ENV PORT=8000
+
 # Expose port
-EXPOSE 8000
+EXPOSE ${PORT}
 
-# Health check
+# Health check (uses localhost since this runs inside the container)
 HEALTHCHECK --interval=30s --timeout=10s --start-period=5s --retries=3 \
-    CMD python -c "import httpx; httpx.get('http://localhost:8000/health', timeout=5.0)" || exit 1
+    CMD python -c "import httpx; import os; httpx.get(f'http://localhost:{os.environ.get(\"PORT\", 8000)}/health', timeout=5.0)" || exit 1
 
-# Run the application
-CMD ["uvicorn", "app.main:app", "--host", "0.0.0.0", "--port", "8000"]
+# Run the application using shell form to expand $PORT
+CMD uvicorn app.main:app --host 0.0.0.0 --port $PORT
