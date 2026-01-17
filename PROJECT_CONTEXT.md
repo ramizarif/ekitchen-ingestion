@@ -4,11 +4,11 @@ This file provides essential context for any Claude agent working on this projec
 
 ## Project Overview
 
-**Project**: eKitchen Ingestion System
+**Project**: eKitchen AI Agent Ecosystem for Conversational Data Processing  
 **Purpose and Architecture**: 
-eKitchen Recipe Ingestion System - Project Brief
-What It Does
-An AI-powered system that discovers, extracts, and enriches recipe data from across the web to populate your eKitchen app with production-ready culinary content. Instead of manually curating recipes, you have conversations like "Find 500 Mediterranean recipes and fully process them into my database" and the system handles everything automatically.
+Revolutionary approach to data ingestion that replaces traditional pipelines with AI agent orchestration. Instead of building rigid ETL pipelines, we create specialized MCP (Model Context Protocol) tools that AI agents combine conversationally to achieve complex outcomes.
+
+**What It Does**: An AI agent ecosystem that enables conversations like "Find 500 Mediterranean recipes and fully process them into my database" where Claude intelligently orchestrates multiple MCP tools (Playwright for extraction, Recipe Discovery for scraping, Spoonacular for nutrition, PostgreSQL for storage) without any pipeline code.
 Why You Need It
 Your eKitchen app needs rich, structured recipe data to be valuable to users, but:
 
@@ -25,17 +25,18 @@ Traditional Approach: Build complex microservice pipelines with queues, workers,
 ❌ Rigid parsing that breaks with format changes
 ❌ Manual intervention for edge cases
 
-Your MCP + AI Approach: Conversational data processing with intelligent AI coordination
+Your AI Agent Ecosystem Approach: Conversational data processing with MCP tool orchestration
 
 ✅ 2-3 weeks development time (75% faster)
 ✅ Zero infrastructure overhead (runs locally)
-✅ AI handles format variations naturally
-✅ Intelligent error recovery and decision-making
+✅ AI handles format variations and orchestration naturally
+✅ Intelligent error recovery and workflow decisions
 ✅ Natural language control: "Fix those failed ingredient enrichments"
 
 The Core Innovation
-Instead of building rigid ETL pipelines, you're creating conversational data engineering - where AI orchestrates complex multi-step workflows through natural language while simple MCP servers provide the integration points. It's like having a smart data engineer assistant who can handle the complexity while you focus on the results.
-Bottom Line: Get production-ready recipe data faster, cheaper, and with less complexity by letting AI handle the intelligent processing decisions.
+Instead of building rigid ETL pipelines, you're creating **AI agent toolkits** - where you build focused MCP tools and AI agents orchestrate complex multi-step workflows through natural reasoning. It's like having a smart data engineer assistant who can intelligently combine your tools to handle any processing complexity while you focus on building excellent individual capabilities.
+
+**Bottom Line**: Build tools for AI agents instead of pipelines. Get production-ready recipe data faster, cheaper, and with less complexity by letting AI handle the intelligent orchestration and decision-making.
 
 ## Directory Structure & Purpose
 
