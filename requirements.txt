@@ -1,27 +1,29 @@
-# Recipe Discovery MCP Server Dependencies
-# Core MCP and async framework
-fastmcp>=0.9.0
+# FastAPI and Web Server
+fastapi>=0.110.0
+uvicorn[standard]>=0.27.0
 pydantic>=2.0.0
-structlog>=22.0.0
-python-dotenv>=1.0.0
+pydantic-settings>=2.2.0
 
-# Recipe scraping and HTTP
+# Recipe Scraping
 recipe-scrapers>=15.8.0
 httpx>=0.24.0
 beautifulsoup4>=4.12.0
+lxml>=5.0.0
+requests>=2.31.0
 
-# Spoonacular API client dependencies (Issue #11)
-# httpx already included above
-# structlog already included above
+# OpenAI (for video/image parsing and ingredient processing)
+openai>=1.0.0
 
-# Claude-powered smart extraction (no external APIs needed)
+# Ingredient Parsing
+ingredient-parser-nlp>=1.0.0
 
-# Async utilities
-asyncio-extras
+# Spoonacular API (optional)
+# Add if needed for ingredient enrichment
 
-# Development and testing (Issue #6)
+# Testing
 pytest>=7.0.0
 pytest-asyncio>=0.21.0
+pytest-cov>=4.1.0
 
-# Optional: Enhanced logging
-colorama>=0.4.6
+# Development
+python-dotenv>=1.0.0

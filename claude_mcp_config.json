@@ -2,7 +2,15 @@
   "mcpServers": {
     "recipe-discovery": {
       "command": "/Users/ramiz/ekitchen/ekitchen-ingestion/venv/bin/python3",
-      "args": ["/Users/ramiz/ekitchen/ekitchen-ingestion/run_mcp_server.py"],
+      "args": ["-m", "src.mcp_servers.recipe_discovery_mcp.server"],
+      "cwd": "/Users/ramiz/ekitchen/ekitchen-ingestion",
+      "env": {
+        "PYTHONPATH": "/Users/ramiz/ekitchen/ekitchen-ingestion"
+      }
+    },
+    "spoonacular": {
+      "command": "/Users/ramiz/ekitchen/ekitchen-ingestion/venv/bin/python3",
+      "args": ["/Users/ramiz/ekitchen/ekitchen-ingestion/scripts/start_spoonacular_mcp.py"],
       "cwd": "/Users/ramiz/ekitchen/ekitchen-ingestion",
       "env": {
         "PYTHONPATH": "/Users/ramiz/ekitchen/ekitchen-ingestion"

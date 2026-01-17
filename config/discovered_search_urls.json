@@ -8,15 +8,6 @@
     "success_rate": 0.5,
     "verification_count": 4
   },
-  "foodnetwork.com": {
-    "search_urls": [
-      "/search/{query}"
-    ],
-    "discovered_at": "2025-07-21T12:30:00.000000",
-    "last_verified": "2025-07-21T12:30:00.000000",
-    "success_rate": 1.0,
-    "verification_count": 1
-  },
   "delish.com": {
     "search_urls": [
       "/search/?q={query}"
