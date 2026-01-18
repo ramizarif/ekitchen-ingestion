@@ -55,10 +55,10 @@ def validate_ekitchen_auth() -> tuple[bool, str]:
         
         with urllib.request.urlopen(req, timeout=10) as response:
             result = json.loads(response.read().decode('utf-8'))
-            if result.get('token'):
+            if result.get('access_token'):
                 return True, "Authentication successful"
             else:
-                return False, "No token in response"
+                return False, f"No access_token in response: {list(result.keys())}"
                 
     except urllib.error.HTTPError as e:
         return False, f"HTTP {e.code}: {e.reason}"
