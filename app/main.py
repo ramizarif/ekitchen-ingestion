@@ -48,7 +48,7 @@ def validate_ekitchen_auth() -> tuple[bool, str]:
         }).encode('utf-8')
         
         req = urllib.request.Request(
-            f"{base_url}/login",
+            f"{base_url}/auth/login",
             data=login_data,
             headers={'Content-Type': 'application/json'}
         )
