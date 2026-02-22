@@ -816,3 +816,444 @@ class TestAudioConfidenceScoring:
 
         # With 120 words + basic recipe, should get at least transcript quality points
         assert score > 0.25, f"Long transcript should get length bonus, got {score}"
+
+
+class TestHybridAudioVisionRouting:
+    """Test suite for smart audio+vision routing logic."""
+
+    @pytest.fixture
+    def video_parser(self):
+        """Create VideoParser instance for testing."""
+        return VideoParser(timeout=120)
+
+    @pytest.fixture
+    def mock_audio_extraction(self):
+        """Mock audio extraction that returns high confidence result."""
+        def _mock(confidence=0.8):
+            return {
+                'success': True,
+                'transcript': "This is a detailed recipe with clear instructions.",
+                'recipe_data': {
+                    'name': 'Test Recipe',
+                    'ingredients': ['ingredient1', 'ingredient2'],
+                    'steps': ['step1', 'step2']
+                },
+                'confidence': confidence
+            }
+        return _mock
+
+    @pytest.mark.asyncio
+    async def test_high_confidence_routes_to_audio_only(self, video_parser, mock_audio_extraction):
+        """Test that high confidence (≥0.7) routes to audio-only mode."""
+        with patch.object(video_parser, '_try_audio_extraction') as mock_audio, \
+             patch.object(video_parser, '_calculate_audio_confidence') as mock_confidence, \
+             patch.object(video_parser, '_download_audio') as mock_download_audio, \
+             patch.object(video_parser, '_detect_platform') as mock_platform, \
+             patch('tempfile.mkdtemp') as mock_tempdir:
+
+            # Setup mocks
+            mock_tempdir.return_value = '/tmp/test'
+            mock_platform.return_value = ('youtube.com', 'https://youtube.com/watch?v=123')
+            mock_download_audio.return_value = {
+                'success': True,
+                'title': 'Test Recipe',
+                'description': 'Test description'
+            }
+
+            # High confidence audio result
+            mock_audio.return_value = mock_audio_extraction(confidence=0.85)
+            mock_confidence.return_value = 0.85
+
+            # Should NOT call vision methods
+            with patch.object(video_parser, '_download_video') as mock_video, \
+                 patch.object(video_parser, '_extract_key_frames') as mock_frames, \
+                 patch.object(video_parser, '_vision_extract_recipe') as mock_vision:
+
+                # Mock cleanup
+                with patch('os.path.exists', return_value=True), \
+                     patch('shutil.rmtree'):
+
+                    result = await video_parser.parse('https://youtube.com/watch?v=123')
+
+                # Verify routing
+                assert result.success
+                assert result.extraction_method == 'audio_only'
+                assert result.frames_used == 0
+                assert result.confidence_score == 0.85
+
+                # Vision methods should NOT be called
+                mock_video.assert_not_called()
+                mock_frames.assert_not_called()
+                mock_vision.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_medium_confidence_routes_to_hybrid(self, video_parser, mock_audio_extraction):
+        """Test that medium confidence (0.4-0.7) routes to hybrid mode."""
+        with patch.object(video_parser, '_try_audio_extraction') as mock_audio, \
+             patch.object(video_parser, '_calculate_audio_confidence') as mock_confidence, \
+             patch.object(video_parser, '_download_audio') as mock_download_audio, \
+             patch.object(video_parser, '_detect_platform') as mock_platform, \
+             patch('tempfile.mkdtemp') as mock_tempdir:
+
+            # Setup mocks
+            mock_tempdir.return_value = '/tmp/test'
+            mock_platform.return_value = ('tiktok.com', 'https://tiktok.com/@user/video/123')
+            mock_download_audio.return_value = {
+                'success': True,
+                'title': 'Quick Recipe',
+                'description': 'Fast recipe'
+            }
+
+            # Medium confidence audio result
+            mock_audio.return_value = mock_audio_extraction(confidence=0.55)
+            mock_confidence.return_value = 0.55
+
+            # Mock video download and vision extraction
+            with patch.object(video_parser, '_download_video') as mock_video, \
+                 patch.object(video_parser, '_extract_key_frames') as mock_frames, \
+                 patch.object(video_parser, '_vision_extract_recipe') as mock_vision:
+
+                mock_video.return_value = '/tmp/test/video.mp4'
+                mock_frames.return_value = ['frame1', 'frame2', 'frame3']
+                mock_vision.return_value = {
+                    'name': 'Enhanced Recipe',
+                    'ingredients': ['ing1', 'ing2', 'ing3'],
+                    'steps': ['step1', 'step2', 'step3']
+                }
+
+                # Mock cleanup
+                with patch('os.path.exists', return_value=True), \
+                     patch('shutil.rmtree'):
+
+                    result = await video_parser.parse('https://tiktok.com/@user/video/123')
+
+                # Verify routing to hybrid mode
+                assert result.success
+                assert result.extraction_method == 'hybrid'
+                assert result.frames_used == 3  # Hybrid uses 3 frames
+                assert result.confidence_score == 0.55
+
+                # Verify vision methods were called
+                mock_video.assert_called_once()
+                mock_frames.assert_called_once_with('/tmp/test/video.mp4', num_frames=3)
+                mock_vision.assert_called_once()
+
+                # Verify audio transcript was passed to vision
+                vision_call_kwargs = mock_vision.call_args[1]
+                assert 'audio_transcript' in vision_call_kwargs
+                assert vision_call_kwargs['audio_transcript'] is not None
+
+    @pytest.mark.asyncio
+    async def test_low_confidence_routes_to_vision_only(self, video_parser, mock_audio_extraction):
+        """Test that low confidence (<0.4) routes to vision-only mode."""
+        with patch.object(video_parser, '_try_audio_extraction') as mock_audio, \
+             patch.object(video_parser, '_calculate_audio_confidence') as mock_confidence, \
+             patch.object(video_parser, '_download_audio') as mock_download_audio, \
+             patch.object(video_parser, '_detect_platform') as mock_platform, \
+             patch('tempfile.mkdtemp') as mock_tempdir:
+
+            # Setup mocks
+            mock_tempdir.return_value = '/tmp/test'
+            mock_platform.return_value = ('instagram.com', 'https://instagram.com/reel/abc123')
+            mock_download_audio.return_value = {
+                'success': True,
+                'title': 'Recipe Reel',
+                'description': 'Visual recipe'
+            }
+
+            # Low confidence audio result (mostly music)
+            mock_audio.return_value = {
+                'success': False,
+                'confidence': 0.2,
+                'reason': 'insufficient_audio',
+                'transcript': '[music] [music] yeah'
+            }
+            mock_confidence.return_value = 0.2
+
+            # Mock video download and vision extraction
+            with patch.object(video_parser, '_download_video') as mock_video, \
+                 patch.object(video_parser, '_extract_key_frames') as mock_frames, \
+                 patch.object(video_parser, '_vision_extract_recipe') as mock_vision:
+
+                mock_video.return_value = '/tmp/test/video.mp4'
+                mock_frames.return_value = ['f1', 'f2', 'f3', 'f4', 'f5']
+                mock_vision.return_value = {
+                    'name': 'Visual Recipe',
+                    'ingredients': ['ing1', 'ing2'],
+                    'steps': ['step1', 'step2']
+                }
+
+                # Mock cleanup
+                with patch('os.path.exists', return_value=True), \
+                     patch('shutil.rmtree'):
+
+                    result = await video_parser.parse('https://instagram.com/reel/abc123')
+
+                # Verify routing to vision-only mode
+                assert result.success
+                assert result.extraction_method == 'vision_only'
+                assert result.frames_used == 5  # Vision-only uses 5 frames
+                assert result.confidence_score == 0.2
+                assert result.fallback_reason == 'insufficient_audio'  # From audio_result['reason']
+
+                # Verify vision methods were called with correct params
+                mock_video.assert_called_once()
+                mock_frames.assert_called_once_with('/tmp/test/video.mp4', num_frames=5)
+                mock_vision.assert_called_once()
+
+                # Verify NO audio transcript passed to vision (vision-only)
+                vision_call_kwargs = mock_vision.call_args[1]
+                assert vision_call_kwargs.get('audio_transcript') is None
+
+    @pytest.mark.asyncio
+    async def test_audio_extraction_failure_routes_to_vision(self, video_parser):
+        """Test that audio extraction failure routes to vision-only mode."""
+        with patch.object(video_parser, '_try_audio_extraction') as mock_audio, \
+             patch.object(video_parser, '_download_audio') as mock_download_audio, \
+             patch.object(video_parser, '_detect_platform') as mock_platform, \
+             patch('tempfile.mkdtemp') as mock_tempdir:
+
+            # Setup mocks
+            mock_tempdir.return_value = '/tmp/test'
+            mock_platform.return_value = ('youtube.com', 'https://youtube.com/shorts/xyz')
+            mock_download_audio.return_value = {
+                'success': True,
+                'title': 'Recipe Short',
+                'description': 'Quick recipe'
+            }
+
+            # Audio extraction fails completely
+            mock_audio.return_value = {
+                'success': False,
+                'confidence': 0.0,
+                'reason': 'transcription_error',
+                'transcript': ''
+            }
+
+            # Mock video download and vision extraction
+            with patch.object(video_parser, '_download_video') as mock_video, \
+                 patch.object(video_parser, '_extract_key_frames') as mock_frames, \
+                 patch.object(video_parser, '_vision_extract_recipe') as mock_vision:
+
+                mock_video.return_value = '/tmp/test/video.mp4'
+                mock_frames.return_value = ['f1', 'f2', 'f3', 'f4', 'f5']
+                mock_vision.return_value = {
+                    'name': 'Fallback Recipe',
+                    'ingredients': ['ingredient'],
+                    'steps': ['step']
+                }
+
+                # Mock cleanup
+                with patch('os.path.exists', return_value=True), \
+                     patch('shutil.rmtree'):
+
+                    result = await video_parser.parse('https://youtube.com/shorts/xyz')
+
+                # Should fallback to vision-only
+                assert result.success
+                assert result.extraction_method == 'vision_only'
+                assert result.frames_used == 5
+                assert result.fallback_reason == 'transcription_error'  # From audio_result['reason']
+
+    def test_cost_estimation_audio_only(self, video_parser):
+        """Test cost estimation for audio-only extraction."""
+        cost = video_parser._estimate_cost('audio_only', frames_used=0)
+
+        # Audio-only: Whisper + GPT-4 Text = ~$0.011
+        assert 0.010 <= cost <= 0.012, f"Audio-only cost should be ~$0.011, got ${cost}"
+
+    def test_cost_estimation_hybrid(self, video_parser):
+        """Test cost estimation for hybrid extraction with 3 frames."""
+        cost = video_parser._estimate_cost('hybrid', frames_used=3)
+
+        # Hybrid: Whisper + GPT-4 Text + 3 frames = ~$0.041
+        assert 0.039 <= cost <= 0.043, f"Hybrid cost should be ~$0.041, got ${cost}"
+
+    def test_cost_estimation_vision_only(self, video_parser):
+        """Test cost estimation for vision-only with 5 frames."""
+        cost = video_parser._estimate_cost('vision_only', frames_used=5)
+
+        # Vision-only: 5 frames = ~$0.05
+        assert 0.048 <= cost <= 0.052, f"Vision-only cost should be ~$0.05, got ${cost}"
+
+    def test_optimal_frame_count_hybrid_mode(self, video_parser):
+        """Test optimal frame count calculation for hybrid mode."""
+        # Medium confidence should return 3 frames
+        count = video_parser._get_optimal_frame_count(confidence=0.55, video_duration=60)
+        assert count == 3, "Hybrid mode should use 3 frames"
+
+    def test_optimal_frame_count_vision_short_video(self, video_parser):
+        """Test optimal frame count for short video in vision-only mode."""
+        # Low confidence + short video = 3 frames
+        count = video_parser._get_optimal_frame_count(confidence=0.2, video_duration=20)
+        assert count == 3, "Short video should use 3 frames even in vision-only"
+
+    def test_optimal_frame_count_vision_long_video(self, video_parser):
+        """Test optimal frame count for long video in vision-only mode."""
+        # Low confidence + long video = 5 frames
+        count = video_parser._get_optimal_frame_count(confidence=0.2, video_duration=120)
+        assert count == 5, "Long video should use 5 frames in vision-only"
+
+    @pytest.mark.asyncio
+    async def test_extraction_metadata_populated(self, video_parser, mock_audio_extraction):
+        """Test that extraction metadata is properly populated in ParseResult."""
+        with patch.object(video_parser, '_try_audio_extraction') as mock_audio, \
+             patch.object(video_parser, '_calculate_audio_confidence') as mock_confidence, \
+             patch.object(video_parser, '_download_audio') as mock_download_audio, \
+             patch.object(video_parser, '_detect_platform') as mock_platform, \
+             patch('tempfile.mkdtemp') as mock_tempdir:
+
+            # Setup mocks for high confidence audio-only
+            mock_tempdir.return_value = '/tmp/test'
+            mock_platform.return_value = ('youtube.com', 'https://youtube.com/watch?v=123')
+            mock_download_audio.return_value = {
+                'success': True,
+                'title': 'Test Recipe',
+                'description': 'Test'
+            }
+            mock_audio.return_value = mock_audio_extraction(confidence=0.9)
+            mock_confidence.return_value = 0.9
+
+            # Mock cleanup
+            with patch('os.path.exists', return_value=True), \
+                 patch('shutil.rmtree'):
+
+                result = await video_parser.parse('https://youtube.com/watch?v=123')
+
+            # Verify metadata fields are populated
+            assert result.extraction_method == 'audio_only'
+            assert result.frames_used == 0
+            assert result.estimated_cost is not None
+            assert result.estimated_cost > 0
+            assert result.confidence_score == 0.9
+            assert result.fallback_reason is None
+
+    @pytest.mark.asyncio
+    async def test_fallback_cascading(self, video_parser):
+        """Test graceful fallback when audio fails and vision succeeds."""
+        with patch.object(video_parser, '_try_audio_extraction') as mock_audio, \
+             patch.object(video_parser, '_download_audio') as mock_download_audio, \
+             patch.object(video_parser, '_detect_platform') as mock_platform, \
+             patch('tempfile.mkdtemp') as mock_tempdir:
+
+            # Setup mocks
+            mock_tempdir.return_value = '/tmp/test'
+            mock_platform.return_value = ('tiktok.com', 'https://tiktok.com/@user/video/123')
+            mock_download_audio.return_value = {
+                'success': True,
+                'title': 'Recipe',
+                'description': 'Test'
+            }
+
+            # Audio fails
+            mock_audio.return_value = {
+                'success': False,
+                'confidence': 0.0,
+                'reason': 'not_a_recipe',
+                'transcript': 'random music video'
+            }
+
+            # Vision succeeds
+            with patch.object(video_parser, '_download_video') as mock_video, \
+                 patch.object(video_parser, '_extract_key_frames') as mock_frames, \
+                 patch.object(video_parser, '_vision_extract_recipe') as mock_vision:
+
+                mock_video.return_value = '/tmp/test/video.mp4'
+                mock_frames.return_value = ['f1', 'f2', 'f3', 'f4', 'f5']
+                mock_vision.return_value = {
+                    'name': 'Visual Recipe',
+                    'ingredients': ['ing1'],
+                    'steps': ['step1']
+                }
+
+                # Mock cleanup
+                with patch('os.path.exists', return_value=True), \
+                     patch('shutil.rmtree'):
+
+                    result = await video_parser.parse('https://tiktok.com/@user/video/123')
+
+                # Should succeed via vision fallback
+                assert result.success
+                assert result.extraction_method == 'vision_only'
+                assert result.fallback_reason == 'not_a_recipe'  # From audio_result['reason']
+
+    @pytest.mark.asyncio
+    async def test_try_audio_extraction_success(self, video_parser):
+        """Test _try_audio_extraction with successful extraction."""
+        with patch.object(video_parser, '_transcribe_audio') as mock_transcribe, \
+             patch.object(video_parser, '_parse_transcript_to_recipe') as mock_parse:
+
+            mock_transcribe.return_value = "Detailed recipe instructions with measurements"
+            mock_parse.return_value = {
+                'is_recipe': True,
+                'name': 'Test Recipe',
+                'ingredients': ['ing1', 'ing2'],
+                'steps': ['step1', 'step2']
+            }
+
+            result = await video_parser._try_audio_extraction(
+                audio_path='/tmp/audio.m4a',
+                download_info={'title': 'Test', 'description': 'Test', 'platform': 'youtube.com', 'url': 'test'}
+            )
+
+            assert result['success'] is True
+            assert result['confidence'] == 1.0
+            assert 'recipe_data' in result
+            assert 'transcript' in result
+
+    @pytest.mark.asyncio
+    async def test_try_audio_extraction_insufficient_audio(self, video_parser):
+        """Test _try_audio_extraction with insufficient audio content."""
+        with patch.object(video_parser, '_transcribe_audio') as mock_transcribe:
+
+            # Very short transcript
+            mock_transcribe.return_value = "short"
+
+            result = await video_parser._try_audio_extraction(
+                audio_path='/tmp/audio.m4a',
+                download_info={'title': 'Test', 'description': 'Test', 'platform': 'youtube.com', 'url': 'test'}
+            )
+
+            assert result['success'] is False
+            assert result['confidence'] == 0.0
+            assert result['reason'] == 'insufficient_audio'
+
+    @pytest.mark.asyncio
+    async def test_try_audio_extraction_not_a_recipe(self, video_parser):
+        """Test _try_audio_extraction when content is not a recipe."""
+        with patch.object(video_parser, '_transcribe_audio') as mock_transcribe, \
+             patch.object(video_parser, '_parse_transcript_to_recipe') as mock_parse:
+
+            mock_transcribe.return_value = "This is a music video with no recipe content"
+            mock_parse.return_value = {
+                'is_recipe': False,
+                'name': None,
+                'ingredients': [],
+                'steps': []
+            }
+
+            result = await video_parser._try_audio_extraction(
+                audio_path='/tmp/audio.m4a',
+                download_info={'title': 'Test', 'description': 'Test', 'platform': 'youtube.com', 'url': 'test'}
+            )
+
+            assert result['success'] is False
+            assert result['confidence'] == 0.1
+            assert result['reason'] == 'not_a_recipe'
+
+    @pytest.mark.asyncio
+    async def test_try_audio_extraction_exception_handling(self, video_parser):
+        """Test _try_audio_extraction handles exceptions gracefully."""
+        with patch.object(video_parser, '_transcribe_audio') as mock_transcribe:
+
+            # Transcription fails
+            mock_transcribe.side_effect = Exception("API Error")
+
+            result = await video_parser._try_audio_extraction(
+                audio_path='/tmp/audio.m4a',
+                download_info={'title': 'Test', 'description': 'Test', 'platform': 'youtube.com', 'url': 'test'}
+            )
+
+            assert result['success'] is False
+            assert result['confidence'] == 0.0
+            assert 'API Error' in result['reason']

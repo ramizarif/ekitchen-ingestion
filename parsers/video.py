@@ -163,29 +163,29 @@ class VideoParser(BaseParser):
 
     async def parse(self, url: str, **kwargs) -> ParseResult:
         """
-        Parse a recipe from a video URL.
-        
+        Parse a recipe from a video URL using smart audio+vision routing.
+
         Pipeline:
-        1. Detect platform
-        2. Download audio directly with yt-dlp (--extract-audio)
-        3. Transcribe with Whisper API
-        4. Parse transcript with GPT-4 to extract recipe
-        
-        Note: We download audio-only to minimize bandwidth, disk usage, and legal footprint.
-        Video frames are only needed if OCR is required (not implemented yet).
-        
+        1. Detect platform and download audio (always - it's cheap)
+        2. Try audio-only extraction with Whisper + GPT-4
+        3. Calculate audio confidence score
+        4. Route based on confidence:
+           - High (≥0.7): Use audio result (cost-efficient)
+           - Medium (0.4-0.7): Enhance with 3 vision frames (hybrid)
+           - Low (<0.4): Full vision with 5 frames (vision-only)
+
         Args:
             url: Video URL (TikTok, Instagram, YouTube)
             **kwargs: Additional options
-                - need_video_frames: bool - If True, download full video for OCR (default: False)
+                - force_mode: str - Force specific mode: "audio", "hybrid", "vision"
 
         Returns:
-            ParseResult with recipe data or error information
+            ParseResult with recipe data and extraction metadata
         """
         start_time = time.time()
         temp_dir = None
-        need_video_frames = kwargs.get('need_video_frames', False)
-        
+        force_mode = kwargs.get('force_mode', None)
+
         try:
             # Step 1: Detect platform
             platform = self._detect_platform(url)
@@ -196,12 +196,12 @@ class VideoParser(BaseParser):
                     error_message=f"URL not recognized as TikTok, Instagram, or YouTube: {url}",
                     parser_name=self.parser_name
                 )
-            
+
             logger.info(f"Detected platform: {platform} for URL: {url}")
-            
-            # Resolve short URLs (TikTok /t/... links)
+
+            # Resolve short URLs
             resolved_url, resolution_error = self._resolve_short_url(url, platform)
-            
+
             if resolution_error:
                 return ParseResult(
                     success=False,
@@ -209,17 +209,18 @@ class VideoParser(BaseParser):
                     error_message=resolution_error,
                     parser_name=self.parser_name
                 )
-            
+
             if resolved_url != url:
                 logger.info(f"Using resolved URL: {resolved_url}")
-            
-            # Create temp directory for processing
+
+            # Create temp directory
             temp_dir = tempfile.mkdtemp(prefix="video_recipe_")
             audio_path = os.path.join(temp_dir, "audio.mp3")
-            
-            # Step 2: Download audio directly with yt-dlp (faster, smaller footprint)
-            logger.info("Downloading audio with yt-dlp (audio-only mode)...")
+
+            # Step 2: Download audio (always - it's cheap and fast)
+            logger.info("Downloading audio with yt-dlp...")
             download_info = self._download_audio(resolved_url, audio_path)
+
             if not download_info.get('success'):
                 return ParseResult(
                     success=False,
@@ -227,53 +228,120 @@ class VideoParser(BaseParser):
                     error_message=download_info.get('error', 'Failed to download audio'),
                     parser_name=self.parser_name
                 )
-            
-            # Step 3: Transcribe with Whisper
-            logger.info("Transcribing audio with Whisper API...")
-            transcript = self._transcribe_audio(audio_path)
-            if not transcript:
-                return ParseResult(
-                    success=False,
-                    error_code="TRANSCRIPTION_FAILED",
-                    error_message="Failed to transcribe audio or no speech detected",
-                    parser_name=self.parser_name
+
+            # Add metadata to download_info for downstream methods
+            download_info['platform'] = platform
+            download_info['url'] = url
+
+            # Step 3: Try audio extraction
+            logger.info("Attempting audio-only extraction...")
+            audio_result = await self._try_audio_extraction(audio_path, download_info)
+
+            # Step 4: Calculate confidence if audio succeeded
+            confidence = 0.0
+            if audio_result['success']:
+                confidence = self._calculate_audio_confidence(
+                    transcript=audio_result.get('transcript', ''),
+                    recipe_data=audio_result.get('recipe_data', {})
                 )
-            
-            logger.info(f"Transcript ({len(transcript)} chars): {transcript[:200]}...")
-            
-            # Step 4: Parse transcript with GPT-4 to extract recipe
-            logger.info("Parsing transcript with GPT-4...")
-            recipe_data = self._parse_transcript_to_recipe(
-                transcript=transcript,
-                video_title=download_info.get('title', ''),
-                video_description=download_info.get('description', ''),
-                platform=platform,
-                url=url
-            )
-            
-            if not recipe_data:
+                logger.info(f"Audio confidence: {confidence:.2f}")
+            else:
+                logger.info(f"Audio extraction failed: {audio_result.get('reason')}")
+                confidence = audio_result.get('confidence', 0.0)
+
+            # Step 5: Route based on confidence (or forced mode)
+            extraction_method = None
+            frames_used = 0
+            final_recipe = None
+            fallback_reason = None
+
+            if force_mode == "audio" or (not force_mode and confidence >= 0.7):
+                # HIGH CONFIDENCE - Use audio-only result
+                extraction_method = "audio_only"
+                frames_used = 0
+
+                if audio_result['success']:
+                    logger.info(f"✓ High confidence ({confidence:.2f}) - using audio-only (${self._estimate_cost('audio_only'):.3f})")
+                    final_recipe = audio_result['recipe_data']
+                else:
+                    # Audio failed but we were trying audio-only - fallback to vision
+                    logger.warning("Audio-only failed, falling back to vision-only")
+                    fallback_reason = audio_result.get('reason')
+                    extraction_method = "vision_only"
+                    frames_used = 5
+
+            elif force_mode == "hybrid" or (not force_mode and confidence >= 0.4):
+                # MEDIUM CONFIDENCE - Hybrid mode (audio + 3 frames)
+                extraction_method = "hybrid"
+                frames_used = 3
+
+                logger.info(f"~ Medium confidence ({confidence:.2f}) - using hybrid mode (${self._estimate_cost('hybrid', 3):.3f})")
+
+                # Download video and extract frames
+                video_path = self._download_video(resolved_url, temp_dir)
+                frames = self._extract_key_frames(video_path, num_frames=frames_used)
+
+                # Use vision with audio transcript
+                final_recipe = self._vision_extract_recipe(
+                    frames=frames,
+                    audio_transcript=audio_result.get('transcript'),
+                    video_metadata=download_info
+                )
+
+            else:
+                # LOW CONFIDENCE - Vision-only mode (5 frames, ignore audio)
+                extraction_method = "vision_only"
+                frames_used = 5
+
+                logger.info(f"✗ Low confidence ({confidence:.2f}) - using vision-only (${self._estimate_cost('vision_only', 5):.3f})")
+                fallback_reason = audio_result.get('reason') if not audio_result['success'] else "low_confidence"
+
+                # Download video and extract frames
+                video_path = self._download_video(resolved_url, temp_dir)
+                frames = self._extract_key_frames(video_path, num_frames=frames_used)
+
+                # Vision-only (ignore poor audio)
+                final_recipe = self._vision_extract_recipe(
+                    frames=frames,
+                    audio_transcript=None,
+                    video_metadata=download_info
+                )
+
+            # Check if we got a recipe
+            if not final_recipe:
                 return ParseResult(
                     success=False,
                     error_code="RECIPE_EXTRACTION_FAILED",
-                    error_message="Could not extract recipe from transcript. Video may not be a cooking video.",
-                    parser_name=self.parser_name
+                    error_message="Could not extract recipe from video",
+                    parser_name=self.parser_name,
+                    extraction_method=extraction_method,
+                    frames_used=frames_used
                 )
-            
-            # Calculate processing time and confidence
-            processing_time_ms = int((time.time() - start_time) * 1000)
-            warnings = self._generate_warnings(recipe_data)
-            confidence_score = self._calculate_confidence(recipe_data)
-            
-            logger.info(f"Successfully parsed video recipe: {recipe_data.get('name', 'Unknown')}")
-            
+
+            # Calculate warnings
+            warnings = self._generate_warnings(final_recipe)
+
+            # Estimate cost
+            estimated_cost = self._estimate_cost(
+                extraction_method,
+                frames_used=frames_used,
+                transcript_length=len(audio_result.get('transcript', ''))
+            )
+
+            logger.info(f"✓ Successfully extracted recipe: {final_recipe.get('name', 'Unknown')} via {extraction_method}")
+
             return ParseResult(
                 success=True,
-                data=recipe_data,
+                data=final_recipe,
                 parser_name=self.parser_name,
-                confidence_score=confidence_score,
-                warnings=warnings
+                confidence_score=confidence,
+                warnings=warnings,
+                extraction_method=extraction_method,
+                frames_used=frames_used,
+                estimated_cost=estimated_cost,
+                fallback_reason=fallback_reason
             )
-            
+
         except Exception as e:
             logger.error(f"Error parsing video: {e}", exc_info=True)
             return ParseResult(
@@ -1337,3 +1405,198 @@ Return ONLY valid JSON, no other text or explanation."""
         logger.info(f"Audio confidence score: {final_score:.2f} (words: {word_count}, ingredients: {len(ingredients)}, steps: {len(steps)})")
 
         return final_score
+
+    async def _try_audio_extraction(
+        self,
+        audio_path: str,
+        download_info: Dict[str, Any]
+    ) -> Dict[str, Any]:
+        """
+        Attempt audio-only recipe extraction with graceful degradation.
+
+        Returns dict with:
+            - success: bool
+            - transcript: str (if successful)
+            - recipe_data: dict (if successful)
+            - confidence: float
+            - reason: str (if failed)
+        """
+        try:
+            # Transcribe audio
+            transcript = self._transcribe_audio(audio_path)
+
+            if not transcript or len(transcript) < 20:
+                logger.warning("Insufficient audio content for extraction")
+                return {
+                    'success': False,
+                    'confidence': 0.0,
+                    'reason': 'insufficient_audio',
+                    'transcript': transcript or ''
+                }
+
+            logger.info(f"Transcript ({len(transcript)} chars): {transcript[:200]}...")
+
+            # Parse transcript to recipe
+            recipe_data = self._parse_transcript_to_recipe(
+                transcript=transcript,
+                video_title=download_info.get('title', ''),
+                video_description=download_info.get('description', ''),
+                platform=download_info.get('platform', ''),
+                url=download_info.get('url', '')
+            )
+
+            if not recipe_data:
+                logger.warning("Could not extract recipe from transcript")
+                return {
+                    'success': False,
+                    'confidence': 0.2,
+                    'reason': 'not_a_recipe',
+                    'transcript': transcript
+                }
+
+            # Check if GPT-4 determined it's not a recipe
+            if not recipe_data.get('is_recipe', True):
+                logger.info("GPT-4 determined this is not a cooking video")
+                return {
+                    'success': False,
+                    'confidence': 0.1,
+                    'reason': 'not_a_recipe',
+                    'transcript': transcript
+                }
+
+            return {
+                'success': True,
+                'transcript': transcript,
+                'recipe_data': recipe_data,
+                'confidence': 1.0  # Will be recalculated by _calculate_audio_confidence
+            }
+
+        except Exception as e:
+            logger.warning(f"Audio extraction failed: {e}")
+            return {
+                'success': False,
+                'confidence': 0.0,
+                'reason': str(e),
+                'transcript': ''
+            }
+
+    def _get_optimal_frame_count(
+        self,
+        confidence: float,
+        video_duration: Optional[int] = None
+    ) -> int:
+        """
+        Determine optimal frame count based on confidence and video duration.
+
+        Args:
+            confidence: Audio confidence score (0.0-1.0)
+            video_duration: Video duration in seconds (optional)
+
+        Returns:
+            Optimal number of frames to extract (1-10)
+        """
+        # Hybrid mode (medium confidence) - minimal frames
+        if confidence >= 0.4:
+            return 3
+
+        # Low confidence - need more frames
+        if video_duration and video_duration < 30:
+            # Short video - fewer frames sufficient
+            return 3
+        else:
+            # Longer video or unknown duration - more frames
+            return 5
+
+    def _download_video(self, url: str, temp_dir: str) -> str:
+        """
+        Download full video file for frame extraction.
+
+        Args:
+            url: Video URL
+            temp_dir: Temporary directory for download
+
+        Returns:
+            Path to downloaded video file
+
+        Raises:
+            RuntimeError: If download fails
+        """
+        video_path = os.path.join(temp_dir, "video.mp4")
+
+        try:
+            cmd = [
+                'yt-dlp',
+                '-f', 'best',  # Best quality video
+                '-o', video_path,
+                '--no-warnings',
+                '--no-playlist',
+                url
+            ]
+
+            result = subprocess.run(
+                cmd,
+                capture_output=True,
+                text=True,
+                timeout=self.timeout
+            )
+
+            if result.returncode != 0:
+                error_msg = result.stderr or result.stdout or "Unknown yt-dlp error"
+                logger.error(f"Video download failed: {error_msg}")
+                raise RuntimeError(f"Video download failed: {error_msg}")
+
+            if not os.path.exists(video_path):
+                raise RuntimeError(f"Video file not created: {video_path}")
+
+            logger.info(f"Downloaded video: {video_path} ({os.path.getsize(video_path)} bytes)")
+            return video_path
+
+        except subprocess.TimeoutExpired:
+            raise RuntimeError(f"Video download timed out after {self.timeout} seconds")
+        except Exception as e:
+            raise RuntimeError(f"Video download error: {str(e)}")
+
+    def _estimate_cost(
+        self,
+        extraction_method: str,
+        frames_used: int = 0,
+        transcript_length: int = 0
+    ) -> float:
+        """
+        Estimate API cost for the extraction.
+
+        Costs (approximate):
+        - Whisper API: $0.006 per minute (assume 1 min avg)
+        - GPT-4: $0.01 per 1K tokens (assume 500 tokens)
+        - GPT-4 Vision: $0.01 per image in high detail mode
+
+        Args:
+            extraction_method: "audio_only", "hybrid", or "vision_only"
+            frames_used: Number of frames analyzed
+            transcript_length: Length of transcript in chars
+
+        Returns:
+            Estimated cost in USD
+        """
+        # Whisper cost (always used for audio methods)
+        whisper_cost = 0.006  # $0.006 per minute (assume 1 min average)
+
+        # GPT-4 text cost (transcript parsing)
+        gpt4_text_cost = 0.005  # ~500 tokens for parsing
+
+        # GPT-4 Vision cost per frame (high detail mode)
+        gpt4_vision_cost_per_frame = 0.01
+
+        if extraction_method == "audio_only":
+            return whisper_cost + gpt4_text_cost  # ~$0.011
+
+        elif extraction_method == "hybrid":
+            return whisper_cost + gpt4_text_cost + (frames_used * gpt4_vision_cost_per_frame)
+            # With 3 frames: ~$0.041
+
+        elif extraction_method == "vision_only":
+            # May or may not use Whisper, but vision is primary cost
+            return (frames_used * gpt4_vision_cost_per_frame)
+            # With 5 frames: ~$0.05
+
+        return 0.0

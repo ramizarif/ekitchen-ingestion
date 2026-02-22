@@ -18,6 +18,12 @@ class ParseResult:
     confidence_score: Optional[float] = None
     warnings: list = None
 
+    # Video parser specific fields (for multi-mode extraction tracking)
+    extraction_method: Optional[str] = None  # "audio_only", "hybrid", "vision_only"
+    frames_used: Optional[int] = None
+    estimated_cost: Optional[float] = None
+    fallback_reason: Optional[str] = None
+
     def __post_init__(self):
         if self.warnings is None:
             self.warnings = []
