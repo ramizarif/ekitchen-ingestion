@@ -944,3 +944,247 @@ Return ONLY valid JSON, no other text."""
         except Exception as e:
             logger.warning(f"Failed to compute frame hash: {e}")
             return ""
+
+    def _vision_extract_recipe(
+        self,
+        frames: List[str],
+        audio_transcript: Optional[str] = None,
+        video_metadata: Optional[Dict] = None
+    ) -> Optional[Dict[str, Any]]:
+        """
+        Extract recipe from video frames using GPT-4 Vision API.
+
+        Analyzes frames to extract structured recipe data from:
+        - Picture slideshow TikToks with text overlays
+        - Silent cooking videos with visual instructions
+        - Hybrid videos (combines visual + audio transcript)
+
+        Args:
+            frames: List of base64-encoded JPEG frame images
+            audio_transcript: Optional audio transcript for hybrid mode
+            video_metadata: Optional dict with 'title', 'description', 'platform'
+
+        Returns:
+            Recipe dict with standard structure, or None if not a recipe video
+
+        Raises:
+            Exception: If GPT-4 Vision API call fails after retries
+        """
+        if not frames:
+            logger.warning("No frames provided for vision extraction")
+            return None
+
+        metadata = video_metadata or {}
+        platform = metadata.get('platform', 'unknown')
+        title = metadata.get('title', '')
+        description = metadata.get('description', '')
+
+        logger.info(f"Extracting recipe from {len(frames)} frames using GPT-4 Vision...")
+
+        # Build the prompt
+        prompt = self._build_vision_prompt(
+            platform=platform,
+            title=title,
+            description=description,
+            audio_transcript=audio_transcript
+        )
+
+        # Construct GPT-4 Vision API message
+        message_content = [
+            {
+                "type": "text",
+                "text": prompt
+            }
+        ]
+
+        # Add frames as images
+        for i, frame_b64 in enumerate(frames):
+            message_content.append({
+                "type": "image_url",
+                "image_url": {
+                    "url": f"data:image/jpeg;base64,{frame_b64}",
+                    "detail": "high"  # High detail for better OCR
+                }
+            })
+
+        messages = [
+            {
+                "role": "system",
+                "content": "You are a recipe extraction expert. Analyze video frames to extract structured recipes from cooking videos. Read text overlays, identify ingredients visually, and return valid JSON."
+            },
+            {
+                "role": "user",
+                "content": message_content
+            }
+        ]
+
+        # Call GPT-4 Vision API with retry logic
+        max_retries = 3
+        retry_delay = 2  # seconds
+
+        for attempt in range(max_retries):
+            try:
+                response = self.openai_client.chat.completions.create(
+                    model="gpt-4o",
+                    messages=messages,
+                    max_tokens=2000,
+                    temperature=0.3
+                )
+
+                content = response.choices[0].message.content.strip()
+
+                # Clean up markdown code blocks if present
+                if content.startswith('```'):
+                    content = re.sub(r'^```json?\s*', '', content)
+                    content = re.sub(r'\s*```$', '', content)
+
+                # Parse JSON response
+                parsed = json.loads(content)
+
+                # Check if it's a recipe
+                if not parsed.get('is_recipe', False):
+                    logger.info("GPT-4 Vision determined this is not a cooking video")
+                    return None
+
+                # Format into standard recipe structure
+                recipe_data = {
+                    "name": parsed.get('name', 'Video Recipe'),
+                    "description": parsed.get('description', ''),
+                    "ingredients": parsed.get('ingredients', []),
+                    "steps": parsed.get('steps', []),
+                    "servings": parsed.get('servings'),
+                    "prep_time_minutes": parsed.get('prep_time_minutes'),
+                    "cook_time_minutes": parsed.get('cook_time_minutes'),
+                    "total_time_minutes": parsed.get('total_time_minutes'),
+                    "image_url": None,
+                    "video_url": metadata.get('url'),
+                    "source_metadata": {
+                        "author": None,
+                        "site_name": platform.title(),
+                        "host": platform,
+                        "url": metadata.get('url'),
+                        "video_title": title,
+                        "extraction_method": "vision",
+                        "frames_analyzed": len(frames),
+                        "audio_available": audio_transcript is not None
+                    },
+                    "tips": parsed.get('tips', [])
+                }
+
+                logger.info(f"Successfully extracted recipe via vision: {recipe_data['name']}")
+                return recipe_data
+
+            except json.JSONDecodeError as e:
+                logger.error(f"Failed to parse GPT-4 Vision response as JSON: {e}")
+                logger.debug(f"Response content: {content[:500]}")
+
+                if attempt < max_retries - 1:
+                    logger.info(f"Retrying vision extraction (attempt {attempt + 2}/{max_retries})...")
+                    time.sleep(retry_delay * (attempt + 1))  # Exponential backoff
+                else:
+                    return None
+
+            except Exception as e:
+                logger.error(f"GPT-4 Vision API call failed: {e}")
+
+                if attempt < max_retries - 1:
+                    logger.info(f"Retrying vision extraction (attempt {attempt + 2}/{max_retries})...")
+                    time.sleep(retry_delay * (attempt + 1))
+                else:
+                    logger.error(f"All retries exhausted for GPT-4 Vision API")
+                    return None
+
+        return None
+
+    def _build_vision_prompt(
+        self,
+        platform: str,
+        title: str,
+        description: str,
+        audio_transcript: Optional[str] = None
+    ) -> str:
+        """
+        Build optimized prompt for GPT-4 Vision recipe extraction.
+
+        Tailors prompt based on platform and whether audio is available.
+
+        Args:
+            platform: Video platform (tiktok, instagram, youtube)
+            title: Video title
+            description: Video description
+            audio_transcript: Optional audio transcript
+
+        Returns:
+            Formatted prompt string
+        """
+        base_prompt = f"""You are analyzing frames from a short-form cooking video to extract a recipe.
+
+VIDEO INFORMATION:
+- Platform: {platform}
+- Title: {title or "Not provided"}
+- Description: {description or "Not provided"}
+- Audio Transcript: {audio_transcript or "No audio available (silent video or poor quality)"}
+
+YOUR TASKS:
+1. Examine all frames carefully and read any text overlays (ingredients, measurements, steps)
+2. Identify ingredients visible in the video
+3. Note cooking steps shown visually or written as text
+4. If this is NOT a cooking/recipe video, respond with exactly: {{"is_recipe": false}}
+5. If this IS a cooking video, extract the recipe into this JSON format:
+
+{{
+    "is_recipe": true,
+    "name": "Recipe name (read from video or infer from context)",
+    "description": "Brief description of the dish",
+    "ingredients": [
+        "List ingredients with quantities from text overlays or visual context",
+        "e.g., '2 cups flour', '1 tablespoon olive oil', '3 cloves garlic'"
+    ],
+    "steps": [
+        "Step 1: Description from visual/text",
+        "Step 2: Next action",
+        "..."
+    ],
+    "servings": null or number if mentioned,
+    "prep_time_minutes": null or number if mentioned,
+    "cook_time_minutes": null or number if mentioned,
+    "total_time_minutes": null or number if mentioned,
+    "tips": ["Any tips or variations shown/mentioned"]
+}}
+
+IMPORTANT INSTRUCTIONS:
+- **Read text overlays carefully** - ingredients are often listed as on-screen text
+- **Infer from visual context** - if you see butter being added but quantity isn't shown, note "butter (amount not specified)"
+- **Combine audio + visual** - if audio transcript is available, use it to supplement what you see
+- **Handle abbreviations** - tbsp = tablespoon, tsp = teaspoon, c = cup
+- **Preserve measurements** - keep exact quantities as shown (don't convert units)
+- **Sequential steps** - list steps in the order shown in the video
+"""
+
+        # Add platform-specific hints
+        if platform == 'tiktok':
+            base_prompt += """
+TIKTOK-SPECIFIC NOTES:
+- Pay close attention to text overlays - TikTok recipes often use on-screen text for ingredients
+- Text may be abbreviated or stylized (e.g., "2c flour" = "2 cups flour")
+- Steps are sometimes numbered visually (1., 2., 3.)
+- This may be a picture slideshow - read all text in each frame
+"""
+        elif platform == 'instagram':
+            base_prompt += """
+INSTAGRAM-SPECIFIC NOTES:
+- Look for captions/subtitles at bottom of frames
+- Ingredients may be shown aesthetically without speaking them
+- Pay attention to visual presentation for plating/serving suggestions
+"""
+        elif platform == 'youtube':
+            base_prompt += """
+YOUTUBE-SPECIFIC NOTES:
+- Professional content - may have clear text overlays or graphics
+- Look for on-screen graphics showing ingredients and measurements
+"""
+
+        base_prompt += """
+Return ONLY valid JSON, no other text or explanation."""
+
+        return base_prompt

@@ -267,3 +267,305 @@ class TestFrameExtraction:
         # (unless similarity filtering reduces count)
         assert len(frames) > 0, f"Should extract frames for num_frames={num_frames}"
         assert len(frames) <= num_frames, f"Should not exceed {num_frames} frames"
+
+
+class TestVisionExtraction:
+    """Test suite for GPT-4 Vision recipe extraction methods."""
+
+    @pytest.fixture
+    def video_parser(self):
+        """Create VideoParser instance for testing."""
+        return VideoParser(timeout=120)
+
+    @pytest.fixture
+    def sample_frames(self):
+        """Create sample base64-encoded frames for testing."""
+        from PIL import Image
+        import io
+        import base64
+
+        frames = []
+        for i in range(3):
+            # Create simple test image
+            img = Image.new('RGB', (100, 100), color=['red', 'green', 'blue'][i])
+            buffer = io.BytesIO()
+            img.save(buffer, format='JPEG')
+            b64_frame = base64.b64encode(buffer.getvalue()).decode('utf-8')
+            frames.append(b64_frame)
+
+        return frames
+
+    def test_build_vision_prompt_tiktok(self, video_parser):
+        """Test prompt building for TikTok videos."""
+        prompt = video_parser._build_vision_prompt(
+            platform="tiktok.com",
+            title="Creamy Pasta Recipe",
+            description="Easy 10-minute pasta"
+        )
+
+        assert "text overlays" in prompt.lower()
+        assert "Creamy Pasta Recipe" in prompt
+        assert "JSON" in prompt
+        assert "name" in prompt
+        assert "ingredients" in prompt
+
+    def test_build_vision_prompt_instagram(self, video_parser):
+        """Test prompt building for Instagram Reels."""
+        prompt = video_parser._build_vision_prompt(
+            platform="instagram.com",
+            title="Chocolate Cake",
+            description="Delicious cake recipe"
+        )
+
+        assert "Chocolate Cake" in prompt
+        assert "JSON" in prompt
+
+    def test_build_vision_prompt_youtube(self, video_parser):
+        """Test prompt building for YouTube Shorts."""
+        prompt = video_parser._build_vision_prompt(
+            platform="youtube.com",
+            title="Quick Breakfast",
+            description="Healthy breakfast ideas"
+        )
+
+        assert "Quick Breakfast" in prompt
+        assert "JSON" in prompt
+
+    def test_build_vision_prompt_with_audio(self, video_parser):
+        """Test prompt building with audio transcript."""
+        prompt = video_parser._build_vision_prompt(
+            platform="tiktok.com",
+            title="Pasta Recipe",
+            description="Easy pasta",
+            audio_transcript="First, boil water. Then add pasta. Cook for 10 minutes."
+        )
+
+        assert "audio transcript" in prompt.lower() or "transcript" in prompt.lower()
+        assert "boil water" in prompt
+        assert "hybrid" in prompt.lower() or "combine" in prompt.lower()
+
+    def test_vision_extract_recipe_success(self, video_parser, sample_frames):
+        """Test successful recipe extraction with GPT-4 Vision."""
+        # Mock the OpenAI client property
+        mock_client = MagicMock()
+        video_parser._openai_client = mock_client
+
+        # Mock successful API response
+        mock_response = MagicMock()
+        mock_response.choices = [
+            MagicMock(
+                message=MagicMock(
+                    content='{"is_recipe": true, "name": "Creamy Garlic Pasta", "ingredients": ["pasta", "garlic", "cream"], "steps": ["Boil pasta", "Make sauce", "Combine"]}'
+                )
+            )
+        ]
+        mock_client.chat.completions.create.return_value = mock_response
+
+        # Call vision extraction
+        result = video_parser._vision_extract_recipe(
+            frames=sample_frames,
+            video_metadata={"title": "Pasta Recipe", "description": "Easy pasta", "platform": "tiktok.com"}
+        )
+
+        # Verify result
+        assert result is not None
+        assert result['name'] == "Creamy Garlic Pasta"
+        assert len(result['ingredients']) == 3
+        assert len(result['steps']) == 3
+        assert "pasta" in result['ingredients']
+
+        # Verify API was called correctly
+        mock_client.chat.completions.create.assert_called_once()
+        call_kwargs = mock_client.chat.completions.create.call_args[1]
+        assert call_kwargs['model'] == 'gpt-4o'
+        assert len(call_kwargs['messages']) == 2
+        assert call_kwargs['messages'][0]['role'] == 'system'
+        assert call_kwargs['messages'][1]['role'] == 'user'
+
+    def test_vision_extract_recipe_with_audio(self, video_parser, sample_frames):
+        """Test recipe extraction with both frames and audio transcript."""
+        mock_client = MagicMock()
+        video_parser._openai_client = mock_client
+
+        mock_response = MagicMock()
+        mock_response.choices = [
+            MagicMock(
+                message=MagicMock(
+                    content='{"is_recipe": true, "name": "Pasta", "ingredients": ["pasta"], "steps": ["Cook"]}'
+                )
+            )
+        ]
+        mock_client.chat.completions.create.return_value = mock_response
+
+        result = video_parser._vision_extract_recipe(
+            frames=sample_frames,
+            audio_transcript="Boil water and add pasta",
+            video_metadata={"title": "Pasta", "description": "Quick pasta", "platform": "tiktok.com"}
+        )
+
+        assert result is not None
+        # Verify prompt includes audio transcript
+        call_kwargs = mock_client.chat.completions.create.call_args[1]
+        user_message = call_kwargs['messages'][1]['content'][0]['text']
+        assert "boil water" in user_message.lower() or "audio transcript" in user_message.lower()
+
+    def test_vision_extract_recipe_api_error_retry(self, video_parser, sample_frames):
+        """Test retry logic on API errors."""
+        mock_client = MagicMock()
+        video_parser._openai_client = mock_client
+
+        # First 2 calls fail, 3rd succeeds
+        mock_client.chat.completions.create.side_effect = [
+            Exception("API Error"),
+            Exception("API Error"),
+            MagicMock(
+                choices=[
+                    MagicMock(
+                        message=MagicMock(
+                            content='{"is_recipe": true, "name": "Pasta", "ingredients": ["pasta"], "steps": ["Cook"]}'
+                        )
+                    )
+                ]
+            )
+        ]
+
+        result = video_parser._vision_extract_recipe(
+            frames=sample_frames,
+            video_metadata={"title": "Test", "description": "Test", "platform": "tiktok.com"}
+        )
+
+        # Should succeed after retries
+        assert result is not None
+        assert result['name'] == "Pasta"
+        # Verify 3 attempts were made
+        assert mock_client.chat.completions.create.call_count == 3
+
+    def test_vision_extract_recipe_all_retries_fail(self, video_parser, sample_frames):
+        """Test behavior when all retry attempts fail."""
+        mock_client = MagicMock()
+        video_parser._openai_client = mock_client
+
+        # All calls fail
+        mock_client.chat.completions.create.side_effect = Exception("API Error")
+
+        result = video_parser._vision_extract_recipe(
+            frames=sample_frames,
+            video_metadata={"title": "Test", "description": "Test", "platform": "tiktok.com"}
+        )
+
+        # Should return None after all retries fail
+        assert result is None
+        # Verify 3 attempts were made
+        assert mock_client.chat.completions.create.call_count == 3
+
+    def test_vision_extract_recipe_invalid_json(self, video_parser, sample_frames):
+        """Test handling of invalid JSON response."""
+        mock_client = MagicMock()
+        video_parser._openai_client = mock_client
+
+        # Return invalid JSON
+        mock_response = MagicMock()
+        mock_response.choices = [
+            MagicMock(
+                message=MagicMock(
+                    content='This is not valid JSON'
+                )
+            )
+        ]
+        mock_client.chat.completions.create.return_value = mock_response
+
+        result = video_parser._vision_extract_recipe(
+            frames=sample_frames,
+            video_metadata={"title": "Test", "description": "Test", "platform": "tiktok.com"}
+        )
+
+        # Should return None for invalid JSON
+        assert result is None
+
+    def test_vision_extract_recipe_json_with_markdown(self, video_parser, sample_frames):
+        """Test handling of JSON wrapped in markdown code blocks."""
+        mock_client = MagicMock()
+        video_parser._openai_client = mock_client
+
+        # Return JSON wrapped in markdown
+        mock_response = MagicMock()
+        mock_response.choices = [
+            MagicMock(
+                message=MagicMock(
+                    content='```json\n{"is_recipe": true, "name": "Pasta", "ingredients": ["pasta"], "steps": ["Cook"]}\n```'
+                )
+            )
+        ]
+        mock_client.chat.completions.create.return_value = mock_response
+
+        result = video_parser._vision_extract_recipe(
+            frames=sample_frames,
+            video_metadata={"title": "Test", "description": "Test", "platform": "tiktok.com"}
+        )
+
+        # Should successfully extract JSON from markdown
+        assert result is not None
+        assert result['name'] == "Pasta"
+
+    def test_vision_extract_recipe_multiple_frames(self, video_parser):
+        """Test that all frames are included in API call."""
+        mock_client = MagicMock()
+        video_parser._openai_client = mock_client
+
+        mock_response = MagicMock()
+        mock_response.choices = [
+            MagicMock(
+                message=MagicMock(
+                    content='{"is_recipe": true, "name": "Test", "ingredients": ["ingredient"], "steps": ["step"]}'
+                )
+            )
+        ]
+        mock_client.chat.completions.create.return_value = mock_response
+
+        # Create 5 frames
+        frames = ["frame1", "frame2", "frame3", "frame4", "frame5"]
+
+        result = video_parser._vision_extract_recipe(
+            frames=frames,
+            video_metadata={"title": "Test", "description": "Test", "platform": "tiktok.com"}
+        )
+
+        assert result is not None
+
+        # Verify all 5 frames were included in the API call
+        call_kwargs = mock_client.chat.completions.create.call_args[1]
+        user_content = call_kwargs['messages'][1]['content']
+
+        # First element is text prompt, remaining should be image frames
+        image_frames = [item for item in user_content if item['type'] == 'image_url']
+        assert len(image_frames) == 5
+
+    def test_vision_extract_recipe_high_detail_mode(self, video_parser, sample_frames):
+        """Test that high detail mode is used for better OCR."""
+        mock_client = MagicMock()
+        video_parser._openai_client = mock_client
+
+        mock_response = MagicMock()
+        mock_response.choices = [
+            MagicMock(
+                message=MagicMock(
+                    content='{"is_recipe": true, "name": "Test", "ingredients": ["ingredient"], "steps": ["step"]}'
+                )
+            )
+        ]
+        mock_client.chat.completions.create.return_value = mock_response
+
+        result = video_parser._vision_extract_recipe(
+            frames=sample_frames,
+            video_metadata={"title": "Test", "description": "Test", "platform": "tiktok.com"}
+        )
+
+        assert result is not None
+
+        # Verify high detail mode is set
+        call_kwargs = mock_client.chat.completions.create.call_args[1]
+        user_content = call_kwargs['messages'][1]['content']
+
+        # Check that at least one image has detail="high"
+        image_frames = [item for item in user_content if item['type'] == 'image_url']
+        assert any(frame['image_url'].get('detail') == 'high' for frame in image_frames)
