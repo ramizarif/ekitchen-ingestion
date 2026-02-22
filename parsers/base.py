@@ -24,9 +24,25 @@ class ParseResult:
     estimated_cost: Optional[float] = None
     fallback_reason: Optional[str] = None
 
+    # Cost tracking fields (Issue #39)
+    cost_breakdown: Optional[Dict[str, float]] = None  # Detailed cost breakdown
+    audio_duration_seconds: Optional[float] = None
+    video_size_mb: Optional[float] = None
+    processing_time_ms: Optional[int] = None
+    transcript_tokens: Optional[int] = None
+    output_tokens: Optional[int] = None
+
     def __post_init__(self):
         if self.warnings is None:
             self.warnings = []
+        if self.cost_breakdown is None:
+            self.cost_breakdown = {
+                "whisper_transcription": 0.0,
+                "gpt4_text": 0.0,
+                "gpt4_vision": 0.0,
+                "video_download": 0.0,
+                "total": 0.0
+            }
 
 
 class BaseParser(ABC):

@@ -465,14 +465,44 @@ class VideoParser(BaseParser):
             # Calculate warnings
             warnings = self._generate_warnings(final_recipe)
 
-            # Estimate cost
+            # Estimate cost (legacy simple estimate)
             estimated_cost = self._estimate_cost(
                 extraction_method,
                 frames_used=frames_used,
                 transcript_length=len(audio_result.get('transcript', ''))
             )
 
+            # Calculate detailed cost breakdown (Issue #39)
+            transcript = audio_result.get('transcript', '')
+            transcript_tokens = len(transcript) // 4 if transcript else 0  # Rough estimate: 4 chars/token
+
+            # Get audio duration from download_info or estimate
+            audio_duration = download_info.get('duration', 60.0)  # Default 60s if not available
+
+            # Get video file size if we downloaded it
+            video_size_mb = 0.0
+            if temp_dir and os.path.exists(temp_dir):
+                # Check if video was downloaded
+                video_files = [f for f in os.listdir(temp_dir) if f.endswith(('.mp4', '.webm', '.mkv'))]
+                if video_files:
+                    video_path = os.path.join(temp_dir, video_files[0])
+                    video_size_mb = os.path.getsize(video_path) / (1024 * 1024)  # Convert to MB
+
+            # Calculate processing time
+            processing_time_ms = int((time.time() - start_time) * 1000)
+
+            # Calculate detailed cost breakdown
+            extraction_data = {
+                'audio_duration_seconds': audio_duration,
+                'transcript_tokens': transcript_tokens,
+                'output_tokens': 500,  # Estimate GPT-4 output tokens
+                'frames_used': frames_used,
+                'video_size_mb': video_size_mb
+            }
+            cost_breakdown = self._calculate_extraction_cost(extraction_data)
+
             logger.info(f"✓ Successfully extracted recipe: {final_recipe.get('name', 'Unknown')} via {extraction_method}")
+            logger.info(f"💰 Cost breakdown: ${cost_breakdown['total']:.4f} (whisper: ${cost_breakdown['whisper_transcription']:.4f}, gpt4_text: ${cost_breakdown['gpt4_text']:.4f}, gpt4_vision: ${cost_breakdown['gpt4_vision']:.4f})")
 
             return ParseResult(
                 success=True,
@@ -483,7 +513,14 @@ class VideoParser(BaseParser):
                 extraction_method=extraction_method,
                 frames_used=frames_used,
                 estimated_cost=estimated_cost,
-                fallback_reason=fallback_reason
+                fallback_reason=fallback_reason,
+                # Cost tracking fields (Issue #39)
+                cost_breakdown=cost_breakdown,
+                audio_duration_seconds=audio_duration,
+                video_size_mb=video_size_mb,
+                processing_time_ms=processing_time_ms,
+                transcript_tokens=transcript_tokens,
+                output_tokens=500  # Estimate
             )
 
         except Exception as e:
@@ -1746,3 +1783,72 @@ Return ONLY valid JSON, no other text or explanation."""
             # With 5 frames: ~$0.05
 
         return 0.0
+
+    def _calculate_extraction_cost(
+        self,
+        extraction_data: Dict[str, Any]
+    ) -> Dict[str, float]:
+        """
+        Calculate detailed API costs for this extraction.
+
+        Actual OpenAI pricing (as of 2025):
+        - Whisper: $0.006 per minute
+        - GPT-4o input: $2.50 per 1M tokens
+        - GPT-4o output: $10.00 per 1M tokens
+        - GPT-4 Vision: varies by image size and detail level
+          - High detail (1024px): ~$0.03 per image
+
+        Args:
+            extraction_data: Dict with extraction metadata
+                - audio_duration_seconds: Audio duration
+                - transcript_tokens: Estimated input tokens for transcript
+                - output_tokens: Estimated output tokens from GPT-4
+                - frames_used: Number of frames analyzed
+                - video_size_mb: Video file size
+
+        Returns:
+            Dict with cost breakdown: {
+                "whisper_transcription": float,
+                "gpt4_text": float,
+                "gpt4_vision": float,
+                "video_download": float,
+                "total": float
+            }
+        """
+        costs = {
+            "whisper_transcription": 0.0,
+            "gpt4_text": 0.0,
+            "gpt4_vision": 0.0,
+            "video_download": 0.0,
+            "total": 0.0
+        }
+
+        # Whisper cost: $0.006 per minute
+        if extraction_data.get('audio_duration_seconds'):
+            audio_minutes = extraction_data['audio_duration_seconds'] / 60
+            costs['whisper_transcription'] = audio_minutes * 0.006
+
+        # GPT-4o text cost (for transcript parsing or vision analysis)
+        input_tokens = extraction_data.get('transcript_tokens', 0)
+        output_tokens = extraction_data.get('output_tokens', 500)  # Estimate 500 tokens
+
+        if input_tokens > 0:
+            # $2.50 per 1M input tokens, $10 per 1M output tokens
+            input_cost = (input_tokens / 1_000_000) * 2.50
+            output_cost = (output_tokens / 1_000_000) * 10.00
+            costs['gpt4_text'] = input_cost + output_cost
+
+        # GPT-4 Vision cost: ~$0.03 per high-detail image
+        # (1024px width images use high-detail mode)
+        if extraction_data.get('frames_used'):
+            costs['gpt4_vision'] = extraction_data['frames_used'] * 0.03
+
+        # Bandwidth cost (negligible, but included for completeness)
+        # Estimate $0.0001 per MB
+        if extraction_data.get('video_size_mb'):
+            costs['video_download'] = extraction_data['video_size_mb'] * 0.0001
+
+        # Calculate total
+        costs['total'] = sum(v for k, v in costs.items() if k != 'total')
+
+        return costs

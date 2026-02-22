@@ -20,6 +20,7 @@ sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..', '..'))
 
 from parsers.video import VideoParser
 from services.recipe_processor import DirectRecipeProcessor
+from app.routers.analytics import record_extraction_cost
 
 logger = logging.getLogger(__name__)
 
@@ -221,7 +222,23 @@ async def _ingest_video(url: str, platform: str, request: IngestRequest, start_t
         
         recipe_data = parse_result.data
         logger.info(f"Parsed video recipe: {recipe_data.get('name')} ({len(recipe_data.get('ingredients', []))} ingredients)")
-        
+
+        # Record cost data for analytics (Issue #39)
+        if parse_result.cost_breakdown:
+            try:
+                record_extraction_cost({
+                    "url": url,
+                    "platform": platform,
+                    "extraction_method": parse_result.extraction_method,
+                    "cost_breakdown": parse_result.cost_breakdown,
+                    "frames_used": parse_result.frames_used or 0,
+                    "audio_duration_seconds": parse_result.audio_duration_seconds or 0,
+                    "processing_time_ms": parse_result.processing_time_ms or 0,
+                    "success": True
+                })
+            except Exception as e:
+                logger.warning(f"Failed to record cost data: {e}")
+
         # Step 2: Process through DirectRecipeProcessor
         processor = get_processor()
         
