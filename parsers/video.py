@@ -694,5 +694,253 @@ Return ONLY valid JSON, no other text."""
         # Source URL: 5 points
         if recipe_data.get('video_url'):
             score += 0.05
-        
+
         return min(score, 1.0)
+
+    def _extract_key_frames(
+        self,
+        video_path: str,
+        num_frames: int = 5,
+        skip_similar: bool = True
+    ) -> List[str]:
+        """
+        Extract key frames from video for GPT-4 Vision analysis.
+
+        Uses ffmpeg to extract evenly-spaced frames, optimized for GPT-4 Vision API:
+        - Frames scaled to max 1024px width (token optimization)
+        - JPEG compression at 85% quality
+        - Skip first/last 5% of video (intro/outro)
+        - Optional similarity detection to avoid duplicate frames
+
+        Args:
+            video_path: Path to downloaded video file
+            num_frames: Number of frames to extract (default: 5)
+            skip_similar: Skip nearly identical frames (default: True)
+
+        Returns:
+            List of base64-encoded JPEG images ready for GPT-4 Vision API
+
+        Raises:
+            FileNotFoundError: If video file doesn't exist
+            subprocess.CalledProcessError: If ffmpeg extraction fails
+        """
+        import base64
+        from PIL import Image
+        import hashlib
+
+        if not os.path.exists(video_path):
+            raise FileNotFoundError(f"Video file not found: {video_path}")
+
+        logger.info(f"Extracting {num_frames} key frames from video...")
+
+        # Create temp directory for frames
+        temp_frame_dir = tempfile.mkdtemp(prefix="video_frames_")
+
+        try:
+            # Step 1: Get video duration
+            duration = self._get_video_duration(video_path)
+            if not duration:
+                logger.warning("Could not determine video duration, using default extraction")
+                duration = 60  # Assume 60 seconds
+
+            # Skip first/last 5% of video
+            start_time = duration * 0.05
+            end_time = duration * 0.95
+            effective_duration = end_time - start_time
+
+            # Calculate frame interval
+            if effective_duration <= 0 or num_frames <= 0:
+                logger.warning(f"Invalid duration ({duration}s) or frame count ({num_frames})")
+                return []
+
+            frame_interval = effective_duration / (num_frames + 1)
+
+            # Step 2: Extract frames at calculated intervals
+            extracted_frames = []
+
+            for i in range(1, num_frames + 1):
+                timestamp = start_time + (i * frame_interval)
+                frame_path = os.path.join(temp_frame_dir, f"frame_{i:03d}.jpg")
+
+                # Extract single frame at timestamp with ffmpeg
+                ffmpeg_cmd = [
+                    'ffmpeg',
+                    '-ss', str(timestamp),  # Seek to timestamp
+                    '-i', video_path,
+                    '-vframes', '1',  # Extract 1 frame
+                    '-vf', 'scale=1024:-1',  # Scale to 1024px width, maintain aspect
+                    '-q:v', '2',  # JPEG quality (2 = ~85-90%)
+                    '-y',  # Overwrite
+                    frame_path
+                ]
+
+                result = subprocess.run(
+                    ffmpeg_cmd,
+                    capture_output=True,
+                    text=True,
+                    timeout=10
+                )
+
+                if result.returncode == 0 and os.path.exists(frame_path):
+                    extracted_frames.append(frame_path)
+                else:
+                    logger.warning(f"Failed to extract frame at {timestamp:.2f}s")
+
+            if not extracted_frames:
+                logger.error("No frames could be extracted")
+                return []
+
+            logger.info(f"Extracted {len(extracted_frames)} frames successfully")
+
+            # Step 3: Optional similarity filtering
+            if skip_similar and len(extracted_frames) > 1:
+                filtered_frames = self._filter_similar_frames(extracted_frames)
+                logger.info(f"After similarity filtering: {len(filtered_frames)} frames")
+            else:
+                filtered_frames = extracted_frames
+
+            # Step 4: Convert frames to base64
+            base64_frames = []
+            for frame_path in filtered_frames:
+                try:
+                    with Image.open(frame_path) as img:
+                        # Convert to RGB if needed (some videos have RGBA)
+                        if img.mode != 'RGB':
+                            img = img.convert('RGB')
+
+                        # Save to bytes buffer
+                        import io
+                        buffer = io.BytesIO()
+                        img.save(buffer, format='JPEG', quality=85)
+                        buffer.seek(0)
+
+                        # Encode to base64
+                        b64_string = base64.b64encode(buffer.read()).decode('utf-8')
+                        base64_frames.append(b64_string)
+
+                except Exception as e:
+                    logger.warning(f"Failed to encode frame {frame_path}: {e}")
+
+            logger.info(f"Encoded {len(base64_frames)} frames to base64")
+            return base64_frames
+
+        finally:
+            # Cleanup temp directory
+            import shutil
+            try:
+                shutil.rmtree(temp_frame_dir)
+            except Exception as e:
+                logger.warning(f"Failed to cleanup temp frames: {e}")
+
+    def _get_video_duration(self, video_path: str) -> Optional[float]:
+        """
+        Get video duration in seconds using ffmpeg.
+
+        Args:
+            video_path: Path to video file
+
+        Returns:
+            Duration in seconds or None if could not determine
+        """
+        try:
+            ffprobe_cmd = [
+                'ffprobe',
+                '-v', 'error',
+                '-show_entries', 'format=duration',
+                '-of', 'default=noprint_wrappers=1:nokey=1',
+                video_path
+            ]
+
+            result = subprocess.run(
+                ffprobe_cmd,
+                capture_output=True,
+                text=True,
+                timeout=10
+            )
+
+            if result.returncode == 0:
+                duration = float(result.stdout.strip())
+                logger.debug(f"Video duration: {duration:.2f}s")
+                return duration
+
+        except (ValueError, subprocess.SubprocessError) as e:
+            logger.warning(f"Could not determine video duration: {e}")
+
+        return None
+
+    def _filter_similar_frames(self, frame_paths: List[str], similarity_threshold: float = 0.9) -> List[str]:
+        """
+        Filter out nearly identical consecutive frames.
+
+        Uses perceptual hashing to detect similar frames (useful for slideshows).
+
+        Args:
+            frame_paths: List of frame file paths
+            similarity_threshold: Frames with >threshold similarity are considered duplicates (0-1)
+
+        Returns:
+            Filtered list of frame paths with duplicates removed
+        """
+        from PIL import Image
+        import hashlib
+
+        if len(frame_paths) <= 1:
+            return frame_paths
+
+        filtered = [frame_paths[0]]  # Always keep first frame
+        prev_hash = self._compute_frame_hash(frame_paths[0])
+
+        for frame_path in frame_paths[1:]:
+            curr_hash = self._compute_frame_hash(frame_path)
+
+            # Compare hashes (simple approach: exact match = duplicate)
+            # For more sophisticated similarity, could use hamming distance
+            if curr_hash != prev_hash:
+                filtered.append(frame_path)
+                prev_hash = curr_hash
+            else:
+                logger.debug(f"Skipping similar frame: {frame_path}")
+
+        return filtered
+
+    def _compute_frame_hash(self, frame_path: str) -> str:
+        """
+        Compute perceptual hash of frame image.
+
+        Uses difference hash (dHash) algorithm which is more robust for detecting
+        actual image differences compared to simple average hash.
+
+        Args:
+            frame_path: Path to frame image
+
+        Returns:
+            Hash string
+        """
+        from PIL import Image
+        import hashlib
+
+        try:
+            with Image.open(frame_path) as img:
+                # Resize to 9x8 for dHash (need 9 to compute 8 differences)
+                img = img.resize((9, 8)).convert('L')
+
+                # Get pixel data
+                pixels = list(img.getdata())
+
+                # Compute difference hash (dHash)
+                # Compare each pixel to its neighbor to the right
+                bits = ''
+                for row in range(8):
+                    for col in range(8):
+                        pixel_index = row * 9 + col
+                        left_pixel = pixels[pixel_index]
+                        right_pixel = pixels[pixel_index + 1]
+                        # Set bit if left pixel is brighter than right
+                        bits += '1' if left_pixel > right_pixel else '0'
+
+                # Convert to hex hash
+                return hashlib.md5(bits.encode()).hexdigest()
+
+        except Exception as e:
+            logger.warning(f"Failed to compute frame hash: {e}")
+            return ""

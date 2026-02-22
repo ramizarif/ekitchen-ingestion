@@ -14,6 +14,9 @@ requests>=2.31.0
 # OpenAI (for video/image parsing and ingredient processing)
 openai>=1.0.0
 
+# Image Processing (for video frame extraction)
+Pillow>=10.0.0
+
 # Ingredient Parsing
 ingredient-parser-nlp>=1.0.0
 
