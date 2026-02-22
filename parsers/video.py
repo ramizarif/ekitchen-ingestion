@@ -48,6 +48,42 @@ class VideoParser(BaseParser):
         r'(youtube\.com/watch\?v=[\w-]+)',
     ]
 
+    # Platform-specific optimization configurations
+    PLATFORM_CONFIG = {
+        'tiktok': {
+            'audio_confidence_threshold': 0.65,  # Slightly lower - often has music
+            'hybrid_confidence_threshold': 0.35,  # Lower threshold for hybrid
+            'default_frames': 3,  # Shorter videos
+            'max_frames': 4,
+            'detect_slideshows': True,  # Check for picture slideshows
+            'prompt_hints': 'TikTok videos often have text overlays with ingredients and steps. Pay special attention to on-screen text.',
+        },
+        'instagram': {
+            'audio_confidence_threshold': 0.75,  # Higher - better audio quality
+            'hybrid_confidence_threshold': 0.45,
+            'default_frames': 4,  # Medium-length videos
+            'max_frames': 5,
+            'detect_slideshows': False,  # Less common
+            'prompt_hints': 'Instagram Reels often have clear voiceovers and aesthetic visuals. Look for captions/subtitles.',
+        },
+        'youtube': {
+            'audio_confidence_threshold': 0.8,  # Highest - best audio quality
+            'hybrid_confidence_threshold': 0.5,
+            'default_frames': 3,  # Prefer audio, fewer frames needed
+            'max_frames': 4,
+            'detect_slideshows': False,  # Rare
+            'prompt_hints': 'YouTube Shorts typically have professional production and detailed explanations.',
+        },
+        'default': {
+            'audio_confidence_threshold': 0.7,
+            'hybrid_confidence_threshold': 0.4,
+            'default_frames': 4,
+            'max_frames': 5,
+            'detect_slideshows': False,
+            'prompt_hints': '',
+        }
+    }
+
     def __init__(self, timeout: int = 120, openai_client=None):
         """
         Initialize video parser.
@@ -75,24 +111,96 @@ class VideoParser(BaseParser):
     def _detect_platform(self, url: str) -> Optional[str]:
         """
         Detect which platform the URL belongs to.
-        
+
         Returns: 'tiktok', 'instagram', 'youtube', or None
         """
         url_lower = url.lower()
-        
+
         for pattern in self.TIKTOK_PATTERNS:
             if re.search(pattern, url_lower):
                 return 'tiktok'
-                
+
         for pattern in self.INSTAGRAM_PATTERNS:
             if re.search(pattern, url_lower):
                 return 'instagram'
-                
+
         for pattern in self.YOUTUBE_PATTERNS:
             if re.search(pattern, url_lower):
                 return 'youtube'
-                
+
         return None
+
+    def _get_platform_config(self, platform: Optional[str]) -> Dict[str, Any]:
+        """
+        Get platform-specific configuration.
+
+        Args:
+            platform: Platform name ('tiktok', 'instagram', 'youtube') or None
+
+        Returns:
+            Platform configuration dict with thresholds and settings
+        """
+        if platform and platform in self.PLATFORM_CONFIG:
+            return self.PLATFORM_CONFIG[platform]
+        return self.PLATFORM_CONFIG['default']
+
+    def _is_slideshow_video(self, frames: List[str], similarity_threshold: float = 0.95) -> bool:
+        """
+        Detect if video is a picture slideshow (common on TikTok).
+
+        Picture slideshows have very high frame similarity since they're static images
+        with transitions, versus actual video which has continuous motion.
+
+        Args:
+            frames: List of base64-encoded frame images
+            similarity_threshold: Frames above this similarity are considered identical (0.95 = 95%)
+
+        Returns:
+            True if video appears to be a slideshow (high frame similarity)
+        """
+        if len(frames) < 2:
+            return False
+
+        # Decode frames and compute hashes
+        from PIL import Image
+        import io
+        import base64
+
+        hashes = []
+        for frame_b64 in frames:
+            try:
+                # Decode base64 to image
+                frame_bytes = base64.b64decode(frame_b64)
+                img = Image.open(io.BytesIO(frame_bytes))
+
+                # Compute perceptual hash (same as _compute_frame_hash)
+                img = img.convert('L').resize((9, 8), Image.Resampling.LANCZOS)
+                pixels = list(img.getdata())
+
+                avg = sum(pixels) / len(pixels)
+                bits = ''.join('1' if p > avg else '0' for p in pixels)
+                hashes.append(bits)
+            except Exception as e:
+                logger.warning(f"Failed to hash frame for slideshow detection: {e}")
+                continue
+
+        if len(hashes) < 2:
+            return False
+
+        # Calculate average similarity between consecutive frames
+        similarities = []
+        for i in range(len(hashes) - 1):
+            # Hamming distance
+            diff = sum(c1 != c2 for c1, c2 in zip(hashes[i], hashes[i+1]))
+            similarity = 1.0 - (diff / len(hashes[i]))
+            similarities.append(similarity)
+
+        avg_similarity = sum(similarities) / len(similarities)
+
+        is_slideshow = avg_similarity >= similarity_threshold
+        logger.info(f"Slideshow detection: avg_similarity={avg_similarity:.3f}, threshold={similarity_threshold:.3f}, is_slideshow={is_slideshow}")
+
+        return is_slideshow
 
     def _resolve_short_url(self, url: str, platform: str) -> tuple[str, Optional[str]]:
         """
@@ -249,13 +357,21 @@ class VideoParser(BaseParser):
                 logger.info(f"Audio extraction failed: {audio_result.get('reason')}")
                 confidence = audio_result.get('confidence', 0.0)
 
-            # Step 5: Route based on confidence (or forced mode)
+            # Get platform-specific configuration
+            platform_config = self._get_platform_config(platform)
+            audio_threshold = platform_config['audio_confidence_threshold']
+            hybrid_threshold = platform_config['hybrid_confidence_threshold']
+            default_frames = platform_config['default_frames']
+
+            logger.info(f"Platform: {platform or 'unknown'} | Audio threshold: {audio_threshold}, Hybrid threshold: {hybrid_threshold}")
+
+            # Step 5: Route based on confidence (or forced mode) with platform-specific thresholds
             extraction_method = None
             frames_used = 0
             final_recipe = None
             fallback_reason = None
 
-            if force_mode == "audio" or (not force_mode and confidence >= 0.7):
+            if force_mode == "audio" or (not force_mode and confidence >= audio_threshold):
                 # HIGH CONFIDENCE - Use audio-only result
                 extraction_method = "audio_only"
                 frames_used = 0
@@ -268,32 +384,59 @@ class VideoParser(BaseParser):
                     logger.warning("Audio-only failed, falling back to vision-only")
                     fallback_reason = audio_result.get('reason')
                     extraction_method = "vision_only"
-                    frames_used = 5
+                    frames_used = platform_config['max_frames']
 
-            elif force_mode == "hybrid" or (not force_mode and confidence >= 0.4):
-                # MEDIUM CONFIDENCE - Hybrid mode (audio + 3 frames)
+            elif force_mode == "hybrid" or (not force_mode and confidence >= hybrid_threshold):
+                # MEDIUM CONFIDENCE - Hybrid mode (audio + platform-specific frames)
                 extraction_method = "hybrid"
-                frames_used = 3
+                frames_used = default_frames
 
-                logger.info(f"~ Medium confidence ({confidence:.2f}) - using hybrid mode (${self._estimate_cost('hybrid', 3):.3f})")
+                logger.info(f"~ Medium confidence ({confidence:.2f}) - using hybrid mode (${self._estimate_cost('hybrid', frames_used):.3f})")
 
                 # Download video and extract frames
                 video_path = self._download_video(resolved_url, temp_dir)
                 frames = self._extract_key_frames(video_path, num_frames=frames_used)
 
-                # Use vision with audio transcript
-                final_recipe = self._vision_extract_recipe(
-                    frames=frames,
-                    audio_transcript=audio_result.get('transcript'),
-                    video_metadata=download_info
-                )
+                # TikTok-specific: Detect picture slideshows and force vision-only
+                if platform == 'tiktok' and platform_config.get('detect_slideshows'):
+                    is_slideshow = self._is_slideshow_video(frames)
+                    if is_slideshow:
+                        logger.info("🖼️  Detected TikTok picture slideshow - switching to vision-only mode")
+                        extraction_method = "vision_only"
+                        fallback_reason = "tiktok_slideshow_detected"
+                        # Extract more frames for slideshows (each frame = different recipe step)
+                        frames = self._extract_key_frames(video_path, num_frames=platform_config['max_frames'])
+                        frames_used = len(frames)
+                        # Vision-only for slideshows (audio is usually just background music)
+                        final_recipe = self._vision_extract_recipe(
+                            frames=frames,
+                            audio_transcript=None,
+                            video_metadata=download_info,
+                            platform=platform
+                        )
+                    else:
+                        # Normal hybrid mode
+                        final_recipe = self._vision_extract_recipe(
+                            frames=frames,
+                            audio_transcript=audio_result.get('transcript'),
+                            video_metadata=download_info,
+                            platform=platform
+                        )
+                else:
+                    # Use vision with audio transcript
+                    final_recipe = self._vision_extract_recipe(
+                        frames=frames,
+                        audio_transcript=audio_result.get('transcript'),
+                        video_metadata=download_info,
+                        platform=platform
+                    )
 
             else:
-                # LOW CONFIDENCE - Vision-only mode (5 frames, ignore audio)
+                # LOW CONFIDENCE - Vision-only mode (platform-specific frames, ignore audio)
                 extraction_method = "vision_only"
-                frames_used = 5
+                frames_used = platform_config['max_frames']
 
-                logger.info(f"✗ Low confidence ({confidence:.2f}) - using vision-only (${self._estimate_cost('vision_only', 5):.3f})")
+                logger.info(f"✗ Low confidence ({confidence:.2f}) - using vision-only (${self._estimate_cost('vision_only', frames_used):.3f})")
                 fallback_reason = audio_result.get('reason') if not audio_result['success'] else "low_confidence"
 
                 # Download video and extract frames
@@ -304,7 +447,8 @@ class VideoParser(BaseParser):
                 final_recipe = self._vision_extract_recipe(
                     frames=frames,
                     audio_transcript=None,
-                    video_metadata=download_info
+                    video_metadata=download_info,
+                    platform=platform
                 )
 
             # Check if we got a recipe
@@ -1017,7 +1161,8 @@ Return ONLY valid JSON, no other text."""
         self,
         frames: List[str],
         audio_transcript: Optional[str] = None,
-        video_metadata: Optional[Dict] = None
+        video_metadata: Optional[Dict] = None,
+        platform: Optional[str] = None
     ) -> Optional[Dict[str, Any]]:
         """
         Extract recipe from video frames using GPT-4 Vision API.
@@ -1031,6 +1176,7 @@ Return ONLY valid JSON, no other text."""
             frames: List of base64-encoded JPEG frame images
             audio_transcript: Optional audio transcript for hybrid mode
             video_metadata: Optional dict with 'title', 'description', 'platform'
+            platform: Optional platform name for optimized prompts
 
         Returns:
             Recipe dict with standard structure, or None if not a recipe video
@@ -1043,15 +1189,15 @@ Return ONLY valid JSON, no other text."""
             return None
 
         metadata = video_metadata or {}
-        platform = metadata.get('platform', 'unknown')
+        detected_platform = platform or metadata.get('platform', 'unknown')
         title = metadata.get('title', '')
         description = metadata.get('description', '')
 
-        logger.info(f"Extracting recipe from {len(frames)} frames using GPT-4 Vision...")
+        logger.info(f"Extracting recipe from {len(frames)} frames using GPT-4 Vision (platform: {detected_platform})...")
 
-        # Build the prompt
+        # Build the prompt with platform-specific hints
         prompt = self._build_vision_prompt(
-            platform=platform,
+            platform=detected_platform,
             title=title,
             description=description,
             audio_transcript=audio_transcript

@@ -1257,3 +1257,331 @@ class TestHybridAudioVisionRouting:
             assert result['success'] is False
             assert result['confidence'] == 0.0
             assert 'API Error' in result['reason']
+
+
+class TestPlatformSpecificOptimizations:
+    """Test suite for platform-specific optimizations (Issue #38)."""
+
+    @pytest.fixture
+    def video_parser(self):
+        """Create VideoParser instance for testing."""
+        return VideoParser(timeout=120)
+
+    def test_get_platform_config_tiktok(self, video_parser):
+        """Test TikTok platform configuration retrieval."""
+        config = video_parser._get_platform_config('tiktok')
+
+        assert config['audio_confidence_threshold'] == 0.65
+        assert config['hybrid_confidence_threshold'] == 0.35
+        assert config['default_frames'] == 3
+        assert config['max_frames'] == 4
+        assert config['detect_slideshows'] is True
+
+    def test_get_platform_config_instagram(self, video_parser):
+        """Test Instagram platform configuration retrieval."""
+        config = video_parser._get_platform_config('instagram')
+
+        assert config['audio_confidence_threshold'] == 0.75
+        assert config['hybrid_confidence_threshold'] == 0.45
+        assert config['default_frames'] == 4
+        assert config['max_frames'] == 5
+        assert config['detect_slideshows'] is False
+
+    def test_get_platform_config_youtube(self, video_parser):
+        """Test YouTube platform configuration retrieval."""
+        config = video_parser._get_platform_config('youtube')
+
+        assert config['audio_confidence_threshold'] == 0.8
+        assert config['hybrid_confidence_threshold'] == 0.5
+        assert config['default_frames'] == 3
+        assert config['max_frames'] == 4
+        assert config['detect_slideshows'] is False
+
+    def test_get_platform_config_unknown(self, video_parser):
+        """Test unknown platform falls back to default configuration."""
+        config = video_parser._get_platform_config('unknown_platform')
+
+        assert config['audio_confidence_threshold'] == 0.7
+        assert config['hybrid_confidence_threshold'] == 0.4
+        assert config['default_frames'] == 4
+        assert config['max_frames'] == 5
+
+    def test_get_platform_config_none(self, video_parser):
+        """Test None platform falls back to default configuration."""
+        config = video_parser._get_platform_config(None)
+
+        assert config['audio_confidence_threshold'] == 0.7
+        assert config['hybrid_confidence_threshold'] == 0.4
+
+    def test_is_slideshow_video_high_similarity(self, video_parser):
+        """Test slideshow detection with high frame similarity."""
+        # Create 3 identical frames (base64-encoded blank images)
+        import base64
+        from PIL import Image
+        import io
+
+        # Create identical frames
+        frames = []
+        for _ in range(3):
+            img = Image.new('RGB', (100, 100), color=(255, 255, 255))
+            buffer = io.BytesIO()
+            img.save(buffer, format='JPEG')
+            frame_b64 = base64.b64encode(buffer.getvalue()).decode('utf-8')
+            frames.append(frame_b64)
+
+        is_slideshow = video_parser._is_slideshow_video(frames, similarity_threshold=0.95)
+        assert is_slideshow is True
+
+    def test_is_slideshow_video_low_similarity(self, video_parser):
+        """Test slideshow detection with low frame similarity (normal video)."""
+        import base64
+        from PIL import Image
+        from PIL import ImageDraw
+        import io
+
+        # Create different frames with varying content (not just solid colors)
+        frames = []
+        for i in range(3):
+            img = Image.new('RGB', (100, 100), color=(255, 255, 255))
+            draw = ImageDraw.Draw(img)
+            # Draw different shapes in each frame
+            if i == 0:
+                draw.rectangle([10, 10, 40, 40], fill=(255, 0, 0))
+            elif i == 1:
+                draw.ellipse([50, 50, 80, 80], fill=(0, 255, 0))
+            else:
+                draw.polygon([(10, 90), (50, 10), (90, 90)], fill=(0, 0, 255))
+
+            buffer = io.BytesIO()
+            img.save(buffer, format='JPEG')
+            frame_b64 = base64.b64encode(buffer.getvalue()).decode('utf-8')
+            frames.append(frame_b64)
+
+        is_slideshow = video_parser._is_slideshow_video(frames, similarity_threshold=0.95)
+        assert is_slideshow is False
+
+    def test_is_slideshow_video_insufficient_frames(self, video_parser):
+        """Test slideshow detection with insufficient frames."""
+        import base64
+
+        # Only 1 frame
+        is_slideshow = video_parser._is_slideshow_video([base64.b64encode(b'fake').decode('utf-8')])
+        assert is_slideshow is False
+
+    @pytest.mark.asyncio
+    async def test_tiktok_routing_medium_confidence(self, video_parser):
+        """Test TikTok routes to audio-only with confidence 0.70 (above 0.65 threshold)."""
+        with patch.object(video_parser, '_detect_platform') as mock_detect, \
+             patch.object(video_parser, '_resolve_short_url') as mock_resolve, \
+             patch.object(video_parser, '_download_audio') as mock_audio, \
+             patch.object(video_parser, '_try_audio_extraction') as mock_try_audio, \
+             patch.object(video_parser, '_calculate_audio_confidence') as mock_confidence:
+
+            mock_detect.return_value = 'tiktok'
+            mock_resolve.return_value = ('https://tiktok.com/@user/video/123', None)
+            mock_audio.return_value = {
+                'success': True,
+                'title': 'Test Recipe',
+                'description': 'Test description',
+                'platform': 'tiktok',
+                'url': 'https://tiktok.com/@user/video/123'
+            }
+
+            # Audio extraction succeeded
+            mock_try_audio.return_value = {
+                'success': True,
+                'recipe_data': {'name': 'Test Recipe', 'ingredients': [], 'steps': []},
+                'transcript': 'Test transcript'
+            }
+
+            # Confidence 0.70 - above TikTok audio threshold (0.65) but below default (0.7)
+            mock_confidence.return_value = 0.70
+
+            result = await video_parser.parse('https://tiktok.com/@user/video/123')
+
+            # Should use audio-only (confidence 0.70 >= 0.65)
+            assert result.success is True
+            assert result.extraction_method == 'audio_only'
+
+    @pytest.mark.asyncio
+    async def test_instagram_routing_medium_confidence(self, video_parser):
+        """Test Instagram requires higher confidence (0.73 < 0.75 threshold) for audio-only."""
+        with patch.object(video_parser, '_detect_platform') as mock_detect, \
+             patch.object(video_parser, '_resolve_short_url') as mock_resolve, \
+             patch.object(video_parser, '_download_audio') as mock_audio, \
+             patch.object(video_parser, '_try_audio_extraction') as mock_try_audio, \
+             patch.object(video_parser, '_calculate_audio_confidence') as mock_confidence, \
+             patch.object(video_parser, '_download_video') as mock_video, \
+             patch.object(video_parser, '_extract_key_frames') as mock_frames, \
+             patch.object(video_parser, '_vision_extract_recipe') as mock_vision:
+
+            mock_detect.return_value = 'instagram'
+            mock_resolve.return_value = ('https://instagram.com/reel/ABC123', None)
+            mock_audio.return_value = {
+                'success': True,
+                'title': 'Test Recipe',
+                'description': 'Test description',
+                'platform': 'instagram',
+                'url': 'https://instagram.com/reel/ABC123'
+            }
+
+            # Audio extraction succeeded
+            mock_try_audio.return_value = {
+                'success': True,
+                'recipe_data': {'name': 'Test Recipe', 'ingredients': [], 'steps': []},
+                'transcript': 'Test transcript'
+            }
+
+            # Confidence 0.73 - below Instagram threshold (0.75)
+            mock_confidence.return_value = 0.73
+
+            mock_video.return_value = '/tmp/video.mp4'
+            mock_frames.return_value = ['frame1', 'frame2', 'frame3', 'frame4']
+            mock_vision.return_value = {'name': 'Vision Recipe', 'ingredients': [], 'steps': []}
+
+            result = await video_parser.parse('https://instagram.com/reel/ABC123')
+
+            # Should use hybrid mode (0.73 >= 0.45 hybrid threshold)
+            assert result.success is True
+            assert result.extraction_method == 'hybrid'
+            assert result.frames_used == 4  # Instagram default_frames
+
+    @pytest.mark.asyncio
+    async def test_youtube_routing_high_threshold(self, video_parser):
+        """Test YouTube requires highest confidence (0.78 < 0.8 threshold) for audio-only."""
+        with patch.object(video_parser, '_detect_platform') as mock_detect, \
+             patch.object(video_parser, '_resolve_short_url') as mock_resolve, \
+             patch.object(video_parser, '_download_audio') as mock_audio, \
+             patch.object(video_parser, '_try_audio_extraction') as mock_try_audio, \
+             patch.object(video_parser, '_calculate_audio_confidence') as mock_confidence, \
+             patch.object(video_parser, '_download_video') as mock_video, \
+             patch.object(video_parser, '_extract_key_frames') as mock_frames, \
+             patch.object(video_parser, '_vision_extract_recipe') as mock_vision:
+
+            mock_detect.return_value = 'youtube'
+            mock_resolve.return_value = ('https://youtube.com/shorts/xyz', None)
+            mock_audio.return_value = {
+                'success': True,
+                'title': 'Test Recipe',
+                'description': 'Test description',
+                'platform': 'youtube',
+                'url': 'https://youtube.com/shorts/xyz'
+            }
+
+            # Audio extraction succeeded
+            mock_try_audio.return_value = {
+                'success': True,
+                'recipe_data': {'name': 'Test Recipe', 'ingredients': [], 'steps': []},
+                'transcript': 'Test transcript'
+            }
+
+            # Confidence 0.78 - below YouTube threshold (0.8)
+            mock_confidence.return_value = 0.78
+
+            mock_video.return_value = '/tmp/video.mp4'
+            mock_frames.return_value = ['frame1', 'frame2', 'frame3']
+            mock_vision.return_value = {'name': 'Vision Recipe', 'ingredients': [], 'steps': []}
+
+            result = await video_parser.parse('https://youtube.com/shorts/xyz')
+
+            # Should use hybrid mode (0.78 >= 0.5 hybrid threshold)
+            assert result.success is True
+            assert result.extraction_method == 'hybrid'
+            assert result.frames_used == 3  # YouTube default_frames
+
+    @pytest.mark.asyncio
+    async def test_tiktok_slideshow_detection(self, video_parser):
+        """Test TikTok slideshow detection switches to vision-only mode."""
+        with patch.object(video_parser, '_detect_platform') as mock_detect, \
+             patch.object(video_parser, '_resolve_short_url') as mock_resolve, \
+             patch.object(video_parser, '_download_audio') as mock_audio, \
+             patch.object(video_parser, '_try_audio_extraction') as mock_try_audio, \
+             patch.object(video_parser, '_calculate_audio_confidence') as mock_confidence, \
+             patch.object(video_parser, '_download_video') as mock_video, \
+             patch.object(video_parser, '_extract_key_frames') as mock_frames, \
+             patch.object(video_parser, '_is_slideshow_video') as mock_slideshow, \
+             patch.object(video_parser, '_vision_extract_recipe') as mock_vision:
+
+            mock_detect.return_value = 'tiktok'
+            mock_resolve.return_value = ('https://tiktok.com/@user/video/123', None)
+            mock_audio.return_value = {
+                'success': True,
+                'title': 'Test Recipe',
+                'description': 'Test description',
+                'platform': 'tiktok',
+                'url': 'https://tiktok.com/@user/video/123'
+            }
+
+            # Audio extraction succeeded
+            mock_try_audio.return_value = {
+                'success': True,
+                'recipe_data': {'name': 'Test Recipe', 'ingredients': [], 'steps': []},
+                'transcript': 'Background music'
+            }
+
+            # Medium confidence - would normally use hybrid mode
+            mock_confidence.return_value = 0.50
+
+            mock_video.return_value = '/tmp/video.mp4'
+            # First call returns 3 frames (default), second call returns 4 (max_frames for slideshow)
+            mock_frames.side_effect = [
+                ['frame1', 'frame2', 'frame3'],
+                ['frame1', 'frame2', 'frame3', 'frame4']
+            ]
+            mock_slideshow.return_value = True  # Detected as slideshow
+            mock_vision.return_value = {'name': 'Vision Recipe', 'ingredients': [], 'steps': []}
+
+            result = await video_parser.parse('https://tiktok.com/@user/video/123')
+
+            # Should switch to vision-only due to slideshow detection
+            assert result.success is True
+            assert result.extraction_method == 'vision_only'
+            assert result.fallback_reason == 'tiktok_slideshow_detected'
+            assert result.frames_used == 4  # TikTok max_frames for slideshows
+
+    @pytest.mark.asyncio
+    async def test_platform_specific_frame_counts(self, video_parser):
+        """Test platform-specific frame counts are used correctly."""
+        test_cases = [
+            ('tiktok', 3, 4),      # default_frames=3, max_frames=4
+            ('instagram', 4, 5),   # default_frames=4, max_frames=5
+            ('youtube', 3, 4),     # default_frames=3, max_frames=4
+        ]
+
+        for platform, expected_hybrid, expected_vision in test_cases:
+            with patch.object(video_parser, '_detect_platform') as mock_detect, \
+                 patch.object(video_parser, '_resolve_short_url') as mock_resolve, \
+                 patch.object(video_parser, '_download_audio') as mock_audio, \
+                 patch.object(video_parser, '_try_audio_extraction') as mock_try_audio, \
+                 patch.object(video_parser, '_download_video') as mock_video, \
+                 patch.object(video_parser, '_extract_key_frames') as mock_frames, \
+                 patch.object(video_parser, '_is_slideshow_video') as mock_slideshow, \
+                 patch.object(video_parser, '_vision_extract_recipe') as mock_vision:
+
+                mock_detect.return_value = platform
+                mock_resolve.return_value = (f'https://{platform}.com/video/123', None)
+                mock_audio.return_value = {
+                    'success': True,
+                    'title': 'Test Recipe',
+                    'description': 'Test description',
+                    'platform': platform,
+                    'url': f'https://{platform}.com/video/123'
+                }
+
+                # Low confidence for vision-only mode
+                mock_try_audio.return_value = {
+                    'success': False,
+                    'confidence': 0.1,
+                    'recipe_data': None,
+                    'reason': 'low_confidence'
+                }
+
+                mock_video.return_value = '/tmp/video.mp4'
+                mock_frames.return_value = ['frame'] * expected_vision
+                mock_slideshow.return_value = False
+                mock_vision.return_value = {'name': 'Recipe', 'ingredients': [], 'steps': []}
+
+                result = await video_parser.parse(f'https://{platform}.com/video/123')
+
+                # Should use platform-specific max_frames for vision-only
+                assert result.frames_used == expected_vision, f"{platform} should use {expected_vision} frames for vision-only"
