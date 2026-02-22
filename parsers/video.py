@@ -1188,3 +1188,152 @@ YOUTUBE-SPECIFIC NOTES:
 Return ONLY valid JSON, no other text or explanation."""
 
         return base_prompt
+
+    def _calculate_audio_confidence(
+        self,
+        transcript: str,
+        recipe_data: Dict[str, Any],
+        audio_metadata: Optional[Dict] = None
+    ) -> float:
+        """
+        Calculate confidence score for audio-based recipe extraction.
+
+        Analyzes multiple factors to determine if audio extraction is reliable
+        or if vision-based fallback is needed for better quality.
+
+        Args:
+            transcript: Whisper transcription text
+            recipe_data: Extracted recipe from GPT-4 (audio-only)
+            audio_metadata: Optional audio analysis (volume, clarity, duration)
+
+        Returns:
+            Confidence score 0.0-1.0 where:
+            - >= 0.7: High confidence (use audio-only)
+            - 0.4-0.7: Medium confidence (use hybrid audio+vision)
+            - < 0.4: Low confidence (use vision-only)
+
+        Scoring Factors:
+            - Transcript Quality (30%): length, coherence, clarity
+            - Recipe Completeness (40%): name, ingredients, steps, quantities
+            - Cooking Content (20%): cooking vocabulary, measurements
+            - GPT-4 Confidence (10%): metadata completeness
+        """
+        if not transcript or not recipe_data:
+            logger.warning("Empty transcript or recipe data for confidence calculation")
+            return 0.0
+
+        score = 0.0
+
+        # 1. TRANSCRIPT QUALITY (30% weight)
+        transcript_lower = transcript.lower()
+        word_count = len(transcript.split())
+
+        # Length scoring (25% of total)
+        if word_count >= 100:
+            score += 0.25
+        elif word_count >= 50:
+            score += 0.15
+        elif word_count >= 20:
+            score += 0.08
+        else:
+            score += 0.02
+
+        # Clarity scoring (5% of total)
+        inaudible_markers = transcript.count('[inaudible]') + transcript.count('[music]')
+        if word_count > 0:
+            clarity_ratio = 1.0 - min(inaudible_markers / word_count, 1.0)
+            score += clarity_ratio * 0.05
+
+        # 2. RECIPE COMPLETENESS (40% weight)
+
+        # Has recipe name (10%)
+        if recipe_data.get('name') and len(recipe_data['name']) > 3:
+            score += 0.10
+
+        # Has adequate ingredients (15%)
+        ingredients = recipe_data.get('ingredients', [])
+        if len(ingredients) >= 5:
+            score += 0.15
+        elif len(ingredients) >= 3:
+            score += 0.10
+        elif len(ingredients) >= 1:
+            score += 0.05
+
+        # Has cooking steps (15%)
+        steps = recipe_data.get('steps', [])
+        if len(steps) >= 3:
+            score += 0.15
+        elif len(steps) >= 2:
+            score += 0.10
+        elif len(steps) >= 1:
+            score += 0.05
+
+        # Has quantities in ingredients (bonus within 40%)
+        if ingredients:
+            has_quantities = sum(
+                1 for ing in ingredients
+                if any(unit in str(ing).lower() for unit in ['cup', 'tablespoon', 'teaspoon', 'tbsp', 'tsp', 'gram', 'oz', 'lb', 'ml', 'liter'])
+            )
+            quantity_ratio = has_quantities / len(ingredients)
+            # This is already counted in the 15% for ingredients, so it's a quality boost
+            if quantity_ratio >= 0.5:
+                score += 0.05
+
+        # 3. COOKING CONTENT DETECTION (20% weight)
+
+        # Cooking action verbs (10%)
+        cooking_verbs = [
+            'add', 'mix', 'stir', 'cook', 'bake', 'fry', 'boil', 'simmer',
+            'chop', 'dice', 'slice', 'season', 'heat', 'preheat', 'combine',
+            'whisk', 'blend', 'pour', 'serve', 'prepare', 'marinate', 'grill'
+        ]
+        verb_count = sum(1 for verb in cooking_verbs if verb in transcript_lower)
+        if verb_count >= 5:
+            score += 0.10
+        elif verb_count >= 3:
+            score += 0.07
+        elif verb_count >= 1:
+            score += 0.03
+
+        # Measurement units present (5%)
+        measurement_units = [
+            'cup', 'cups', 'tablespoon', 'tablespoons', 'tbsp', 'teaspoon', 'teaspoons', 'tsp',
+            'gram', 'grams', 'ounce', 'ounces', 'oz', 'pound', 'pounds', 'lb',
+            'milliliter', 'ml', 'liter', 'pinch', 'dash'
+        ]
+        unit_count = sum(1 for unit in measurement_units if unit in transcript_lower)
+        if unit_count >= 3:
+            score += 0.05
+        elif unit_count >= 1:
+            score += 0.03
+
+        # Negative signals - promotional content (reduces score)
+        promotional_phrases = [
+            'like and subscribe', 'follow me', 'check my bio', 'link in bio',
+            'swipe up', 'check description', 'comment below', 'hit the bell'
+        ]
+        promo_count = sum(1 for phrase in promotional_phrases if phrase in transcript_lower)
+        if promo_count > 0:
+            score -= min(promo_count * 0.05, 0.15)  # Max penalty 0.15
+
+        # 4. GPT-4 PARSER CONFIDENCE SIGNALS (10% weight)
+
+        # Has metadata (servings, time) (5%)
+        if recipe_data.get('servings') or recipe_data.get('total_time_minutes') or \
+           recipe_data.get('prep_time_minutes') or recipe_data.get('cook_time_minutes'):
+            score += 0.05
+
+        # Detailed steps (average step length > 10 words) (5%)
+        if steps:
+            avg_step_length = sum(len(step.split()) for step in steps) / len(steps)
+            if avg_step_length >= 15:
+                score += 0.05
+            elif avg_step_length >= 10:
+                score += 0.03
+
+        # Ensure score is in valid range [0.0, 1.0]
+        final_score = max(0.0, min(score, 1.0))
+
+        logger.info(f"Audio confidence score: {final_score:.2f} (words: {word_count}, ingredients: {len(ingredients)}, steps: {len(steps)})")
+
+        return final_score

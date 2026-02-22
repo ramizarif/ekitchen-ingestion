@@ -569,3 +569,250 @@ class TestVisionExtraction:
         # Check that at least one image has detail="high"
         image_frames = [item for item in user_content if item['type'] == 'image_url']
         assert any(frame['image_url'].get('detail') == 'high' for frame in image_frames)
+
+
+class TestAudioConfidenceScoring:
+    """Test suite for audio confidence scoring."""
+
+    @pytest.fixture
+    def video_parser(self):
+        """Create VideoParser instance for testing."""
+        return VideoParser(timeout=120)
+
+    def test_high_confidence_spoken_recipe(self, video_parser):
+        """Test high confidence score for clear spoken recipe."""
+        transcript = """
+        Today I'm making a delicious pasta carbonara. Start by boiling water in a large pot.
+        Add 1 pound of spaghetti and cook for 10 minutes until al dente. While the pasta cooks,
+        heat a large skillet and add 4 ounces of diced pancetta. Cook until crispy, about 5 minutes.
+        In a bowl, whisk together 3 eggs, 1 cup of grated parmesan cheese, and black pepper.
+        Drain the pasta and add it to the skillet with the pancetta. Remove from heat and quickly
+        stir in the egg mixture. The heat from the pasta will cook the eggs. Serve immediately
+        with extra parmesan and fresh basil. This recipe serves 4 people.
+        """
+
+        recipe_data = {
+            "name": "Pasta Carbonara",
+            "ingredients": [
+                "1 pound spaghetti",
+                "4 ounces pancetta",
+                "3 eggs",
+                "1 cup parmesan cheese",
+                "black pepper"
+            ],
+            "steps": [
+                "Boil water and cook spaghetti for 10 minutes",
+                "Cook pancetta in skillet until crispy",
+                "Whisk eggs with parmesan and pepper",
+                "Combine pasta with pancetta",
+                "Stir in egg mixture off heat"
+            ],
+            "servings": 4
+        }
+
+        score = video_parser._calculate_audio_confidence(transcript, recipe_data)
+
+        # Should be high confidence (>= 0.7)
+        assert score >= 0.7, f"Expected high confidence, got {score}"
+        assert score <= 1.0
+
+    def test_low_confidence_music_only(self, video_parser):
+        """Test low confidence for music-only or non-recipe video."""
+        transcript = "[music] [music] yeah yeah [music] vibes [music]"
+
+        recipe_data = {
+            "name": None,
+            "ingredients": [],
+            "steps": []
+        }
+
+        score = video_parser._calculate_audio_confidence(transcript, recipe_data)
+
+        # Should be low confidence (< 0.4)
+        assert score < 0.4, f"Expected low confidence for music-only, got {score}"
+
+    def test_medium_confidence_partial_audio(self, video_parser):
+        """Test medium confidence for partial audio with some recipe content."""
+        transcript = """
+        Quick pasta recipe. Cook the pasta. Add sauce. Mix everything together.
+        """
+
+        recipe_data = {
+            "name": "Quick Pasta",
+            "ingredients": [
+                "pasta",
+                "sauce"
+            ],
+            "steps": [
+                "Cook pasta",
+                "Add sauce",
+                "Mix together"
+            ]
+        }
+
+        score = video_parser._calculate_audio_confidence(transcript, recipe_data)
+
+        # Should be medium confidence (0.4 - 0.7)
+        assert 0.3 <= score < 0.7, f"Expected medium confidence, got {score}"
+
+    def test_confidence_with_measurements(self, video_parser):
+        """Test that measurements boost confidence score."""
+        transcript = """
+        Add 2 cups of flour, 1 tablespoon of sugar, and 3 teaspoons of baking powder.
+        Mix well and bake.
+        """
+
+        recipe_data = {
+            "name": "Simple Bread",
+            "ingredients": [
+                "2 cups flour",
+                "1 tablespoon sugar",
+                "3 teaspoons baking powder"
+            ],
+            "steps": [
+                "Mix ingredients",
+                "Bake"
+            ]
+        }
+
+        score = video_parser._calculate_audio_confidence(transcript, recipe_data)
+
+        # Should have reasonable confidence due to measurements
+        assert score >= 0.5, f"Expected decent confidence with measurements, got {score}"
+
+    def test_confidence_penalized_by_promotional_content(self, video_parser):
+        """Test that promotional content reduces confidence."""
+        transcript = """
+        Make sure to like and subscribe! Check my bio for more recipes!
+        Mix flour and sugar. Link in description below!
+        """
+
+        recipe_data = {
+            "name": "Recipe",
+            "ingredients": ["flour", "sugar"],
+            "steps": ["Mix ingredients"]
+        }
+
+        score_with_promo = video_parser._calculate_audio_confidence(transcript, recipe_data)
+
+        # Compare to similar recipe without promo content
+        clean_transcript = "Mix flour and sugar together"
+        score_without_promo = video_parser._calculate_audio_confidence(clean_transcript, recipe_data)
+
+        # Promotional content should reduce score
+        assert score_with_promo < score_without_promo, "Promotional content should reduce confidence"
+
+    def test_confidence_with_cooking_verbs(self, video_parser):
+        """Test that cooking action verbs increase confidence."""
+        transcript = """
+        Chop the vegetables, dice the onions, and slice the peppers. Heat the pan,
+        add oil, and sauté everything together. Season with salt and pepper, then
+        simmer for 10 minutes.
+        """
+
+        recipe_data = {
+            "name": "Sautéed Vegetables",
+            "ingredients": ["vegetables", "onions", "peppers", "oil", "salt", "pepper"],
+            "steps": [
+                "Chop vegetables",
+                "Heat pan and sauté",
+                "Season and simmer"
+            ]
+        }
+
+        score = video_parser._calculate_audio_confidence(transcript, recipe_data)
+
+        # Should have good confidence due to cooking vocabulary
+        assert score >= 0.6, f"Expected good confidence with cooking verbs, got {score}"
+
+    def test_empty_transcript_returns_zero(self, video_parser):
+        """Test that empty transcript returns 0 confidence."""
+        score = video_parser._calculate_audio_confidence("", {"name": "Test"})
+        assert score == 0.0
+
+    def test_empty_recipe_data_returns_zero(self, video_parser):
+        """Test that empty recipe data returns 0 confidence."""
+        score = video_parser._calculate_audio_confidence("some transcript", {})
+        assert score == 0.0
+
+    def test_confidence_with_detailed_steps(self, video_parser):
+        """Test that detailed steps increase confidence."""
+        transcript = "Let me show you how to make the perfect risotto"
+
+        detailed_recipe = {
+            "name": "Risotto",
+            "ingredients": ["rice", "broth", "wine", "cheese"],
+            "steps": [
+                "First, heat the chicken broth in a separate pot and keep it warm on low heat",
+                "In a large pan, heat olive oil and sauté the finely chopped onions until translucent",
+                "Add the arborio rice and toast it for about 2 minutes while stirring constantly"
+            ]
+        }
+
+        brief_recipe = {
+            "name": "Risotto",
+            "ingredients": ["rice", "broth", "wine", "cheese"],
+            "steps": [
+                "Heat broth",
+                "Sauté onions",
+                "Toast rice"
+            ]
+        }
+
+        detailed_score = video_parser._calculate_audio_confidence(transcript, detailed_recipe)
+        brief_score = video_parser._calculate_audio_confidence(transcript, brief_recipe)
+
+        # Detailed steps should yield higher confidence
+        assert detailed_score > brief_score, "Detailed steps should increase confidence"
+
+    def test_confidence_with_metadata(self, video_parser):
+        """Test that recipe metadata (servings, time) increases confidence."""
+        transcript = "Quick 30-minute recipe for 4 people"
+
+        recipe_with_metadata = {
+            "name": "Quick Meal",
+            "ingredients": ["ingredient1", "ingredient2"],
+            "steps": ["step1", "step2"],
+            "servings": 4,
+            "total_time_minutes": 30
+        }
+
+        recipe_without_metadata = {
+            "name": "Quick Meal",
+            "ingredients": ["ingredient1", "ingredient2"],
+            "steps": ["step1", "step2"]
+        }
+
+        score_with = video_parser._calculate_audio_confidence(transcript, recipe_with_metadata)
+        score_without = video_parser._calculate_audio_confidence(transcript, recipe_without_metadata)
+
+        # Metadata should increase confidence
+        assert score_with > score_without, "Metadata should increase confidence"
+
+    def test_confidence_score_range(self, video_parser):
+        """Test that confidence scores are always in valid range [0, 1]."""
+        test_cases = [
+            ("", {}),  # Empty
+            ("word", {"name": "test"}),  # Minimal
+            ("a" * 1000, {"name": "test", "ingredients": ["i"] * 100, "steps": ["s"] * 100})  # Excessive
+        ]
+
+        for transcript, recipe_data in test_cases:
+            score = video_parser._calculate_audio_confidence(transcript, recipe_data)
+            assert 0.0 <= score <= 1.0, f"Score {score} out of range for input: {transcript[:50]}"
+
+    def test_long_transcript_gets_high_length_score(self, video_parser):
+        """Test that long transcripts (>100 words) get maximum length score."""
+        # Create a 120-word transcript
+        long_transcript = " ".join(["cook pasta add sauce"] * 30)
+
+        recipe_data = {
+            "name": "Pasta",
+            "ingredients": ["pasta", "sauce"],
+            "steps": ["cook", "add"]
+        }
+
+        score = video_parser._calculate_audio_confidence(long_transcript, recipe_data)
+
+        # With 120 words + basic recipe, should get at least transcript quality points
+        assert score > 0.25, f"Long transcript should get length bonus, got {score}"
