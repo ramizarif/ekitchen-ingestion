@@ -8,7 +8,7 @@ from fastapi import FastAPI, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 
-from app.routers import parse, health, ingest, analytics
+from app.routers import parse, health, ingest, analytics, dashboard
 from app.config import settings
 
 # Configure logging
@@ -137,6 +137,7 @@ app.include_router(health.router, tags=["health"])
 app.include_router(parse.router, prefix="/api/v1", tags=["parse"])
 app.include_router(ingest.router, prefix="/api/v1", tags=["ingest"])
 app.include_router(analytics.router, prefix="/api/v1", tags=["analytics"])
+app.include_router(dashboard.router, tags=["dashboard"])
 
 
 @app.get("/")

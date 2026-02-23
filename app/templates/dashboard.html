@@ -1,0 +1,472 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>eKitchen Video Ingestion Analytics</title>
+    <script src="https://cdn.tailwindcss.com"></script>
+    <script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.1/dist/chart.umd.min.js"></script>
+    <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.5.1/css/all.min.css">
+    <style>
+        .stat-card {
+            transition: transform 0.2s, box-shadow 0.2s;
+        }
+        .stat-card:hover {
+            transform: translateY(-4px);
+            box-shadow: 0 12px 24px rgba(0, 0, 0, 0.15);
+        }
+        .chart-container {
+            position: relative;
+            height: 300px;
+        }
+        .loading {
+            animation: pulse 2s cubic-bezier(0.4, 0, 0.6, 1) infinite;
+        }
+        @keyframes pulse {
+            0%, 100% { opacity: 1; }
+            50% { opacity: .5; }
+        }
+    </style>
+</head>
+<body class="bg-gray-50">
+    <!-- Header -->
+    <header class="bg-gradient-to-r from-blue-600 to-purple-600 text-white shadow-lg">
+        <div class="container mx-auto px-6 py-6">
+            <div class="flex items-center justify-between">
+                <div>
+                    <h1 class="text-3xl font-bold">🎬 eKitchen Video Ingestion Analytics</h1>
+                    <p class="text-blue-100 mt-1">Real-time cost tracking and performance monitoring</p>
+                </div>
+                <div class="text-right">
+                    <div class="text-sm text-blue-100">Last Updated</div>
+                    <div id="lastUpdated" class="text-lg font-semibold">--:--:--</div>
+                </div>
+            </div>
+        </div>
+    </header>
+
+    <div class="container mx-auto px-6 py-8">
+        <!-- Summary Cards -->
+        <div class="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-4 gap-6 mb-8">
+            <!-- Total Cost -->
+            <div class="stat-card bg-white rounded-xl shadow-md p-6">
+                <div class="flex items-center justify-between">
+                    <div>
+                        <p class="text-gray-500 text-sm font-medium">Total Cost</p>
+                        <h3 id="totalCost" class="text-3xl font-bold text-gray-900 mt-2 loading">$0.00</h3>
+                        <p class="text-xs text-gray-400 mt-1">All time</p>
+                    </div>
+                    <div class="bg-green-100 rounded-full p-3">
+                        <i class="fas fa-dollar-sign text-green-600 text-2xl"></i>
+                    </div>
+                </div>
+            </div>
+
+            <!-- Videos Processed -->
+            <div class="stat-card bg-white rounded-xl shadow-md p-6">
+                <div class="flex items-center justify-between">
+                    <div>
+                        <p class="text-gray-500 text-sm font-medium">Videos Processed</p>
+                        <h3 id="videoCount" class="text-3xl font-bold text-gray-900 mt-2 loading">0</h3>
+                        <p class="text-xs text-gray-400 mt-1">All time</p>
+                    </div>
+                    <div class="bg-blue-100 rounded-full p-3">
+                        <i class="fas fa-video text-blue-600 text-2xl"></i>
+                    </div>
+                </div>
+            </div>
+
+            <!-- Average Cost -->
+            <div class="stat-card bg-white rounded-xl shadow-md p-6">
+                <div class="flex items-center justify-between">
+                    <div>
+                        <p class="text-gray-500 text-sm font-medium">Avg Cost/Video</p>
+                        <h3 id="avgCost" class="text-3xl font-bold text-gray-900 mt-2 loading">$0.00</h3>
+                        <p class="text-xs text-gray-400 mt-1">Per extraction</p>
+                    </div>
+                    <div class="bg-purple-100 rounded-full p-3">
+                        <i class="fas fa-chart-line text-purple-600 text-2xl"></i>
+                    </div>
+                </div>
+            </div>
+
+            <!-- Today's Cost -->
+            <div class="stat-card bg-white rounded-xl shadow-md p-6">
+                <div class="flex items-center justify-between">
+                    <div>
+                        <p class="text-gray-500 text-sm font-medium">Today's Cost</p>
+                        <h3 id="todayCost" class="text-3xl font-bold text-gray-900 mt-2 loading">$0.00</h3>
+                        <p id="todayCount" class="text-xs text-gray-400 mt-1">0 videos</p>
+                    </div>
+                    <div class="bg-orange-100 rounded-full p-3">
+                        <i class="fas fa-calendar-day text-orange-600 text-2xl"></i>
+                    </div>
+                </div>
+            </div>
+        </div>
+
+        <!-- Charts Row -->
+        <div class="grid grid-cols-1 lg:grid-cols-2 gap-6 mb-8">
+            <!-- Cost by Method Chart -->
+            <div class="bg-white rounded-xl shadow-md p-6">
+                <h3 class="text-lg font-semibold text-gray-900 mb-4">💰 Cost by Extraction Method</h3>
+                <div class="chart-container">
+                    <canvas id="methodChart"></canvas>
+                </div>
+                <div id="methodStats" class="mt-4 space-y-2">
+                    <!-- Populated by JS -->
+                </div>
+            </div>
+
+            <!-- Cost by Platform Chart -->
+            <div class="bg-white rounded-xl shadow-md p-6">
+                <h3 class="text-lg font-semibold text-gray-900 mb-4">🌐 Cost by Platform</h3>
+                <div class="chart-container">
+                    <canvas id="platformChart"></canvas>
+                </div>
+                <div id="platformStats" class="mt-4 space-y-2">
+                    <!-- Populated by JS -->
+                </div>
+            </div>
+        </div>
+
+        <!-- Daily Trend Chart -->
+        <div class="bg-white rounded-xl shadow-md p-6 mb-8">
+            <h3 class="text-lg font-semibold text-gray-900 mb-4">📈 Daily Cost Trend (Last 7 Days)</h3>
+            <div style="height: 300px;">
+                <canvas id="trendChart"></canvas>
+            </div>
+        </div>
+
+        <!-- Cost Breakdown Table -->
+        <div class="bg-white rounded-xl shadow-md p-6 mb-8">
+            <h3 class="text-lg font-semibold text-gray-900 mb-4">🔍 Detailed Cost Breakdown</h3>
+            <div class="overflow-x-auto">
+                <table class="min-w-full divide-y divide-gray-200">
+                    <thead class="bg-gray-50">
+                        <tr>
+                            <th class="px-6 py-3 text-left text-xs font-medium text-gray-500 uppercase tracking-wider">API Service</th>
+                            <th class="px-6 py-3 text-right text-xs font-medium text-gray-500 uppercase tracking-wider">Total Cost</th>
+                            <th class="px-6 py-3 text-right text-xs font-medium text-gray-500 uppercase tracking-wider">% of Total</th>
+                        </tr>
+                    </thead>
+                    <tbody id="costBreakdownTable" class="bg-white divide-y divide-gray-200">
+                        <!-- Populated by JS -->
+                    </tbody>
+                </table>
+            </div>
+        </div>
+
+        <!-- Cost Optimization Insights -->
+        <div id="optimizationInsights" class="bg-gradient-to-r from-green-50 to-blue-50 rounded-xl shadow-md p-6 border-l-4 border-green-500">
+            <h3 class="text-lg font-semibold text-gray-900 mb-3">💡 Cost Optimization Insights</h3>
+            <div id="insightsContent" class="space-y-2 text-gray-700">
+                <!-- Populated by JS -->
+            </div>
+        </div>
+    </div>
+
+    <!-- Footer -->
+    <footer class="bg-white border-t border-gray-200 mt-12">
+        <div class="container mx-auto px-6 py-4 text-center text-gray-500 text-sm">
+            <p>eKitchen Video Ingestion Analytics • Built with FastAPI & Chart.js</p>
+        </div>
+    </footer>
+
+    <script>
+        // API base URL
+        const API_BASE = '/api/v1';
+
+        // Chart instances
+        let methodChart, platformChart, trendChart;
+
+        // Fetch and update all analytics data
+        async function fetchAnalytics() {
+            try {
+                // Fetch detailed analytics
+                const response = await fetch(`${API_BASE}/analytics/costs`);
+                const data = await response.json();
+
+                // Fetch summary
+                const summaryResponse = await fetch(`${API_BASE}/analytics/costs/summary`);
+                const summary = await summaryResponse.json();
+
+                // Update summary cards
+                updateSummaryCards(data, summary);
+
+                // Update charts
+                updateMethodChart(data.by_method);
+                updatePlatformChart(data.by_platform);
+                updateTrendChart(data.trends.daily_costs);
+
+                // Update cost breakdown table
+                updateCostBreakdownTable(data.totals);
+
+                // Update optimization insights
+                updateOptimizationInsights(data);
+
+                // Update last updated time
+                document.getElementById('lastUpdated').textContent = new Date().toLocaleTimeString();
+
+                // Remove loading state
+                document.querySelectorAll('.loading').forEach(el => el.classList.remove('loading'));
+
+            } catch (error) {
+                console.error('Error fetching analytics:', error);
+            }
+        }
+
+        function updateSummaryCards(data, summary) {
+            document.getElementById('totalCost').textContent = `$${data.totals.total.toFixed(2)}`;
+            document.getElementById('videoCount').textContent = data.totals.count;
+            document.getElementById('avgCost').textContent = `$${data.avg_cost_per_video.toFixed(4)}`;
+            document.getElementById('todayCost').textContent = `$${summary.today.cost.toFixed(2)}`;
+            document.getElementById('todayCount').textContent = `${summary.today.count} videos`;
+        }
+
+        function updateMethodChart(byMethod) {
+            const ctx = document.getElementById('methodChart').getContext('2d');
+
+            const labels = Object.keys(byMethod);
+            const costs = labels.map(method => byMethod[method].avg_cost);
+            const counts = labels.map(method => byMethod[method].count);
+
+            if (methodChart) methodChart.destroy();
+
+            methodChart = new Chart(ctx, {
+                type: 'bar',
+                data: {
+                    labels: labels.map(l => l.replace('_', ' ')),
+                    datasets: [{
+                        label: 'Avg Cost per Video',
+                        data: costs,
+                        backgroundColor: ['#10B981', '#3B82F6', '#8B5CF6'],
+                        borderRadius: 8,
+                    }]
+                },
+                options: {
+                    responsive: true,
+                    maintainAspectRatio: false,
+                    plugins: {
+                        legend: { display: false },
+                        tooltip: {
+                            callbacks: {
+                                label: (context) => `$${context.parsed.y.toFixed(4)}`
+                            }
+                        }
+                    },
+                    scales: {
+                        y: {
+                            beginAtZero: true,
+                            ticks: {
+                                callback: (value) => `$${value.toFixed(2)}`
+                            }
+                        }
+                    }
+                }
+            });
+
+            // Update method stats
+            const methodStatsHtml = labels.map((method, i) => {
+                const stats = byMethod[method];
+                const colors = ['green', 'blue', 'purple'];
+                return `
+                    <div class="flex items-center justify-between text-sm">
+                        <span class="text-gray-600">${method.replace('_', ' ')}</span>
+                        <span class="font-semibold text-${colors[i]}-600">$${stats.avg_cost.toFixed(4)} × ${stats.count}</span>
+                    </div>
+                `;
+            }).join('');
+            document.getElementById('methodStats').innerHTML = methodStatsHtml;
+        }
+
+        function updatePlatformChart(byPlatform) {
+            const ctx = document.getElementById('platformChart').getContext('2d');
+
+            const labels = Object.keys(byPlatform);
+            const costs = labels.map(platform => byPlatform[platform].total_cost);
+
+            if (platformChart) platformChart.destroy();
+
+            platformChart = new Chart(ctx, {
+                type: 'doughnut',
+                data: {
+                    labels: labels,
+                    datasets: [{
+                        data: costs,
+                        backgroundColor: ['#EF4444', '#F59E0B', '#10B981', '#3B82F6'],
+                        borderWidth: 2,
+                        borderColor: '#fff'
+                    }]
+                },
+                options: {
+                    responsive: true,
+                    maintainAspectRatio: false,
+                    plugins: {
+                        legend: {
+                            position: 'bottom'
+                        },
+                        tooltip: {
+                            callbacks: {
+                                label: (context) => {
+                                    const platform = context.label;
+                                    const cost = context.parsed;
+                                    const count = byPlatform[platform].count;
+                                    return `${platform}: $${cost.toFixed(4)} (${count} videos)`;
+                                }
+                            }
+                        }
+                    }
+                }
+            });
+
+            // Update platform stats
+            const platformStatsHtml = labels.map(platform => {
+                const stats = byPlatform[platform];
+                return `
+                    <div class="flex items-center justify-between text-sm">
+                        <span class="text-gray-600">${platform}</span>
+                        <span class="font-semibold text-gray-900">$${stats.total_cost.toFixed(4)} (${stats.count})</span>
+                    </div>
+                `;
+            }).join('');
+            document.getElementById('platformStats').innerHTML = platformStatsHtml;
+        }
+
+        function updateTrendChart(dailyCosts) {
+            const ctx = document.getElementById('trendChart').getContext('2d');
+
+            const sortedDates = Object.keys(dailyCosts).sort();
+            const costs = sortedDates.map(date => dailyCosts[date]);
+
+            if (trendChart) trendChart.destroy();
+
+            trendChart = new Chart(ctx, {
+                type: 'line',
+                data: {
+                    labels: sortedDates,
+                    datasets: [{
+                        label: 'Daily Cost',
+                        data: costs,
+                        borderColor: '#3B82F6',
+                        backgroundColor: 'rgba(59, 130, 246, 0.1)',
+                        borderWidth: 3,
+                        fill: true,
+                        tension: 0.4,
+                        pointRadius: 5,
+                        pointBackgroundColor: '#3B82F6',
+                        pointBorderColor: '#fff',
+                        pointBorderWidth: 2,
+                        pointHoverRadius: 7,
+                    }]
+                },
+                options: {
+                    responsive: true,
+                    maintainAspectRatio: false,
+                    plugins: {
+                        legend: { display: false },
+                        tooltip: {
+                            callbacks: {
+                                label: (context) => `Cost: $${context.parsed.y.toFixed(4)}`
+                            }
+                        }
+                    },
+                    scales: {
+                        y: {
+                            beginAtZero: true,
+                            ticks: {
+                                callback: (value) => `$${value.toFixed(2)}`
+                            }
+                        }
+                    }
+                }
+            });
+        }
+
+        function updateCostBreakdownTable(totals) {
+            const services = [
+                { name: 'Whisper Transcription', cost: totals.whisper, icon: '🎤' },
+                { name: 'GPT-4 Text Processing', cost: totals.gpt4_text, icon: '💬' },
+                { name: 'GPT-4 Vision Analysis', cost: totals.gpt4_vision, icon: '👁️' }
+            ];
+
+            const total = totals.total;
+            const html = services.map(service => {
+                const percentage = total > 0 ? (service.cost / total * 100).toFixed(1) : 0;
+                return `
+                    <tr>
+                        <td class="px-6 py-4 whitespace-nowrap text-sm font-medium text-gray-900">
+                            ${service.icon} ${service.name}
+                        </td>
+                        <td class="px-6 py-4 whitespace-nowrap text-sm text-right text-gray-900 font-semibold">
+                            $${service.cost.toFixed(4)}
+                        </td>
+                        <td class="px-6 py-4 whitespace-nowrap text-sm text-right text-gray-500">
+                            ${percentage}%
+                        </td>
+                    </tr>
+                `;
+            }).join('');
+
+            document.getElementById('costBreakdownTable').innerHTML = html;
+        }
+
+        function updateOptimizationInsights(data) {
+            const insights = [];
+
+            const audioOnly = data.by_method['audio_only'];
+            const hybrid = data.by_method['hybrid'];
+            const visionOnly = data.by_method['vision_only'];
+
+            if (audioOnly && visionOnly) {
+                const savings = visionOnly.avg_cost - audioOnly.avg_cost;
+                const percentage = ((savings / visionOnly.avg_cost) * 100).toFixed(1);
+                insights.push(`
+                    <div class="flex items-start space-x-3">
+                        <div class="flex-shrink-0">
+                            <i class="fas fa-lightbulb text-yellow-500 text-xl"></i>
+                        </div>
+                        <div>
+                            <p class="font-medium">Audio-only is ${percentage}% cheaper than vision-only</p>
+                            <p class="text-sm text-gray-600">Savings: $${savings.toFixed(4)} per video</p>
+                        </div>
+                    </div>
+                `);
+            }
+
+            if (visionOnly && visionOnly.count > 0) {
+                const potentialSavings = (visionOnly.avg_cost - (audioOnly?.avg_cost || 0)) * visionOnly.count;
+                if (potentialSavings > 0) {
+                    insights.push(`
+                        <div class="flex items-start space-x-3">
+                            <div class="flex-shrink-0">
+                                <i class="fas fa-piggy-bank text-green-500 text-xl"></i>
+                            </div>
+                            <div>
+                                <p class="font-medium">Potential savings opportunity</p>
+                                <p class="text-sm text-gray-600">If ${visionOnly.count} vision-only videos used audio-only: $${potentialSavings.toFixed(4)}</p>
+                            </div>
+                        </div>
+                    `);
+                }
+            }
+
+            if (insights.length === 0) {
+                insights.push(`
+                    <div class="text-gray-500 italic">
+                        <i class="fas fa-info-circle"></i> Process more videos to see optimization insights
+                    </div>
+                `);
+            }
+
+            document.getElementById('insightsContent').innerHTML = insights.join('');
+        }
+
+        // Auto-refresh every 30 seconds
+        setInterval(fetchAnalytics, 30000);
+
+        // Initial load
+        fetchAnalytics();
+    </script>
+</body>
+</html>

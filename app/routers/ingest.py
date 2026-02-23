@@ -6,7 +6,7 @@ import sys
 import re
 import time
 import logging
-from typing import Optional
+from typing import Optional, Dict, Any
 from fastapi import APIRouter, HTTPException, status
 from pydantic import BaseModel, HttpUrl, Field
 from dotenv import load_dotenv
@@ -87,7 +87,11 @@ class IngestResponse(BaseModel):
     image_generated: bool = Field(False, description="Whether image was generated")
     processing_time_seconds: float = Field(..., description="Total processing time")
     source_type: str = Field("website", description="Source type: 'website' or 'video'")
-    
+    analytics: Optional[Dict[str, Any]] = Field(
+        None,
+        description="Analytics metadata for ingestion pipeline (costs, extraction methods, performance)"
+    )
+
     class Config:
         json_schema_extra = {
             "example": {
@@ -97,7 +101,18 @@ class IngestResponse(BaseModel):
                 "ingredients_processed": 12,
                 "image_generated": True,
                 "processing_time_seconds": 45.2,
-                "source_type": "website"
+                "source_type": "website",
+                "analytics": {
+                    "url": "https://www.allrecipes.com/recipe/10813/best-chocolate-chip-cookies/",
+                    "platform": "allrecipes",
+                    "source_type": "website",
+                    "processing_time_ms": 45200,
+                    "cost_breakdown": {
+                        "gpt4_text": 0.002,
+                        "spoonacular_api": 0.001,
+                        "total": 0.003
+                    }
+                }
             }
         }
 
@@ -260,6 +275,24 @@ async def _ingest_video(url: str, platform: str, request: IngestRequest, start_t
         
         if result.success:
             logger.info(f"Successfully ingested video recipe: {result.recipe_name} (ID: {result.recipe_id})")
+
+            # Build analytics metadata for eKitchen backend to store
+            analytics = {
+                "url": url,
+                "source_type": "video",
+                "platform": platform,
+                "extraction_method": parse_result.extraction_method,
+                "frames_used": parse_result.frames_used or 0,
+                "audio_duration_seconds": parse_result.audio_duration_seconds,
+                "video_size_mb": parse_result.video_size_mb,
+                "processing_time_ms": parse_result.processing_time_ms,
+                "transcript_tokens": parse_result.transcript_tokens,
+                "output_tokens": parse_result.output_tokens,
+                "confidence_score": parse_result.confidence_score,
+                "fallback_reason": parse_result.fallback_reason,
+                "cost_breakdown": parse_result.cost_breakdown
+            }
+
             return IngestResponse(
                 success=True,
                 recipe_id=result.recipe_id,
@@ -267,7 +300,8 @@ async def _ingest_video(url: str, platform: str, request: IngestRequest, start_t
                 ingredients_processed=result.ingredients_processed,
                 image_generated=result.image_generated,
                 processing_time_seconds=processing_time,
-                source_type="video"
+                source_type="video",
+                analytics=analytics
             )
         else:
             logger.error(f"Video ingestion failed: {result.error_message}")
@@ -335,6 +369,36 @@ async def _ingest_website(url: str, request: IngestRequest, start_time: float):
         
         if result.success:
             logger.info(f"Successfully ingested website recipe: {result.recipe_name} (ID: {result.recipe_id})")
+
+            # Extract platform from URL (e.g., "allrecipes.com" → "allrecipes")
+            from urllib.parse import urlparse
+            parsed_url = urlparse(url)
+            domain = parsed_url.netloc.replace('www.', '')
+            platform_name = domain.split('.')[0] if domain else 'unknown'
+
+            # Build analytics metadata for eKitchen backend to store
+            # Note: Website ingestion doesn't use video-specific fields (extraction_method, frames_used, etc.)
+            analytics = {
+                "url": url,
+                "source_type": "website",
+                "platform": platform_name,
+                "extraction_method": None,  # NULL for websites
+                "frames_used": 0,
+                "audio_duration_seconds": None,
+                "video_size_mb": None,
+                "processing_time_ms": int(processing_time * 1000),
+                "transcript_tokens": 0,  # Could estimate from scraped text if needed
+                "output_tokens": 0,  # Could track GPT-4 usage for ingredient parsing if needed
+                "confidence_score": None,  # Could add recipe-scrapers confidence if available
+                "fallback_reason": None,
+                "cost_breakdown": {
+                    # Websites don't have Whisper/Vision costs, mainly Spoonacular API + GPT-4 for ingredient parsing
+                    "spoonacular_api": 0.0,  # Could track actual Spoonacular API costs
+                    "gpt4_text": 0.0,  # Could track GPT-4 costs for ingredient standardization
+                    "total": 0.0
+                }
+            }
+
             return IngestResponse(
                 success=True,
                 recipe_id=result.recipe_id,
@@ -342,7 +406,8 @@ async def _ingest_website(url: str, request: IngestRequest, start_time: float):
                 ingredients_processed=result.ingredients_processed,
                 image_generated=result.image_generated,
                 processing_time_seconds=processing_time,
-                source_type="website"
+                source_type="website",
+                analytics=analytics
             )
         else:
             logger.error(f"Website ingestion failed: {result.error_message}")
