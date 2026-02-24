@@ -216,58 +216,23 @@ class VideoParser(BaseParser):
         Returns:
             Tuple of (resolved_url, error_message). If error_message is set, the URL is invalid.
         """
-        # Only resolve known short URL patterns
+        # NOTE: We no longer manually resolve short URLs because TikTok's anti-bot
+        # measures make manual resolution unreliable (redirects to homepage).
+        # Instead, we let yt-dlp handle resolution natively, as it has much better
+        # anti-bot capabilities and can handle short URLs directly.
+
         short_patterns = [
             r'tiktok\.com/t/',
             r'vm\.tiktok\.com/',
         ]
-        
-        needs_resolution = any(re.search(p, url.lower()) for p in short_patterns)
-        
-        if not needs_resolution:
-            return (url, None)
-            
-        logger.info(f"Resolving short URL: {url}")
-        
-        try:
-            # Follow redirects with a browser-like user agent
-            headers = {
-                'User-Agent': 'Mozilla/5.0 (iPhone; CPU iPhone OS 16_0 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/16.0 Mobile/15E148 Safari/604.1'
-            }
-            
-            response = requests.head(
-                url,
-                headers=headers,
-                allow_redirects=True,
-                timeout=15
-            )
-            
-            resolved_url = response.url
-            
-            # Check if we landed on a valid video URL (not home/explore page)
-            # Invalid redirects go to: /?_r=1, /explore, etc.
-            invalid_patterns = [
-                r'tiktok\.com/\?',        # Home page
-                r'tiktok\.com/explore',    # Explore page  
-                r'tiktok\.com/$',          # Root
-            ]
-            
-            is_invalid = any(re.search(p, resolved_url) for p in invalid_patterns)
-            
-            if is_invalid:
-                logger.warning(f"Short URL expired or invalid - redirected to: {resolved_url}")
-                return (url, f"TikTok short link has expired or is invalid. The URL '{url}' redirected to the TikTok home page instead of a video. Please use the full video URL (e.g., tiktok.com/@username/video/1234567890)")
-                
-            if '@' in resolved_url and '/video/' in resolved_url:
-                logger.info(f"Resolved short URL to video: {resolved_url}")
-                return (resolved_url, None)
-            
-            logger.info(f"Resolved URL: {resolved_url}")
-            return (resolved_url, None)
-            
-        except requests.RequestException as e:
-            logger.warning(f"Failed to resolve short URL: {e}")
-            return (url, None)  # Return original on failure, let yt-dlp try
+
+        is_short_url = any(re.search(p, url.lower()) for p in short_patterns)
+
+        if is_short_url:
+            logger.info(f"Short URL detected: {url} - yt-dlp will handle resolution")
+
+        # Always return original URL and let yt-dlp resolve it
+        return (url, None)
 
     async def parse(self, url: str, **kwargs) -> ParseResult:
         """
