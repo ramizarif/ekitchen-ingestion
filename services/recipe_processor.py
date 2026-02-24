@@ -1178,9 +1178,9 @@ Return ONLY the DALL-E prompt, nothing else."""
             self._log_and_print(f"❌ DALL-E image generation failed: {e}", 'error')
             return False
     
-    def create_ekitchen_recipe(self, recipe_data: Dict[str, Any], ai_decisions: Dict[str, Any], 
-                             formatted_ingredients: List[Dict[str, str]], 
-                             nutrition_data: Dict[str, float]) -> Optional[str]:
+    def create_ekitchen_recipe(self, recipe_data: Dict[str, Any], ai_decisions: Dict[str, Any],
+                             formatted_ingredients: List[Dict[str, str]],
+                             nutrition_data: Dict[str, float], user_id: Optional[str] = None) -> Optional[str]:
         """Create recipe in eKitchen database using direct API call"""
         self._log_and_print(f"🏗️  Creating recipe in eKitchen: {recipe_data['title']}")
         
@@ -1210,15 +1210,23 @@ Return ONLY the DALL-E prompt, nothing else."""
             "inspired_by_url": recipe_data['url'],
             "ingredients": formatted_ingredients,
             "tag_names": ai_decisions['tags'],
-            
+
             # Nutrition data
             "calories": nutrition_data['calories'],
             "protein": nutrition_data['protein'],
             "fat": nutrition_data['fat'],
             "carbohydrates": nutrition_data['carbohydrates'],
             "fiber": nutrition_data['fiber'],
-            "sugar": nutrition_data['sugar']
+            "sugar": nutrition_data['sugar'],
+
+            # User import tracking (if user_id provided)
+            "user_created": user_id is not None,
+            "imported_from_url": recipe_data['url'] if user_id else None
         }
+
+        # Add created_by_user_id only if user_id is provided
+        if user_id:
+            create_data["created_by_user_id"] = user_id
         
         try:
             response = requests.post(
@@ -1293,8 +1301,8 @@ Return ONLY the DALL-E prompt, nothing else."""
             self._log_and_print(f"❌ Error uploading image: {e}", 'error')
             return False
     
-    def process_parsed_recipe(self, parsed_recipe: Dict[str, Any], save_images_dir: str = None, 
-                               use_enhanced_ingredients: bool = True) -> 'RecipeProcessingResult':
+    def process_parsed_recipe(self, parsed_recipe: Dict[str, Any], save_images_dir: str = None,
+                               use_enhanced_ingredients: bool = True, user_id: Optional[str] = None) -> 'RecipeProcessingResult':
         """
         Process a pre-parsed recipe (e.g., from video transcription).
         
@@ -1412,7 +1420,7 @@ Return ONLY the DALL-E prompt, nothing else."""
             
             # Phase 6: Create recipe in eKitchen
             self._log_and_print("\n📝 PHASE 6: CREATE EKITCHEN RECIPE")
-            recipe_id = self.create_ekitchen_recipe(recipe_data, ai_decisions, formatted_ingredients, nutrition_data)
+            recipe_id = self.create_ekitchen_recipe(recipe_data, ai_decisions, formatted_ingredients, nutrition_data, user_id)
             
             if not recipe_id:
                 return RecipeProcessingResult(
@@ -1459,7 +1467,7 @@ Return ONLY the DALL-E prompt, nothing else."""
                 processing_time_seconds=time.time() - start_time
             )
 
-    def process_recipe_autonomous(self, recipe_url: str, save_images_dir: str = None, use_enhanced_ingredients: bool = True, allow_ingredient_skipping: bool = False) -> RecipeProcessingResult:
+    def process_recipe_autonomous(self, recipe_url: str, save_images_dir: str = None, use_enhanced_ingredients: bool = True, allow_ingredient_skipping: bool = False, user_id: Optional[str] = None) -> RecipeProcessingResult:
         """
         Complete autonomous recipe processing pipeline
         
@@ -1583,7 +1591,8 @@ Return ONLY the DALL-E prompt, nothing else."""
                 recipe_data,
                 ai_decisions,
                 formatted_ingredients,
-                nutrition_data
+                nutrition_data,
+                user_id
             )
             
             if not recipe_id:

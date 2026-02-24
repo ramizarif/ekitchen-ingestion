@@ -30,9 +30,9 @@ router = APIRouter()
 # Video platform URL patterns
 VIDEO_PATTERNS = {
     'tiktok': [
-        r'tiktok\.com/@[\w.]+/video/\d+',
-        r'tiktok\.com/t/[\w]+',
-        r'vm\.tiktok\.com/[\w]+',
+        r'tiktok\.com/@[\w.]+/video/\d+',  # Full URL: tiktok.com/@user/video/123
+        r'tiktok\.com/t/[\w]+',             # Short URL: tiktok.com/t/ABC123
+        r'vm\.tiktok\.com/[\w]+',           # Mobile short URL: vm.tiktok.com/ABC123
     ],
     'instagram': [
         r'instagram\.com/reel/[\w-]+',
@@ -68,12 +68,14 @@ class IngestRequest(BaseModel):
     url: HttpUrl = Field(..., description="Recipe URL to ingest (website or video)")
     generate_image: bool = Field(True, description="Whether to generate DALL-E image")
     save_images_dir: Optional[str] = Field(None, description="Directory to save images (optional)")
+    user_id: Optional[str] = Field(None, description="ID of user importing the recipe (for user_created tracking)")
 
     class Config:
         json_schema_extra = {
             "example": {
                 "url": "https://www.allrecipes.com/recipe/10813/best-chocolate-chip-cookies/",
-                "generate_image": True
+                "generate_image": True,
+                "user_id": "d2kceippeops73cbrkq0"
             }
         }
 
@@ -268,7 +270,8 @@ async def _ingest_video(url: str, platform: str, request: IngestRequest, start_t
         result = processor.process_parsed_recipe(
             parsed_recipe=recipe_data,
             save_images_dir=save_images_dir if request.generate_image else None,
-            use_enhanced_ingredients=True
+            use_enhanced_ingredients=True,
+            user_id=request.user_id
         )
         
         processing_time = time.time() - start_time
@@ -362,7 +365,8 @@ async def _ingest_website(url: str, request: IngestRequest, start_time: float):
             recipe_url=url,
             save_images_dir=save_images_dir if request.generate_image else None,
             use_enhanced_ingredients=True,
-            allow_ingredient_skipping=False
+            allow_ingredient_skipping=False,
+            user_id=request.user_id
         )
         
         processing_time = time.time() - start_time
