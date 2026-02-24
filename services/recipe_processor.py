@@ -1341,10 +1341,10 @@ Return ONLY the DALL-E prompt, nothing else."""
         }
         
         # Now process using the internal pipeline (same as process_recipe_autonomous but skip scraping)
-        return self._process_recipe_data(recipe_data, save_images_dir, use_enhanced_ingredients)
+        return self._process_recipe_data(recipe_data, save_images_dir, use_enhanced_ingredients, user_id)
     
     def _process_recipe_data(self, recipe_data: Dict[str, Any], save_images_dir: str = None,
-                              use_enhanced_ingredients: bool = True) -> 'RecipeProcessingResult':
+                              use_enhanced_ingredients: bool = True, user_id: Optional[str] = None) -> 'RecipeProcessingResult':
         """
         Internal method to process recipe_data through the full pipeline.
         Called by both process_recipe_autonomous (after scraping) and process_parsed_recipe.
