@@ -1219,14 +1219,12 @@ Return ONLY the DALL-E prompt, nothing else."""
             "fiber": nutrition_data['fiber'],
             "sugar": nutrition_data['sugar'],
 
-            # User import tracking (if user_id provided)
+            # User import tracking
+            # All three fields set together when user_id is provided
             "user_created": user_id is not None,
+            "created_by_user_id": user_id,  # Will be user ID or None
             "imported_from_url": recipe_data['url'] if user_id else None
         }
-
-        # Add created_by_user_id only if user_id is provided
-        if user_id:
-            create_data["created_by_user_id"] = user_id
         
         try:
             response = requests.post(
