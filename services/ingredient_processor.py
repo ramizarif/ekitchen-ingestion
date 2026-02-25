@@ -95,6 +95,7 @@ class DirectIngredientProcessor:
         self.ekitchen_base_url = self.env_config.get('EKITCHEN_BASE_URL', 'https://ekitchen-production.up.railway.app')
         self.spoonacular_config = self._load_spoonacular_config()
         self.access_token = None
+        self.refresh_token = None
         
         # Initialize OpenAI for AI-powered ingredient standardization (REQUIRED)
         try:
@@ -236,8 +237,11 @@ class DirectIngredientProcessor:
                 
             if result.get('access_token'):
                 self.access_token = result['access_token']
+                self.refresh_token = result.get('refresh_token')  # Store refresh token if provided
                 self._log_and_print("✅ eKitchen authentication successful")
                 self._log_and_print(f"DEBUG: Access token length: {len(self.access_token)}", 'debug')
+                if self.refresh_token:
+                    self._log_and_print(f"DEBUG: Refresh token stored (length: {len(self.refresh_token)})", 'debug')
                 return True
             else:
                 self._log_and_print(f"❌ Authentication failed: {result}", 'error')
@@ -251,7 +255,64 @@ class DirectIngredientProcessor:
         except Exception as e:
             self._log_and_print(f"❌ Error during authentication: {e}", 'error')
             return False
-    
+
+    def refresh_authentication(self) -> bool:
+        """Refresh authentication tokens using the refresh token"""
+        if not self.refresh_token:
+            self._log_and_print("⚠️  No refresh token available, cannot refresh authentication", 'warning')
+            return False
+
+        self._log_and_print("🔄 Refreshing authentication tokens...")
+        self._log_and_print(f"DEBUG: Using base URL: {self.ekitchen_base_url}", 'debug')
+
+        refresh_data = {
+            "refresh_token": self.refresh_token
+        }
+
+        try:
+            # Prepare the request
+            data = json.dumps(refresh_data).encode('utf-8')
+            req = urllib.request.Request(
+                f"{self.ekitchen_base_url}/auth/refresh",
+                data=data,
+                headers={
+                    'Content-Type': 'application/json'
+                }
+            )
+
+            # Make the request
+            with urllib.request.urlopen(req, timeout=30) as response:
+                result = json.loads(response.read().decode('utf-8'))
+
+            # Extract tokens from response (handle both direct and nested data structure)
+            data = result.get('data', result)
+
+            if data.get('access_token'):
+                self.access_token = data['access_token']
+                self.refresh_token = data.get('refresh_token')  # Update refresh token too
+                self._log_and_print("✅ Token refresh successful")
+                self._log_and_print(f"DEBUG: New access token length: {len(self.access_token)}", 'debug')
+                if self.refresh_token:
+                    self._log_and_print(f"DEBUG: New refresh token stored (length: {len(self.refresh_token)})", 'debug')
+                return True
+            else:
+                self._log_and_print(f"❌ Token refresh failed: {result}", 'error')
+                return False
+
+        except urllib.error.HTTPError as e:
+            error_body = e.read().decode('utf-8') if hasattr(e, 'read') else 'No error body'
+            self._log_and_print(f"❌ HTTP Error during token refresh: {e.code} {e.reason}", 'error')
+            self._log_and_print(f"DEBUG: Refresh error body: {error_body}", 'debug')
+            # If refresh fails, tokens might be expired - clear them
+            if e.code == 401:
+                self._log_and_print("⚠️  Refresh token expired, clearing tokens", 'warning')
+                self.access_token = None
+                self.refresh_token = None
+            return False
+        except Exception as e:
+            self._log_and_print(f"❌ Error during token refresh: {e}", 'error')
+            return False
+
     def search_ekitchen_ingredient(self, query: str) -> List[Dict[str, Any]]:
         """Search for ingredients in eKitchen database"""
         if not self.access_token:

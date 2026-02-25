@@ -48,6 +48,7 @@ class DirectRecipeProcessor:
         # API clients
         self.openai_client = None
         self.ekitchen_token = None
+        self.ekitchen_refresh_token = None
         
         # Initialize API connections
         self._initialize_apis()
@@ -159,6 +160,7 @@ class DirectRecipeProcessor:
         if admin_email and admin_password:
             if self.ingredient_processor.authenticate_ekitchen(admin_email, admin_password):
                 self.ekitchen_token = self.ingredient_processor.access_token
+                self.ekitchen_refresh_token = self.ingredient_processor.refresh_token
                 self._log_and_print("✅ eKitchen authentication successful")
             else:
                 self._log_and_print("❌ eKitchen authentication failed", 'error')
@@ -1178,12 +1180,29 @@ Return ONLY the DALL-E prompt, nothing else."""
             self._log_and_print(f"❌ DALL-E image generation failed: {e}", 'error')
             return False
     
+    def _refresh_ekitchen_tokens(self) -> bool:
+        """Refresh eKitchen authentication tokens before API calls"""
+        if not self.ekitchen_refresh_token:
+            self._log_and_print("⚠️  No refresh token available, skipping token refresh", 'warning')
+            return False
+
+        # Call the ingredient processor's refresh method
+        if self.ingredient_processor.refresh_authentication():
+            # Update local tokens from ingredient processor
+            self.ekitchen_token = self.ingredient_processor.access_token
+            self.ekitchen_refresh_token = self.ingredient_processor.refresh_token
+            return True
+        return False
+
     def create_ekitchen_recipe(self, recipe_data: Dict[str, Any], ai_decisions: Dict[str, Any],
                              formatted_ingredients: List[Dict[str, str]],
                              nutrition_data: Dict[str, float], user_id: Optional[str] = None) -> Optional[str]:
         """Create recipe in eKitchen database using direct API call"""
         self._log_and_print(f"🏗️  Creating recipe in eKitchen: {recipe_data['title']}")
-        
+
+        # Refresh tokens before making API call
+        self._refresh_ekitchen_tokens()
+
         if not self.ekitchen_token:
             self._log_and_print("❌ Not authenticated with eKitchen", 'error')
             return None
