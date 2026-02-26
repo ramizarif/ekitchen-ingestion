@@ -895,9 +895,9 @@ Title: {recipe_data['title']}
 Description: {recipe_data.get('description', '')}
 Ingredients: {recipe_data['ingredients']}
 Instructions: {recipe_data['instructions']}
-Prep Time: {recipe_data['prep_time']} minutes
-Cook Time: {recipe_data['cook_time']} minutes
-Total Time: {recipe_data['total_time']} minutes
+Prep Time: {recipe_data['prep_time']} minutes (0 = not specified, estimate needed)
+Cook Time: {recipe_data['cook_time']} minutes (0 = not specified, estimate needed)
+Total Time: {recipe_data['total_time']} minutes (0 = not specified, estimate needed)
 Servings: {recipe_data['yields']}
 
 REQUIRED JSON RESPONSE FORMAT:
@@ -911,7 +911,10 @@ REQUIRED JSON RESPONSE FORMAT:
     "Step 2 instruction rewritten in warm, cozy language..."
   ],
   "dalle_prompt": "Professional food photography prompt for DALL-E...",
-  "category": "breakfast|lunch|dinner|snack|dessert"
+  "category": "breakfast|lunch|dinner|snack|dessert",
+  "estimated_prep_time_minutes": number (only if original prep_time is 0 or missing),
+  "estimated_cook_time_minutes": number (only if original cook_time is 0 or missing),
+  "estimated_total_time_minutes": number (only if original total_time is 0 or missing)
 }}
 
 GUIDELINES:
@@ -921,7 +924,15 @@ GUIDELINES:
 
 3. TAGS: Include 5-8 relevant tags like dietary restrictions (gluten-free, dairy-free, vegan), cooking method (baked, fried, grilled), meal type, cuisine, etc.
 
-4. COZY_DESCRIPTION: Rewrite the recipe description in eKitchen's approachable, confident brand voice:
+4. TIME ESTIMATION (only if times are 0 or missing):
+   - Analyze the ingredients and cooking steps to estimate realistic times
+   - PREP_TIME: Chopping, mixing, measuring (usually 5-30 minutes)
+   - COOK_TIME: Active cooking time (stovetop, oven, etc.)
+   - TOTAL_TIME: Prep + Cook + any resting/cooling time
+   - Be realistic but practical for home cooks
+   - Examples: Simple pasta (10 prep, 15 cook, 25 total), Roasted chicken (15 prep, 60 cook, 75 total)
+
+5. COZY_DESCRIPTION: Rewrite the recipe description in eKitchen's approachable, confident brand voice:
    - Keep it concise but appetizing (2-3 sentences max)
    - Focus on what makes this dish special or comforting
    - Use warm but professional language that builds excitement
@@ -929,7 +940,7 @@ GUIDELINES:
    - Sound inviting and achievable for home cooks
    - Avoid overly flowery language - stay authentic and helpful
 
-5. COZY_INSTRUCTIONS: Rewrite each instruction step in eKitchen's approachable, confident brand voice:
+6. COZY_INSTRUCTIONS: Rewrite each instruction step in eKitchen's approachable, confident brand voice:
    - Keep instructions clear, precise, and actionable
    - Use warm but professional language ("gently fold", "carefully season")
    - Maintain all original technical details and measurements
@@ -937,14 +948,14 @@ GUIDELINES:
    - Preserve the exact cooking method and nuance from the original
    - Sound encouraging but scientifically accurate
 
-6. DALLE_PROMPT: Create a detailed prompt for food photography:
+7. DALLE_PROMPT: Create a detailed prompt for food photography:
    - Focus on homey, cozy kitchen atmosphere (NOT restaurant-style)
    - Mention "warm family kitchen" or "cozy home setting"
    - Include "natural lighting" and "inviting presentation"
    - Describe the dish appearance, garnishes, and mood
    - End with "warm, inviting home cooking photography"
 
-7. CATEGORY: Choose the most appropriate meal category
+8. CATEGORY: Choose the most appropriate meal category
 
 Respond with ONLY the JSON object, no additional text.
 """
@@ -977,8 +988,27 @@ Respond with ONLY the JSON object, no additional text.
             cozy_instruction = instruction.replace("Cook", "Let it cook with love")
             cozy_instruction = cozy_instruction.replace("Mix", "Lovingly mix together")
             cozy_instructions.append(cozy_instruction)
-        
-        return {
+
+        # Estimate times if missing (rule-based fallback)
+        fallback_times = {}
+        if not recipe_data['prep_time'] or recipe_data['prep_time'] == 0:
+            # Base prep on ingredient count
+            fallback_times['estimated_prep_time_minutes'] = min(5 + (ingredient_count * 2), 30)
+        if not recipe_data['cook_time'] or recipe_data['cook_time'] == 0:
+            # Base cook on difficulty
+            if difficulty == "Easy":
+                fallback_times['estimated_cook_time_minutes'] = 15
+            elif difficulty == "Medium":
+                fallback_times['estimated_cook_time_minutes'] = 30
+            else:
+                fallback_times['estimated_cook_time_minutes'] = 60
+        if not recipe_data['total_time'] or recipe_data['total_time'] == 0:
+            # Sum prep + cook if both estimated
+            prep = fallback_times.get('estimated_prep_time_minutes', recipe_data['prep_time'] or 0)
+            cook = fallback_times.get('estimated_cook_time_minutes', recipe_data['cook_time'] or 0)
+            fallback_times['estimated_total_time_minutes'] = prep + cook
+
+        result = {
             "difficulty": difficulty,
             "cuisine": "American",  # Default
             "tags": tags,
@@ -987,6 +1017,10 @@ Respond with ONLY the JSON object, no additional text.
             "dalle_prompt": f"A cozy home-cooked {recipe_data['title']} served in a warm family kitchen with natural lighting, inviting home cooking photography",
             "category": "dinner"  # Default
         }
+
+        # Add estimated times if calculated
+        result.update(fallback_times)
+        return result
     
     def generate_dalle_prompt_from_recipe(self, recipe_data: Dict[str, Any]) -> Optional[str]:
         """Generate DALL-E prompt using new recipe website photography template"""
@@ -1419,7 +1453,21 @@ Return ONLY the DALL-E prompt, nothing else."""
             # Phase 4: Generate AI decisions
             self._log_and_print("\n🤖 PHASE 4: AI RECIPE DECISIONS")
             ai_decisions = self.generate_ai_decisions(recipe_data)
-            
+
+            # Apply AI-estimated times if original times are missing (0 or None)
+            if ai_decisions:
+                if (not recipe_data['prep_time'] or recipe_data['prep_time'] == 0) and ai_decisions.get('estimated_prep_time_minutes'):
+                    recipe_data['prep_time'] = ai_decisions['estimated_prep_time_minutes']
+                    self._log_and_print(f"   Using AI-estimated prep time: {recipe_data['prep_time']} minutes")
+
+                if (not recipe_data['cook_time'] or recipe_data['cook_time'] == 0) and ai_decisions.get('estimated_cook_time_minutes'):
+                    recipe_data['cook_time'] = ai_decisions['estimated_cook_time_minutes']
+                    self._log_and_print(f"   Using AI-estimated cook time: {recipe_data['cook_time']} minutes")
+
+                if (not recipe_data['total_time'] or recipe_data['total_time'] == 0) and ai_decisions.get('estimated_total_time_minutes'):
+                    recipe_data['total_time'] = ai_decisions['estimated_total_time_minutes']
+                    self._log_and_print(f"   Using AI-estimated total time: {recipe_data['total_time']} minutes")
+
             # Phase 5: Generate DALL-E image (if save_images_dir provided)
             image_path = None
             if save_images_dir:
@@ -1567,7 +1615,7 @@ Return ONLY the DALL-E prompt, nothing else."""
             # Phase 4: AI decisions
             self._log_and_print("\n🤖 PHASE 4: AI DECISION GENERATION")
             ai_decisions = self.generate_ai_decisions(recipe_data)
-            
+
             # Check if AI decisions failed
             if ai_decisions is None:
                 self._log_and_print("❌ AI decision generation failed - stopping recipe processing", 'error')
@@ -1576,7 +1624,20 @@ Return ONLY the DALL-E prompt, nothing else."""
                     error_message="AI decision generation failed after retries",
                     processing_time_seconds=time.time() - start_time
                 )
-            
+
+            # Apply AI-estimated times if original times are missing (0 or None)
+            if (not recipe_data['prep_time'] or recipe_data['prep_time'] == 0) and ai_decisions.get('estimated_prep_time_minutes'):
+                recipe_data['prep_time'] = ai_decisions['estimated_prep_time_minutes']
+                self._log_and_print(f"   Using AI-estimated prep time: {recipe_data['prep_time']} minutes")
+
+            if (not recipe_data['cook_time'] or recipe_data['cook_time'] == 0) and ai_decisions.get('estimated_cook_time_minutes'):
+                recipe_data['cook_time'] = ai_decisions['estimated_cook_time_minutes']
+                self._log_and_print(f"   Using AI-estimated cook time: {recipe_data['cook_time']} minutes")
+
+            if (not recipe_data['total_time'] or recipe_data['total_time'] == 0) and ai_decisions.get('estimated_total_time_minutes'):
+                recipe_data['total_time'] = ai_decisions['estimated_total_time_minutes']
+                self._log_and_print(f"   Using AI-estimated total time: {recipe_data['total_time']} minutes")
+
             # Phase 6: Generate recipe image
             image_generated = False
             if save_images_dir:
