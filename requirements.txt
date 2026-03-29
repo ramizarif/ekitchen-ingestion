@@ -18,6 +18,9 @@ openai>=1.0.0
 # Image Processing (for video frame extraction)
 Pillow>=10.0.0
 
+# Browser impersonation for yt-dlp (bypasses TikTok bot detection)
+curl_cffi>=0.7.0
+
 # Ingredient Parsing
 ingredient-parser-nlp>=1.0.0
 

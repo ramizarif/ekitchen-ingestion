@@ -84,10 +84,13 @@ class VideoParser(BaseParser):
         }
     }
 
+    # Path to cookies file for authenticated downloads (bypasses IP blocks)
+    COOKIES_FILE = os.path.join(os.path.dirname(os.path.dirname(__file__)), 'config', 'tiktok_cookies.txt')
+
     def __init__(self, timeout: int = 120, openai_client=None):
         """
         Initialize video parser.
-        
+
         Args:
             timeout: Maximum time for video download/processing
             openai_client: Optional OpenAI client (lazy-loaded if not provided)
@@ -95,6 +98,20 @@ class VideoParser(BaseParser):
         super().__init__(timeout)
         self.parser_name = "video-audio-parser"
         self._openai_client = openai_client
+
+    def _ytdlp_base_args(self) -> list:
+        """Build common yt-dlp args with cookies, impersonation, and proxy for TikTok."""
+        args = ['yt-dlp']
+        # Use cookies file if it exists (needed to bypass TikTok IP blocks)
+        if os.path.exists(self.COOKIES_FILE):
+            args.extend(['--cookies', self.COOKIES_FILE])
+        # Use proxy if configured (needed for datacenter IPs blocked by TikTok)
+        proxy = os.environ.get('YTDLP_PROXY')
+        if proxy:
+            args.extend(['--proxy', proxy])
+        # Impersonate a real browser to avoid bot detection
+        args.extend(['--impersonate', 'chrome'])
+        return args
         
     @property
     def openai_client(self):
@@ -289,22 +306,122 @@ class VideoParser(BaseParser):
             # Create temp directory
             temp_dir = tempfile.mkdtemp(prefix="video_recipe_")
             audio_path = os.path.join(temp_dir, "audio.mp3")
+            tikwm_metadata = None
 
-            # Step 2: Download audio (always - it's cheap and fast)
-            logger.info("Downloading audio with yt-dlp...")
-            download_info = self._download_audio(resolved_url, audio_path)
+            # Step 2: Download audio
+            if platform == 'tiktok':
+                # TikTok: Use TikWM API instead of yt-dlp
+                logger.info("Fetching TikTok metadata via TikWM...")
+                tikwm_metadata = self._fetch_tiktok_metadata_via_tikwm(url)
 
-            if not download_info.get('success'):
-                return ParseResult(
-                    success=False,
-                    error_code="DOWNLOAD_FAILED",
-                    error_message=download_info.get('error', 'Failed to download audio'),
-                    parser_name=self.parser_name
-                )
+                if not tikwm_metadata.get('success'):
+                    return ParseResult(
+                        success=False,
+                        error_code="TIKWM_FAILED",
+                        error_message=tikwm_metadata.get('error', 'TikWM metadata fetch failed'),
+                        parser_name=self.parser_name
+                    )
+
+                # Download audio from TikWM CDN URL
+                audio_url = tikwm_metadata.get('audio_url', '')
+                if not audio_url:
+                    return ParseResult(
+                        success=False,
+                        error_code="TIKWM_NO_AUDIO",
+                        error_message="TikWM did not return an audio URL",
+                        parser_name=self.parser_name
+                    )
+
+                logger.info("Downloading TikTok audio from TikWM CDN...")
+                audio_download = self._download_from_url(audio_url, audio_path)
+
+                if not audio_download.get('success'):
+                    return ParseResult(
+                        success=False,
+                        error_code="DOWNLOAD_FAILED",
+                        error_message=audio_download.get('error', 'Failed to download TikTok audio'),
+                        parser_name=self.parser_name
+                    )
+
+                download_info = {
+                    'success': True,
+                    'title': tikwm_metadata.get('title', ''),
+                    'description': tikwm_metadata.get('description', ''),
+                    'duration': tikwm_metadata.get('duration', 0),
+                    'file_size': os.path.getsize(audio_path) if os.path.exists(audio_path) else 0,
+                }
+            else:
+                # Instagram/YouTube: Use yt-dlp as before
+                logger.info("Downloading audio with yt-dlp...")
+                download_info = self._download_audio(resolved_url, audio_path)
+
+                if not download_info.get('success'):
+                    return ParseResult(
+                        success=False,
+                        error_code="DOWNLOAD_FAILED",
+                        error_message=download_info.get('error', 'Failed to download audio'),
+                        parser_name=self.parser_name
+                    )
 
             # Add metadata to download_info for downstream methods
             download_info['platform'] = platform
             download_info['url'] = url
+
+            # Step 2.5: Description-first analysis
+            # Check if the video description already contains a full recipe
+            video_title = download_info.get('title', '')
+            video_description = download_info.get('description', video_title)
+
+            if video_title or video_description:
+                logger.info("Analyzing video description for recipe content...")
+                desc_analysis = self._analyze_description(video_title, video_description, platform)
+
+                # Early reject: not a recipe video
+                if not desc_analysis.get('is_recipe', True) and desc_analysis.get('confidence', 0) >= 0.8:
+                    processing_time = time.time() - start_time
+                    logger.info(f"❌ Video rejected as non-recipe from description (confidence: {desc_analysis.get('confidence', 0):.2f}): {desc_analysis.get('rejection_reason', 'unknown')}")
+                    return ParseResult(
+                        success=False,
+                        error_code="NOT_A_RECIPE",
+                        error_message=f"This video doesn't appear to be a recipe: {desc_analysis.get('rejection_reason', 'No recipe content detected')}",
+                        parser_name=self.parser_name,
+                        extraction_method="description_rejected"
+                    )
+
+                # Full recipe found in description — skip audio/vision entirely
+                if desc_analysis.get('has_full_recipe', False) and desc_analysis.get('confidence', 0) >= 0.8 and desc_analysis.get('recipe'):
+                    processing_time = time.time() - start_time
+                    logger.info(f"✅ Full recipe found in description! Skipping audio/vision pipeline (saved ~${self._estimate_cost('audio_only'):.3f}+)")
+
+                    recipe_data = desc_analysis['recipe']
+                    # Ensure recipe has a name
+                    if not recipe_data.get('name'):
+                        recipe_data['name'] = video_title.split('\n')[0][:100] if video_title else 'Untitled Recipe'
+
+                    # Convert structured ingredients to strings for downstream processor
+                    if recipe_data.get('ingredients'):
+                        string_ingredients = []
+                        for ing in recipe_data['ingredients']:
+                            if isinstance(ing, dict):
+                                parts = [ing.get('quantity', ''), ing.get('unit', ''), ing.get('name', '')]
+                                string_ingredients.append(' '.join(p for p in parts if p).strip())
+                            else:
+                                string_ingredients.append(str(ing))
+                        recipe_data['ingredients'] = string_ingredients
+
+                    return ParseResult(
+                        success=True,
+                        data=recipe_data,
+                        parser_name=self.parser_name,
+                        confidence_score=desc_analysis.get('confidence', 0.8),
+                        extraction_method="description_only",
+                        frames_used=0,
+                        estimated_cost=0.001,
+                    )
+
+                # Partial recipe or low confidence — continue with audio/vision pipeline
+                if desc_analysis.get('is_recipe', True):
+                    logger.info(f"Description suggests recipe but incomplete (confidence: {desc_analysis.get('confidence', 0):.2f}). Continuing with audio/vision pipeline.")
 
             # Step 3: Try audio extraction
             logger.info("Attempting audio-only extraction...")
@@ -359,7 +476,9 @@ class VideoParser(BaseParser):
                 logger.info(f"~ Medium confidence ({confidence:.2f}) - using hybrid mode (${self._estimate_cost('hybrid', frames_used):.3f})")
 
                 # Download video and extract frames
-                video_path = self._download_video(resolved_url, temp_dir)
+                video_path = self._download_video_for_platform(
+                    platform, resolved_url, temp_dir, tikwm_metadata
+                )
                 frames = self._extract_key_frames(video_path, num_frames=frames_used)
 
                 # TikTok-specific: Detect picture slideshows and force vision-only
@@ -405,7 +524,9 @@ class VideoParser(BaseParser):
                 fallback_reason = audio_result.get('reason') if not audio_result['success'] else "low_confidence"
 
                 # Download video and extract frames
-                video_path = self._download_video(resolved_url, temp_dir)
+                video_path = self._download_video_for_platform(
+                    platform, resolved_url, temp_dir, tikwm_metadata
+                )
                 frames = self._extract_key_frames(video_path, num_frames=frames_used)
 
                 # Vision-only (ignore poor audio)
@@ -505,6 +626,143 @@ class VideoParser(BaseParser):
                 except Exception as e:
                     logger.warning(f"Failed to cleanup temp dir: {e}")
 
+    def _fetch_tiktok_metadata_via_tikwm(self, url: str) -> Dict[str, Any]:
+        """
+        Fetch TikTok video metadata via TikWM API.
+
+        Bypasses yt-dlp entirely for TikTok by using the TikWM service,
+        which provides direct CDN URLs for video and audio downloads.
+
+        Args:
+            url: TikTok video URL
+
+        Returns:
+            Dict with keys:
+                - success: bool
+                - title: str (video title/caption)
+                - description: str (same as title for TikTok)
+                - video_url: str (direct CDN URL for video mp4)
+                - audio_url: str (direct CDN URL for audio/music)
+                - duration: int (video duration in seconds)
+                - author: str (creator username)
+                - video_id: str (TikTok video ID)
+                - error: str (only if success=False)
+        """
+        api_url = f"https://www.tikwm.com/api/?url={url}"
+        start_time = time.time()
+
+        try:
+            response = requests.get(api_url, timeout=5)
+            elapsed_ms = int((time.time() - start_time) * 1000)
+            logger.info(f"TikWM API response: status={response.status_code}, time={elapsed_ms}ms")
+
+            if response.status_code != 200:
+                return {
+                    'success': False,
+                    'error': f"TikWM returned HTTP {response.status_code}"
+                }
+
+            result = response.json()
+
+            # TikWM returns {"code": 0, "data": {...}} on success
+            if result.get('code') != 0:
+                error_msg = result.get('msg', 'Unknown TikWM error')
+                logger.warning(f"TikWM API error: {error_msg}")
+                return {
+                    'success': False,
+                    'error': f"TikWM error: {error_msg}"
+                }
+
+            data = result.get('data', {})
+            if not data:
+                return {
+                    'success': False,
+                    'error': 'TikWM returned empty data'
+                }
+
+            title = data.get('title', '')
+            return {
+                'success': True,
+                'title': title,
+                'description': title,  # TikTok captions serve as both
+                'video_url': data.get('play', ''),
+                'audio_url': data.get('music', ''),
+                'duration': data.get('duration', 0),
+                'author': data.get('author', {}).get('unique_id', ''),
+                'video_id': str(data.get('id', '')),
+            }
+
+        except requests.Timeout:
+            elapsed_ms = int((time.time() - start_time) * 1000)
+            logger.warning(f"TikWM API timed out after {elapsed_ms}ms")
+            return {
+                'success': False,
+                'error': 'TikWM API request timed out'
+            }
+        except requests.RequestException as e:
+            logger.warning(f"TikWM API request failed: {e}")
+            return {
+                'success': False,
+                'error': f"TikWM request failed: {str(e)}"
+            }
+        except (ValueError, KeyError) as e:
+            logger.warning(f"TikWM API response parse error: {e}")
+            return {
+                'success': False,
+                'error': f"TikWM response parse error: {str(e)}"
+            }
+
+    def _download_from_url(self, url: str, output_path: str) -> Dict[str, Any]:
+        """
+        Download a file from a direct URL (e.g., TikWM CDN link).
+
+        Simple streaming download used for TikWM video/audio URLs.
+        Not used for yt-dlp downloads.
+
+        Args:
+            url: Direct download URL
+            output_path: Local file path to write to
+
+        Returns:
+            Dict with keys:
+                - success: bool
+                - error: str (only if success=False)
+        """
+        try:
+            response = requests.get(url, stream=True, timeout=60)
+
+            if response.status_code != 200:
+                return {
+                    'success': False,
+                    'error': f"Download returned HTTP {response.status_code}"
+                }
+
+            with open(output_path, 'wb') as f:
+                for chunk in response.iter_content(chunk_size=8192):
+                    if chunk:
+                        f.write(chunk)
+
+            file_size = os.path.getsize(output_path)
+            logger.info(f"Downloaded {file_size / 1024:.1f} KB to {output_path}")
+
+            return {'success': True}
+
+        except requests.Timeout:
+            return {
+                'success': False,
+                'error': 'Download timed out after 60 seconds'
+            }
+        except requests.RequestException as e:
+            return {
+                'success': False,
+                'error': f"Download failed: {str(e)}"
+            }
+        except IOError as e:
+            return {
+                'success': False,
+                'error': f"Failed to write file: {str(e)}"
+            }
+
     def _download_audio(self, url: str, output_path: str) -> Dict[str, Any]:
         """
         Download audio directly using yt-dlp's audio-only mode.
@@ -516,24 +774,23 @@ class VideoParser(BaseParser):
         """
         try:
             # First, get video info (title, description) - this is a lightweight metadata fetch
-            info_cmd = [
-                'yt-dlp',
+            info_cmd = self._ytdlp_base_args() + [
                 '--dump-json',
                 '--no-warnings',
                 '--no-download',
                 url
             ]
-            
+
             info_result = subprocess.run(
                 info_cmd,
                 capture_output=True,
                 text=True,
                 timeout=60
             )
-            
+
             title = ""
             description = ""
-            
+
             if info_result.returncode == 0:
                 try:
                     info = json.loads(info_result.stdout)
@@ -541,21 +798,20 @@ class VideoParser(BaseParser):
                     description = info.get('description', '')
                 except json.JSONDecodeError:
                     logger.warning("Could not parse video info JSON")
-            
+
             # Download audio only (much faster than full video)
             # Remove .mp3 extension as yt-dlp will add it
             output_template = output_path.replace('.mp3', '')
-            
-            download_cmd = [
-                'yt-dlp',
-                '-f', 'bestaudio/best',  # Best audio stream
-                '--extract-audio',  # Extract audio
-                '--audio-format', 'mp3',  # Convert to mp3
-                '--audio-quality', '64K',  # 64kbps is enough for speech
-                '-o', output_template + '.%(ext)s',  # Let yt-dlp handle extension
+
+            download_cmd = self._ytdlp_base_args() + [
+                '-f', 'bestaudio/best',
+                '--extract-audio',
+                '--audio-format', 'mp3',
+                '--audio-quality', '64K',
+                '-o', output_template + '.%(ext)s',
                 '--no-warnings',
                 '--no-playlist',
-                '--postprocessor-args', 'ffmpeg:-ar 16000 -ac 1',  # 16kHz mono for Whisper
+                '--postprocessor-args', 'ffmpeg:-ar 16000 -ac 1',
                 url
             ]
             
@@ -609,24 +865,23 @@ class VideoParser(BaseParser):
         """
         try:
             # Get video info
-            info_cmd = [
-                'yt-dlp',
+            info_cmd = self._ytdlp_base_args() + [
                 '--dump-json',
                 '--no-warnings',
                 '--no-download',
                 url
             ]
-            
+
             info_result = subprocess.run(
                 info_cmd,
                 capture_output=True,
                 text=True,
                 timeout=60
             )
-            
+
             title = ""
             description = ""
-            
+
             if info_result.returncode == 0:
                 try:
                     info = json.loads(info_result.stdout)
@@ -634,10 +889,9 @@ class VideoParser(BaseParser):
                     description = info.get('description', '')
                 except json.JSONDecodeError:
                     logger.warning("Could not parse video info JSON")
-            
+
             # Download full video
-            download_cmd = [
-                'yt-dlp',
+            download_cmd = self._ytdlp_base_args() + [
                 '-f', 'best[ext=mp4]/best',
                 '-o', video_path,
                 '--no-warnings',
@@ -836,6 +1090,165 @@ Return ONLY valid JSON, no other text."""
         except Exception as e:
             logger.error(f"GPT-4 recipe extraction failed: {e}")
             return None
+
+    def _analyze_description(
+        self,
+        title: str,
+        description: str,
+        platform: str
+    ) -> Dict[str, Any]:
+        """
+        Analyze video title and description to determine if a full recipe is present.
+
+        Uses GPT-4o-mini (cheaper text model) to classify the description and
+        optionally extract a complete recipe if one is found in the text.
+
+        This is a pre-processing step that can short-circuit expensive video
+        download/transcription when the description already contains a full recipe,
+        or quickly reject non-recipe content.
+
+        Args:
+            title: Video title
+            description: Video description text
+            platform: Platform name ('tiktok', 'instagram', 'youtube')
+
+        Returns:
+            Dict with keys:
+                - is_recipe (bool): Whether this appears to be recipe content
+                - has_full_recipe (bool): Whether description contains a COMPLETE recipe
+                - confidence (float): 0.0-1.0 confidence score
+                - recipe (dict or None): Extracted recipe if has_full_recipe is True
+                - rejection_reason (str or None): Reason if is_recipe is False
+        """
+        error_result = {
+            "is_recipe": False,
+            "has_full_recipe": False,
+            "confidence": 0.0,
+            "recipe": None,
+            "rejection_reason": "analysis_failed"
+        }
+
+        try:
+            # Truncate description to avoid token waste
+            truncated_description = description[:4000] if description else ""
+
+            prompt = f"""You are a recipe content classifier. Analyze the following video title and description to determine if this is recipe content and whether a COMPLETE recipe is present in the text.
+
+VIDEO INFORMATION:
+- Platform: {platform}
+- Title: {title or "(no title)"}
+- Description: {truncated_description or "(no description)"}
+
+CLASSIFICATION TASK:
+1. Determine if this video appears to be about a recipe or cooking.
+2. Determine if the description contains a COMPLETE recipe with BOTH:
+   - Specific ingredient quantities (e.g., "2 cups flour", "1 tbsp oil")
+   - Cooking steps/instructions (e.g., "Mix together", "Bake at 350F for 20 min")
+
+EDGE CASES TO HANDLE:
+- Hashtag-only descriptions (e.g., "#recipe #cooking #foodtok") → is_recipe may be true, but has_full_recipe is false
+- "Link in bio" or "Full recipe on my website" → is_recipe true, has_full_recipe false
+- Non-English descriptions → Analyze in the original language, still extract if possible
+- Descriptions with only ingredient lists but no steps → has_full_recipe false
+- Descriptions with only steps but no ingredients → has_full_recipe false
+- Non-food content (dance, comedy, news, etc.) → is_recipe false
+
+RESPONSE FORMAT (JSON):
+{{
+    "is_recipe": true/false,
+    "has_full_recipe": true/false,
+    "confidence": 0.0 to 1.0,
+    "recipe": {{
+        "name": "Recipe name",
+        "description": "Brief description of the dish",
+        "ingredients": [
+            {{"quantity": "2", "unit": "cups", "name": "flour"}},
+            {{"quantity": "1", "unit": "tbsp", "name": "olive oil"}}
+        ],
+        "steps": [
+            "Step 1: Description",
+            "Step 2: Description"
+        ],
+        "servings": null or number,
+        "prep_time_minutes": null or number,
+        "cook_time_minutes": null or number,
+        "total_time_minutes": null or number,
+        "cuisine": null or string,
+        "difficulty": null or "easy"/"medium"/"hard",
+        "tips": []
+    }},
+    "rejection_reason": null or "string explaining why this is not a recipe"
+}}
+
+RULES:
+- Only include "recipe" when has_full_recipe is true. Set to null otherwise.
+- confidence should reflect how certain you are about the is_recipe classification.
+- For has_full_recipe, be strict: the description must have BOTH specific quantities AND steps.
+- If the description is mostly hashtags or very short, confidence should be lower.
+- Return ONLY valid JSON."""
+
+            response = self.openai_client.chat.completions.create(
+                model="gpt-4o-mini",
+                messages=[
+                    {
+                        "role": "system",
+                        "content": "You classify video descriptions to detect recipe content. Return only valid JSON."
+                    },
+                    {
+                        "role": "user",
+                        "content": prompt
+                    }
+                ],
+                temperature=0.2,
+                max_tokens=2000,
+                response_format={"type": "json_object"}
+            )
+
+            content = response.choices[0].message.content.strip()
+
+            # Clean up markdown code blocks if present
+            if content.startswith('```'):
+                content = re.sub(r'^```json?\s*', '', content)
+                content = re.sub(r'\s*```$', '', content)
+
+            result = json.loads(content)
+
+            # Validate required fields with defaults
+            result.setdefault("is_recipe", False)
+            result.setdefault("has_full_recipe", False)
+            result.setdefault("confidence", 0.0)
+            result.setdefault("recipe", None)
+            result.setdefault("rejection_reason", None)
+
+            # Ensure confidence is a float in range
+            try:
+                result["confidence"] = max(0.0, min(1.0, float(result["confidence"])))
+            except (TypeError, ValueError):
+                result["confidence"] = 0.0
+
+            # If not a recipe, clear recipe data
+            if not result["is_recipe"]:
+                result["recipe"] = None
+                result["has_full_recipe"] = False
+
+            # If no full recipe, clear recipe data
+            if not result["has_full_recipe"]:
+                result["recipe"] = None
+
+            logger.info(
+                f"Description analysis: is_recipe={result['is_recipe']}, "
+                f"has_full_recipe={result['has_full_recipe']}, "
+                f"confidence={result['confidence']:.2f}"
+            )
+
+            return result
+
+        except json.JSONDecodeError as e:
+            logger.error(f"Failed to parse description analysis response as JSON: {e}")
+            return error_result
+        except Exception as e:
+            logger.error(f"Description analysis failed: {e}")
+            return error_result
 
     def _generate_warnings(self, recipe_data: Dict[str, Any]) -> List[str]:
         """Generate warnings for missing or incomplete data."""
@@ -1655,6 +2068,47 @@ Return ONLY valid JSON, no other text or explanation."""
             # Longer video or unknown duration - more frames
             return 5
 
+    def _download_video_for_platform(
+        self,
+        platform: str,
+        url: str,
+        temp_dir: str,
+        tikwm_metadata: Optional[Dict[str, Any]] = None
+    ) -> str:
+        """
+        Download video file using the appropriate method for each platform.
+
+        TikTok uses TikWM CDN URLs; Instagram/YouTube use yt-dlp.
+
+        Args:
+            platform: Detected platform name
+            url: Original video URL
+            temp_dir: Temporary directory for download
+            tikwm_metadata: TikWM metadata dict (required for TikTok)
+
+        Returns:
+            Path to downloaded video file
+
+        Raises:
+            RuntimeError: If download fails
+        """
+        if platform == 'tiktok' and tikwm_metadata:
+            video_url = tikwm_metadata.get('video_url', '')
+            if not video_url:
+                raise RuntimeError("TikWM did not return a video URL")
+
+            video_path = os.path.join(temp_dir, "video.mp4")
+            logger.info("Downloading TikTok video from TikWM CDN...")
+            result = self._download_from_url(video_url, video_path)
+
+            if not result.get('success'):
+                raise RuntimeError(f"TikTok video download failed: {result.get('error', 'Unknown error')}")
+
+            return video_path
+
+        # Instagram/YouTube: use yt-dlp
+        return self._download_video(url, temp_dir)
+
     def _download_video(self, url: str, temp_dir: str) -> str:
         """
         Download full video file for frame extraction.
@@ -1672,8 +2126,7 @@ Return ONLY valid JSON, no other text or explanation."""
         video_path = os.path.join(temp_dir, "video.mp4")
 
         try:
-            cmd = [
-                'yt-dlp',
+            cmd = self._ytdlp_base_args() + [
                 '-f', 'best',  # Best quality video
                 '-o', video_path,
                 '--no-warnings',

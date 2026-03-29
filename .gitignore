@@ -58,3 +58,4 @@ tmp/
 # Data maintenance outputs
 tools/data-maintenance/*.json
 tools/data-maintenance/*.csv
+config/tiktok_cookies.txt
