@@ -1435,6 +1435,136 @@ Return ONLY the DALL-E prompt, nothing else."""
             self._log_and_print(f"❌ Error uploading image: {e}", 'error')
             return False
     
+    def _resolve_ambiguous_matches_for_recipe(self, recipe_id: str, recipe_name: str) -> None:
+        """
+        Auto-resolve ambiguous step matches for a specific recipe using GPT-4o-mini.
+
+        This is best-effort: failures are logged but do not block the ingestion pipeline.
+        """
+        if not self.openai_client:
+            self._log_and_print("⚠️  OpenAI client not available, skipping ambiguous match resolution", 'warning')
+            return
+
+        if not self.ekitchen_token:
+            self._log_and_print("⚠️  Not authenticated with eKitchen, skipping ambiguous match resolution", 'warning')
+            return
+
+        base_url = self.ingredient_processor.ekitchen_base_url
+
+        # Fetch ambiguous matches for this specific recipe using the filter query param
+        resp = requests.get(
+            f"{base_url}/global-recipes/ambiguous-step-matches",
+            headers={"Authorization": f"Bearer {self.ekitchen_token}"},
+            params={"filter": f"recipe_id = '{recipe_id}'", "limit": "100"},
+            timeout=30,
+        )
+        resp.raise_for_status()
+        matches = resp.json()
+
+        # Filter to only unresolved matches (in case the API returns all)
+        unresolved = [m for m in matches if not m.get("resolved_match")]
+
+        if not unresolved:
+            self._log_and_print("✅ No ambiguous step matches to resolve")
+            return
+
+        self._log_and_print(f"   Found {len(unresolved)} ambiguous match(es) to resolve")
+
+        # Fetch the full recipe for context (ingredients list, etc.)
+        recipe_resp = requests.get(
+            f"{base_url}/global-recipes/{recipe_id}",
+            headers={"Authorization": f"Bearer {self.ekitchen_token}"},
+            timeout=30,
+        )
+        recipe_resp.raise_for_status()
+        recipe = recipe_resp.json()
+
+        # Extract ingredient names for the prompt
+        ingredients = recipe.get("ingredients", [])
+        ingredient_names = [ing.get("ingredient_name", ing.get("name", "")) for ing in ingredients]
+        ingredients_list = ", ".join(ingredient_names) if ingredient_names else "N/A"
+
+        resolved_count = 0
+
+        for match in unresolved:
+            match_id = match["id"]
+            step_position = match.get("step_position", "?")
+            template = match.get("template", "")
+            ambiguous_word = match.get("ambiguous_word", "")
+            possible_matches = match.get("possible_matches", [])
+
+            if not possible_matches:
+                self._log_and_print(f"   SKIP: No possible matches for \"{ambiguous_word}\" in step {step_position}", 'warning')
+                continue
+
+            try:
+                # Build prompt (same logic as scripts/resolve_ambiguous_matches.py)
+                prompt = (
+                    f"A recipe step contains an ambiguous ingredient reference that could match multiple ingredients.\n\n"
+                    f"Recipe: {recipe_name}\n"
+                    f"All ingredients in this recipe: {ingredients_list}\n"
+                    f"Step {step_position}: \"{template}\"\n"
+                    f"Ambiguous word in the step: \"{ambiguous_word}\"\n"
+                    f"Possible ingredient matches: {', '.join(possible_matches)}\n\n"
+                    f"Based on the cooking context of this step, which specific ingredient does "
+                    f"\"{ambiguous_word}\" most likely refer to?\n\n"
+                    f"Respond with ONLY the exact ingredient name from the possible matches list. Nothing else."
+                )
+
+                response = self.openai_client.chat.completions.create(
+                    model="gpt-4o-mini",
+                    messages=[{"role": "user", "content": prompt}],
+                    max_tokens=100,
+                    temperature=0.0,
+                )
+
+                answer = response.choices[0].message.content.strip()
+
+                # Validate the answer is one of the possible matches
+                resolved_match = None
+                if answer in possible_matches:
+                    resolved_match = answer
+                else:
+                    # Try case-insensitive match
+                    for pm in possible_matches:
+                        if answer.lower() == pm.lower():
+                            resolved_match = pm
+                            break
+
+                    # Try partial match as fallback
+                    if not resolved_match:
+                        for pm in possible_matches:
+                            if answer.lower() in pm.lower() or pm.lower() in answer.lower():
+                                resolved_match = pm
+                                break
+
+                if not resolved_match:
+                    self._log_and_print(
+                        f"   SKIP: GPT returned \"{answer}\" which doesn't match any of {possible_matches} "
+                        f"for \"{ambiguous_word}\" in step {step_position}",
+                        'warning'
+                    )
+                    continue
+
+                # Resolve via PATCH
+                patch_resp = requests.patch(
+                    f"{base_url}/global-recipes/ambiguous-step-matches/{match_id}",
+                    headers={
+                        "Authorization": f"Bearer {self.ekitchen_token}",
+                        "Content-Type": "application/json",
+                    },
+                    json={"resolved_match": resolved_match},
+                    timeout=30,
+                )
+                patch_resp.raise_for_status()
+                resolved_count += 1
+                self._log_and_print(f"   Resolved: \"{ambiguous_word}\" -> \"{resolved_match}\" in step {step_position}")
+
+            except Exception as e:
+                self._log_and_print(f"   ERROR resolving match {match_id}: {e}", 'warning')
+
+        self._log_and_print(f"✅ Auto-resolved {resolved_count}/{len(unresolved)} ambiguous matches for recipe '{recipe_name}'")
+
     def process_parsed_recipe(self, parsed_recipe: Dict[str, Any], save_images_dir: str = None,
                                use_enhanced_ingredients: bool = True, user_id: Optional[str] = None) -> 'RecipeProcessingResult':
         """
@@ -1584,7 +1714,14 @@ Return ONLY the DALL-E prompt, nothing else."""
                     self._log_and_print("✅ Image uploaded successfully")
                 else:
                     self._log_and_print("⚠️  Image upload failed")
-            
+
+            # Phase 8: Auto-resolve ambiguous step matches (best-effort)
+            self._log_and_print("\n🔍 PHASE 8: AUTO-RESOLVE AMBIGUOUS STEP MATCHES")
+            try:
+                self._resolve_ambiguous_matches_for_recipe(recipe_id, recipe_data['title'])
+            except Exception as e:
+                self._log_and_print(f"⚠️  Ambiguous match resolution failed (non-blocking): {e}", 'warning')
+
             # Success!
             processing_time = time.time() - start_time
             self._log_and_print("\n" + "="*80)
