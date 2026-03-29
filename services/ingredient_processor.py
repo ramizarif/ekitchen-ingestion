@@ -772,6 +772,206 @@ class DirectIngredientProcessor:
             self._log_and_print(f"   ❌ Error creating {ingredient_data.name}: {e}", 'error')
             return None
     
+    # ─── Similarity / Duplicate Detection ──────────────────────────────
+
+    # Common suffixes that can be stripped to find a base ingredient name
+    INGREDIENT_SUFFIXES = [
+        "powder", "ground", "fresh", "dried", "whole", "crushed",
+        "minced", "chopped", "sliced", "flakes", "extract", "paste",
+        "seeds", "seed", "leaves", "leaf", "pieces", "chunks",
+        "granulated", "shredded", "grated", "frozen", "canned",
+        "organic", "raw", "cooked", "roasted", "smoked", "pickled",
+    ]
+
+    def _find_similar_ingredient(self, standardized_name: str) -> Optional[Dict]:
+        """
+        Search the backend for an existing ingredient that might be a duplicate
+        of *standardized_name*.
+
+        Returns a dict with keys  id, name, match_type  if a likely match is
+        found, otherwise None.
+        """
+        if not self.access_token:
+            self._log_and_print("⚠️  Cannot search for similar ingredients - not authenticated", 'warning')
+            return None
+
+        # 1. Exact search – the backend already does ILIKE '%query%'
+        exact_results = self.search_ekitchen_ingredient(standardized_name)
+        if exact_results:
+            for ingredient in exact_results:
+                existing_name = ingredient.get('name', '').lower().strip()
+                query_name = standardized_name.lower().strip()
+                # Exact match (case-insensitive)
+                if existing_name == query_name:
+                    self._log_and_print(
+                        f"   🔎 Exact match found: '{ingredient.get('name')}' (ID: {ingredient.get('id')})"
+                    )
+                    return {
+                        "id": ingredient.get('id'),
+                        "name": ingredient.get('name'),
+                        "match_type": "exact",
+                    }
+
+            # Check if any result is a close variant (one is substring of other)
+            for ingredient in exact_results:
+                existing_name = ingredient.get('name', '').lower().strip()
+                query_name = standardized_name.lower().strip()
+                if (existing_name in query_name or query_name in existing_name) and existing_name != query_name:
+                    self._log_and_print(
+                        f"   🔎 Substring match found: '{ingredient.get('name')}' for query '{standardized_name}'"
+                    )
+                    return {
+                        "id": ingredient.get('id'),
+                        "name": ingredient.get('name'),
+                        "match_type": "substring",
+                    }
+
+        # 2. Strip common suffixes and search for the base name
+        base_name = self._strip_ingredient_suffixes(standardized_name)
+        if base_name and base_name.lower() != standardized_name.lower():
+            self._log_and_print(
+                f"   🔎 Trying base name search: '{base_name}' (stripped from '{standardized_name}')", 'debug'
+            )
+            base_results = self.search_ekitchen_ingredient(base_name)
+            if base_results:
+                for ingredient in base_results:
+                    existing_name = ingredient.get('name', '').lower().strip()
+                    base_lower = base_name.lower().strip()
+                    if existing_name == base_lower or base_lower in existing_name or existing_name in base_lower:
+                        self._log_and_print(
+                            f"   🔎 Base-name match found: '{ingredient.get('name')}' for base '{base_name}'"
+                        )
+                        return {
+                            "id": ingredient.get('id'),
+                            "name": ingredient.get('name'),
+                            "match_type": "base_name",
+                        }
+
+        # 3. Also try searching the full name against existing names that share
+        #    the base (e.g., "paprika" searching might surface "paprika powder")
+        #    — this is already covered by the ILIKE in the API, but we double-check
+        #    the reverse: strip suffixes from *existing* names returned by exact search
+        if exact_results:
+            for ingredient in exact_results:
+                existing_base = self._strip_ingredient_suffixes(ingredient.get('name', ''))
+                if existing_base and existing_base.lower() == standardized_name.lower():
+                    self._log_and_print(
+                        f"   🔎 Reverse base-name match: '{ingredient.get('name')}' base='{existing_base}'"
+                    )
+                    return {
+                        "id": ingredient.get('id'),
+                        "name": ingredient.get('name'),
+                        "match_type": "reverse_base",
+                    }
+
+        self._log_and_print(f"   🔎 No similar ingredient found for '{standardized_name}'", 'debug')
+        return None
+
+    def _strip_ingredient_suffixes(self, name: str) -> str:
+        """Remove common suffixes/modifiers from an ingredient name to get the base form."""
+        words = name.lower().strip().split()
+        # Remove trailing suffix words
+        stripped = [w for w in words if w not in self.INGREDIENT_SUFFIXES]
+        result = " ".join(stripped).strip()
+        # If we stripped everything, return original
+        return result if result else name.strip()
+
+    def _resolve_canonical_name(self, new_name: str, existing_name: str) -> Dict:
+        """
+        Use GPT-4o-mini to decide whether *new_name* and *existing_name* refer to
+        the same ingredient, and if so, which name is canonical.
+
+        Returns a dict with keys: same_ingredient (bool), canonical_name (str), reason (str).
+        """
+        if not self.openai_client:
+            self._log_and_print("⚠️  OpenAI client not available – assuming different ingredients", 'warning')
+            return {"same_ingredient": False, "canonical_name": new_name, "reason": "OpenAI unavailable"}
+
+        prompt = f"""Two ingredient names were found that might be the same ingredient:
+- Existing in database: "{existing_name}"
+- New from recipe: "{new_name}"
+
+Are these the same ingredient? If yes, which name is the canonical (most standard) name?
+
+Respond in JSON only — no markdown fences:
+{{"same_ingredient": true/false, "canonical_name": "the standard name", "reason": "brief explanation"}}
+
+Examples:
+- "paprika powder" vs "paprika" → same, canonical: "paprika"
+- "all purpose flour" vs "flour" → same, canonical: "flour"
+- "almond" vs "almond milk" → different
+- "basil" vs "thai basil" → different
+- "anchovy filet" vs "anchovy fillet" → same, canonical: "anchovy fillet"
+- "green onion" vs "scallion" → same, canonical: "green onion"
+- "cilantro" vs "coriander" → different (leaves vs seeds in US English)
+"""
+        try:
+            response = self.openai_client.chat.completions.create(
+                model="gpt-4o-mini",
+                messages=[{"role": "user", "content": prompt}],
+                temperature=0.0,
+                max_tokens=200,
+            )
+            raw = response.choices[0].message.content.strip()
+            # Strip markdown code fences if present
+            if raw.startswith("```"):
+                raw = re.sub(r"^```(?:json)?\s*", "", raw)
+                raw = re.sub(r"\s*```$", "", raw)
+
+            result = json.loads(raw)
+            self._log_and_print(
+                f"   🤖 Canonical resolution: same={result.get('same_ingredient')}, "
+                f"canonical='{result.get('canonical_name')}' — {result.get('reason')}"
+            )
+            return result
+        except Exception as e:
+            self._log_and_print(f"   ⚠️  Canonical name resolution failed: {e}", 'warning')
+            return {"same_ingredient": False, "canonical_name": new_name, "reason": f"Error: {e}"}
+
+    def rename_ingredient(self, ingredient_id: str, new_name: str) -> bool:
+        """
+        Rename an existing global ingredient via the backend API.
+
+        Calls PATCH /global-ingredients/{id}/rename-ingredient with {"new_name": new_name}.
+        The backend cascades the rename to all recipe step references.
+        """
+        if not self.access_token:
+            self._log_and_print("❌ Not authenticated with eKitchen – cannot rename ingredient", 'error')
+            return False
+
+        url = f"{self.ekitchen_base_url}/global-ingredients/{ingredient_id}/rename-ingredient"
+        body = json.dumps({"new_name": new_name}).encode('utf-8')
+
+        self._log_and_print(f"   ✏️  Renaming ingredient {ingredient_id} → '{new_name}'")
+
+        try:
+            req = urllib.request.Request(
+                url,
+                data=body,
+                method='PATCH',
+                headers={
+                    'Authorization': f'Bearer {self.access_token}',
+                    'Content-Type': 'application/json',
+                },
+            )
+            with urllib.request.urlopen(req, timeout=30) as response:
+                result = json.loads(response.read().decode('utf-8'))
+                self._log_and_print(f"   ✅ Rename successful: {result.get('message', 'OK')}")
+                return True
+
+        except urllib.error.HTTPError as e:
+            error_body = e.read().decode('utf-8') if hasattr(e, 'read') else 'No error body'
+            self._log_and_print(
+                f"   ❌ HTTP Error renaming ingredient {ingredient_id}: {e.code} {e.reason} — {error_body}",
+                'error',
+            )
+            return False
+        except Exception as e:
+            self._log_and_print(f"   ❌ Error renaming ingredient {ingredient_id}: {e}", 'error')
+            return False
+
+    # ─── End Similarity / Duplicate Detection ────────────────────────────
+
     def standardize_ingredient_with_ai(self, ingredient_text: str) -> Dict[str, str]:
         """Use AI to standardize ingredient name and extract reference_as field"""
         try:

@@ -22,6 +22,32 @@ from openai import OpenAI
 # Import ingredient processor from same package
 from services.ingredient_processor import DirectIngredientProcessor, IngredientData, load_env_file
 
+# Non-ingredient blocklist: equipment, tools, prepared foods, and non-food items
+# that GPT-4 sometimes includes when parsing recipes
+NON_INGREDIENT_BLOCKLIST = {
+    # Equipment/tools
+    'fork', 'knife', 'spoon', 'spatula', 'whisk', 'tongs',
+    'baking sheet', 'sheet pan', 'frying pan', 'saucepan', 'skillet',
+    'pot', 'dutch oven', 'wok', 'grill', 'oven',
+    'foil', 'aluminum foil', 'parchment paper', 'plastic wrap', 'cling wrap',
+    'bamboo skewer', 'skewer', 'toothpick',
+    'potato ricer', 'food processor', 'blender', 'mixer',
+    'cutting board', 'bowl', 'plate', 'serving platter',
+    'baking pan', 'cake pan', 'muffin tin', 'loaf pan',
+    'colander', 'strainer', 'sieve', 'grater', 'peeler',
+    'rolling pin', 'pastry brush', 'ladle', 'slotted spoon',
+    'measuring cup', 'measuring spoon', 'thermometer',
+    'parchment', 'wax paper', 'saran wrap',
+    # Prepared foods (not base ingredients)
+    'french fry', 'french fries', 'potato chip', 'potato chips',
+    'tortilla chip', 'tortilla chips',
+    'bean and cheese burrito', 'pizza dough',
+    # Non-food items
+    'ice cube', 'ice cubes', 'paper towel', 'paper towels',
+    'kitchen twine', 'cheesecloth', 'butcher twine',
+    'cooking spray', 'nonstick spray',
+}
+
 @dataclass
 class RecipeProcessingResult:
     """Result of recipe processing operation"""
@@ -530,14 +556,66 @@ Examples:
             # Use the SAME search logic as the working ingredient_processor_direct.py
             existing_ingredients = self.ingredient_processor.search_ekitchen_ingredient(standardized_name)
             
-            # If found, use the existing ingredient
+            # If found with exact name match, use the existing ingredient
             if existing_ingredients:
-                ingredient = existing_ingredients[0]
-                ingredient_id = ingredient.get('id')
-                self.global_ingredients_cache[standardized_name] = ingredient_id
-                self._log_and_print(f"   ♻️ Found existing global ingredient '{standardized_name}' → {ingredient_id}")
-                return ingredient_id
-            
+                # Check for true exact match first (case-insensitive)
+                exact_match = None
+                for ing in existing_ingredients:
+                    if ing.get('name', '').lower().strip() == standardized_name.lower().strip():
+                        exact_match = ing
+                        break
+
+                if exact_match:
+                    ingredient_id = exact_match.get('id')
+                    self.global_ingredients_cache[standardized_name] = ingredient_id
+                    self._log_and_print(f"   ♻️ Found existing global ingredient '{standardized_name}' → {ingredient_id}")
+                    return ingredient_id
+
+            # ── Similarity / duplicate detection ──────────────────────
+            # Before creating a new ingredient, check if a similar one exists
+            similar = self.ingredient_processor._find_similar_ingredient(standardized_name)
+            if similar:
+                resolution = self.ingredient_processor._resolve_canonical_name(
+                    standardized_name, similar['name']
+                )
+                if resolution.get('same_ingredient'):
+                    canonical = resolution.get('canonical_name', standardized_name)
+                    existing_id = similar['id']
+                    existing_name = similar['name']
+
+                    if canonical.lower().strip() == existing_name.lower().strip():
+                        # Existing name IS canonical → just reuse it
+                        self.global_ingredients_cache[standardized_name] = existing_id
+                        self._log_and_print(
+                            f"   ♻️ Dedup: '{standardized_name}' is same as existing "
+                            f"'{existing_name}' (canonical) → {existing_id}"
+                        )
+                        return existing_id
+                    else:
+                        # New name is canonical → rename existing ingredient, then reuse
+                        self._log_and_print(
+                            f"   ✏️  Dedup: renaming '{existing_name}' → '{canonical}' (canonical)"
+                        )
+                        renamed = self.ingredient_processor.rename_ingredient(existing_id, canonical)
+                        if renamed:
+                            self.global_ingredients_cache[standardized_name] = existing_id
+                            # Also cache under canonical name
+                            self.global_ingredients_cache[canonical] = existing_id
+                            return existing_id
+                        else:
+                            # Rename failed – still reuse existing to avoid duplicate
+                            self._log_and_print(
+                                f"   ⚠️  Rename failed, reusing existing '{existing_name}' → {existing_id}",
+                                'warning',
+                            )
+                            self.global_ingredients_cache[standardized_name] = existing_id
+                            return existing_id
+                else:
+                    self._log_and_print(
+                        f"   🔀 AI says '{standardized_name}' ≠ '{similar['name']}' — creating new ingredient"
+                    )
+            # ── End similarity detection ──────────────────────────────
+
             # If not found, create with COMPREHENSIVE 2-step enrichment process
             self._log_and_print(f"   🌶️ Starting 2-step enrichment for '{standardized_name}'...")
             
@@ -793,7 +871,12 @@ Category:"""
             standardized_name = ai_result["standardized_name"]
             reference_as = ai_result["reference_as"]
             self._log_and_print(f"   🤖 AI processed: '{ingredient_text}' → standardized: '{standardized_name}', reference: '{reference_as}'")
-            
+
+            # Check against non-ingredient blocklist
+            if standardized_name.lower() in NON_INGREDIENT_BLOCKLIST:
+                self._log_and_print(f"   ⛔ Skipping non-ingredient: {standardized_name}")
+                continue
+
             # Get or create global ingredient
             global_ingredient_id = self.get_or_create_global_ingredient_enhanced(standardized_name)
             

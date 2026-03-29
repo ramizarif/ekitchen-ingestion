@@ -1032,6 +1032,10 @@ IMPORTANT:
 - Capture cooking techniques and temperatures mentioned
 - Keep the recipe name concise but descriptive
 - If quantities are vague ("some", "a little"), note that in parentheses
+- Only include actual cooking INGREDIENTS. Do NOT include:
+  * Equipment or tools (fork, baking sheet, foil, skewer, frying pan, parchment paper)
+  * Serving suggestions or garnishes that aren't prepared as part of the recipe (e.g., "serve with french fries" should NOT add "french fries" as an ingredient)
+  * Non-food items (plastic wrap, kitchen twine, cheesecloth, paper towels)
 
 Return ONLY valid JSON, no other text."""
 
@@ -1185,6 +1189,10 @@ RULES:
 - confidence should reflect how certain you are about the is_recipe classification.
 - For has_full_recipe, be strict: the description must have BOTH specific quantities AND steps.
 - If the description is mostly hashtags or very short, confidence should be lower.
+- Only include actual cooking INGREDIENTS. Do NOT include:
+  * Equipment or tools (fork, baking sheet, foil, skewer, frying pan, parchment paper)
+  * Serving suggestions or garnishes that aren't prepared as part of the recipe (e.g., "serve with french fries" should NOT add "french fries" as an ingredient)
+  * Non-food items (plastic wrap, kitchen twine, cheesecloth, paper towels)
 - Return ONLY valid JSON."""
 
             response = self.openai_client.chat.completions.create(
@@ -1788,6 +1796,10 @@ IMPORTANT INSTRUCTIONS:
 - **Handle abbreviations** - tbsp = tablespoon, tsp = teaspoon, c = cup
 - **Preserve measurements** - keep exact quantities as shown (don't convert units)
 - **Sequential steps** - list steps in the order shown in the video
+- **Only include actual cooking INGREDIENTS** - Do NOT include:
+  * Equipment or tools (fork, baking sheet, foil, skewer, frying pan, parchment paper)
+  * Serving suggestions or garnishes that aren't prepared as part of the recipe (e.g., "serve with french fries" should NOT add "french fries" as an ingredient)
+  * Non-food items (plastic wrap, kitchen twine, cheesecloth, paper towels)
 """
 
         # Add platform-specific hints
