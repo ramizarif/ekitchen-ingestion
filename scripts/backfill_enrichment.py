@@ -114,6 +114,8 @@ def update_ingredient(base_url: str, token: str, ingredient_id: str,
         "Authorization": f"Bearer {token}",
         "Content-Type": "application/json",
     }
+    # Backend requires ID in both URL and payload
+    update_data["id"] = ingredient_id
     resp = requests.patch(
         f"{base_url}/global-ingredients/{ingredient_id}",
         json=update_data,
