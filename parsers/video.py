@@ -14,6 +14,7 @@ from typing import Optional, Dict, Any, List
 from urllib.parse import urlparse
 
 from parsers.base import BaseParser, ParseResult
+from app.security import is_safe_url
 
 logger = logging.getLogger(__name__)
 
@@ -122,7 +123,11 @@ class VideoParser(BaseParser):
         return self._openai_client
 
     async def validate_url(self, url: str) -> bool:
-        """Check if URL is a supported video platform."""
+        """Check if URL is a supported video platform and safe from SSRF."""
+        is_safe, reason = is_safe_url(url)
+        if not is_safe:
+            logger.warning(f"URL blocked by SSRF check: {url} - {reason}")
+            return False
         return self._detect_platform(url) is not None
     
     def _detect_platform(self, url: str) -> Optional[str]:

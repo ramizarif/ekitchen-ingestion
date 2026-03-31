@@ -114,9 +114,7 @@ async def auth_gate_middleware(request: Request, call_next):
         return JSONResponse(
             status_code=503,
             content={
-                "error": "Service unavailable - eKitchen authentication failed on startup",
-                "detail": _auth_error,
-                "hint": "Check EKITCHEN_BASE_URL, EKITCHEN_ADMIN_EMAIL, EKITCHEN_ADMIN_PASSWORD environment variables"
+                "error": "Service temporarily unavailable",
             }
         )
     

@@ -2,6 +2,7 @@
 Website recipe parser using recipe-scrapers library.
 Supports 200+ recipe websites.
 """
+import html
 import time
 import re
 from typing import Optional, Dict, Any
@@ -9,6 +10,7 @@ from urllib.parse import urlparse
 
 from recipe_scrapers import scrape_me
 from parsers.base import BaseParser, ParseResult
+from app.security import is_safe_url
 
 
 class WebsiteParser(BaseParser):
@@ -29,14 +31,15 @@ class WebsiteParser(BaseParser):
 
     async def validate_url(self, url: str) -> bool:
         """
-        Check if the URL is a valid HTTP/HTTPS URL.
+        Check if the URL is a valid HTTP/HTTPS URL and safe from SSRF.
         recipe-scrapers will handle site-specific validation.
         """
-        try:
-            parsed = urlparse(url)
-            return parsed.scheme in ('http', 'https') and bool(parsed.netloc)
-        except Exception:
+        is_safe, reason = is_safe_url(url)
+        if not is_safe:
+            import logging
+            logging.getLogger(__name__).warning(f"URL blocked by SSRF check: {url} - {reason}")
             return False
+        return True
 
     async def parse(self, url: str, **kwargs) -> ParseResult:
         """
@@ -64,12 +67,12 @@ class WebsiteParser(BaseParser):
             # Use recipe-scrapers to fetch and parse the recipe
             scraper = scrape_me(url)
 
-            # Extract all available data
+            # Extract all available data, sanitizing scraped text to remove HTML
             recipe_data = {
-                "name": self._safe_extract(scraper.title),
-                "description": self._safe_extract(scraper.description),
-                "ingredients": self._safe_extract(scraper.ingredients, default=[]),
-                "steps": self._safe_extract(scraper.instructions_list, default=[]),
+                "name": self._sanitize_text(self._safe_extract(scraper.title)),
+                "description": self._sanitize_text(self._safe_extract(scraper.description)),
+                "ingredients": self._sanitize_list(self._safe_extract(scraper.ingredients, default=[])),
+                "steps": self._sanitize_list(self._safe_extract(scraper.instructions_list, default=[])),
                 "servings": self._extract_servings(scraper),
                 "prep_time_minutes": self._extract_time_minutes(scraper.prep_time),
                 "cook_time_minutes": self._extract_time_minutes(scraper.cook_time),
@@ -113,6 +116,21 @@ class WebsiteParser(BaseParser):
                 error_message=str(e),
                 parser_name=self.parser_name
             )
+
+    def _sanitize_text(self, text: Any) -> Any:
+        """Strip HTML tags and decode entities from scraped text."""
+        if not isinstance(text, str):
+            return text
+        clean = re.sub(r'<[^>]+>', '', text)
+        clean = html.unescape(clean)
+        clean = re.sub(r'\s+', ' ', clean).strip()
+        return clean
+
+    def _sanitize_list(self, items: Any) -> Any:
+        """Sanitize a list of strings."""
+        if not isinstance(items, list):
+            return items
+        return [self._sanitize_text(item) for item in items if item]
 
     def _safe_extract(self, func_or_value, default: Any = None) -> Any:
         """

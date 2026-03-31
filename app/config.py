@@ -14,8 +14,8 @@ class Settings(BaseSettings):
     API_PORT: int = 8000
     API_WORKERS: int = 4
 
-    # CORS
-    ALLOWED_ORIGINS: List[str] = ["*"]
+    # CORS — default to internal backend URL only; override via env var for dev
+    ALLOWED_ORIGINS: List[str] = ["http://ekitchen.railway.internal:8081"]
 
     # OpenAI
     OPENAI_API_KEY: str = ""
