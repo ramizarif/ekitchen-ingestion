@@ -987,6 +987,7 @@ REQUIRED JSON RESPONSE FORMAT:
 {{
   "difficulty": "Easy|Medium|Hard",
   "cuisine": "cuisine_type",
+  "dietary_classification": "omnivore|pescatarian|vegetarian|vegan",
   "tags": ["tag1", "tag2", "tag3"],
   "cozy_description": "Recipe description rewritten in eKitchen's approachable brand voice...",
   "cozy_instructions": [
@@ -1005,9 +1006,16 @@ GUIDELINES:
 
 2. CUISINE: Identify the cuisine type (Italian, Mexican, American, Thai, etc.)
 
-3. TAGS: Include 5-8 relevant tags like dietary restrictions (gluten-free, dairy-free, vegan), cooking method (baked, fried, grilled), meal type, cuisine, etc.
+3. DIETARY_CLASSIFICATION: Classify this recipe by the highest restriction level it satisfies (vegan ⊆ vegetarian ⊆ pescatarian ⊆ omnivore):
+   - "vegan" = no animal products of any kind (no meat, fish, dairy, eggs, honey)
+   - "vegetarian" = no meat or fish, but allows dairy/eggs/honey
+   - "pescatarian" = no meat (mammals/birds), but allows fish/seafood, dairy, eggs
+   - "omnivore" = contains meat (beef, chicken, pork, lamb, etc.) OR cannot be classified as more restrictive
+   Return exactly one value. Note: broth or stock from animals (e.g., chicken broth) means omnivore.
 
-4. TIME ESTIMATION (only if times are 0 or missing):
+4. TAGS: Include 5-8 relevant tags like dietary restrictions (gluten-free, dairy-free, vegan), cooking method (baked, fried, grilled), meal type, cuisine, etc.
+
+5. TIME ESTIMATION (only if times are 0 or missing):
    - Analyze the ingredients and cooking steps to estimate realistic times
    - PREP_TIME: Chopping, mixing, measuring (usually 5-30 minutes)
    - COOK_TIME: Active cooking time (stovetop, oven, etc.)
@@ -1015,7 +1023,7 @@ GUIDELINES:
    - Be realistic but practical for home cooks
    - Examples: Simple pasta (10 prep, 15 cook, 25 total), Roasted chicken (15 prep, 60 cook, 75 total)
 
-5. COZY_DESCRIPTION: Rewrite the recipe description in eKitchen's approachable, confident brand voice:
+6. COZY_DESCRIPTION: Rewrite the recipe description in eKitchen's approachable, confident brand voice:
    - Keep it concise but appetizing (2-3 sentences max)
    - Focus on what makes this dish special or comforting
    - Use warm but professional language that builds excitement
@@ -1023,7 +1031,7 @@ GUIDELINES:
    - Sound inviting and achievable for home cooks
    - Avoid overly flowery language - stay authentic and helpful
 
-6. COZY_INSTRUCTIONS: Rewrite each instruction step in eKitchen's approachable, confident brand voice:
+7. COZY_INSTRUCTIONS: Rewrite each instruction step in eKitchen's approachable, confident brand voice:
    - Keep instructions clear, precise, and actionable
    - Use warm but professional language ("gently fold", "carefully season")
    - Maintain all original technical details and measurements
@@ -1031,14 +1039,14 @@ GUIDELINES:
    - Preserve the exact cooking method and nuance from the original
    - Sound encouraging but scientifically accurate
 
-7. DALLE_PROMPT: Create a detailed prompt for food photography:
+8. DALLE_PROMPT: Create a detailed prompt for food photography:
    - Focus on homey, cozy kitchen atmosphere (NOT restaurant-style)
    - Mention "warm family kitchen" or "cozy home setting"
    - Include "natural lighting" and "inviting presentation"
    - Describe the dish appearance, garnishes, and mood
    - End with "warm, inviting home cooking photography"
 
-8. CATEGORY: Choose the most appropriate meal category
+9. CATEGORY: Choose the most appropriate meal category
 
 Respond with ONLY the JSON object, no additional text.
 """
@@ -1343,6 +1351,7 @@ Return ONLY the DALL-E prompt, nothing else."""
             "num_servings": recipe_data['yields'],
             "cuisine": ai_decisions['cuisine'],
             "difficulty": ai_decisions['difficulty'],
+            "dietary_classification": ai_decisions.get('dietary_classification'),
             "inspired_by_url": recipe_data['url'],
             "ingredients": formatted_ingredients,
             "tag_names": ai_decisions['tags'],
