@@ -177,32 +177,29 @@ def classify_dietary(
             elif isinstance(step, str):
                 instruction_list.append(step)
 
-    prompt = f"""
-Classify this recipe by the highest dietary restriction level it satisfies:
-- "vegan" = no animal products of any kind (no meat, fish, dairy, eggs, honey)
-- "vegetarian" = no meat or fish, but allows dairy/eggs/honey
-- "pescatarian" = no meat (mammals/birds), but allows fish/seafood, dairy, eggs
-- "omnivore" = contains meat (beef, chicken, pork, lamb, etc.) OR cannot be classified as more restrictive
+    prompt = f"""Classify this recipe by the highest dietary restriction level it satisfies:
+- vegan = no animal products of any kind (no meat, fish, dairy, eggs, honey)
+- vegetarian = no meat or fish, but allows dairy/eggs/honey
+- pescatarian = no meat (mammals/birds), but allows fish/seafood, dairy, eggs
+- omnivore = contains meat (beef, chicken, pork, lamb, etc.) OR cannot be classified as more restrictive
 
-RECIPE DATA:
+RECIPE:
 Title: {title}
 Ingredients: {', '.join(ingredient_list)}
-Instructions: {'; '.join(instruction_list)}
 
-Respond with ONLY one word: omnivore, pescatarian, vegetarian, or vegan. No explanation.
-"""
+Output ONLY the single word: omnivore, pescatarian, vegetarian, or vegan"""
 
     try:
         response = openai_client.chat.completions.create(
             model="gpt-4o-mini",
             messages=[
                 {
-                    "role": "system",
-                    "content": "You are an expert culinary classifier. Classify recipes by dietary restriction level.",
+                    "role": "user",
+                    "content": prompt,
                 }
             ],
-            temperature=0.3,  # Lower temp for consistency on simple classification
-            max_tokens=10,
+            temperature=0,  # Deterministic for consistent classification
+            max_tokens=5,
         )
 
         classification = response.choices[0].message.content.strip().lower()

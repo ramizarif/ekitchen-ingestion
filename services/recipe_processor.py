@@ -1007,10 +1007,10 @@ GUIDELINES:
 2. CUISINE: Identify the cuisine type (Italian, Mexican, American, Thai, etc.)
 
 3. DIETARY_CLASSIFICATION: Classify this recipe by the highest restriction level it satisfies (vegan ⊆ vegetarian ⊆ pescatarian ⊆ omnivore):
-   - "vegan" = no animal products of any kind (no meat, fish, dairy, eggs, honey)
-   - "vegetarian" = no meat or fish, but allows dairy/eggs/honey
-   - "pescatarian" = no meat (mammals/birds), but allows fish/seafood, dairy, eggs
-   - "omnivore" = contains meat (beef, chicken, pork, lamb, etc.) OR cannot be classified as more restrictive
+   - vegan = no animal products of any kind (no meat, fish, dairy, eggs, honey)
+   - vegetarian = no meat or fish, but allows dairy/eggs/honey
+   - pescatarian = no meat (mammals/birds), but allows fish/seafood, dairy, eggs
+   - omnivore = contains meat (beef, chicken, pork, lamb, etc.) OR cannot be classified as more restrictive
    Return exactly one value. Note: broth or stock from animals (e.g., chicken broth) means omnivore.
 
 4. TAGS: Include 5-8 relevant tags like dietary restrictions (gluten-free, dairy-free, vegan), cooking method (baked, fried, grilled), meal type, cuisine, etc.
