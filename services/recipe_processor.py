@@ -1311,17 +1311,33 @@ Return ONLY the DALL-E prompt, nothing else."""
             return True
         return False
 
+    def _ensure_ekitchen_auth(self) -> bool:
+        """Guarantee a usable eKitchen token, re-authenticating if it has been lost.
+
+        The ingredient_processor owns the authoritative session; we delegate to its
+        re-auth (refresh → full re-login from stored admin creds) and re-sync our
+        local token copy so the two never drift. Without this, our copy — taken once
+        at init — goes stale the moment the ingredient processor re-authenticates,
+        and every recipe write would fail with a token the backend already rejected.
+        Returns True if a valid token is available.
+        """
+        ip = self.ingredient_processor
+        if not ip.access_token and not ip._reauthenticate():
+            return False
+        self.ekitchen_token = ip.access_token
+        self.ekitchen_refresh_token = ip.refresh_token
+        return True
+
     def create_ekitchen_recipe(self, recipe_data: Dict[str, Any], ai_decisions: Dict[str, Any],
                              formatted_ingredients: List[Dict[str, str]],
                              nutrition_data: Dict[str, float], user_id: Optional[str] = None) -> Optional[str]:
         """Create recipe in eKitchen database using direct API call"""
         self._log_and_print(f"🏗️  Creating recipe in eKitchen: {recipe_data['title']}")
 
-        # Refresh tokens before making API call
-        self._refresh_ekitchen_tokens()
-
-        if not self.ekitchen_token:
-            self._log_and_print("❌ Not authenticated with eKitchen", 'error')
+        # Guarantee a fresh, valid token (re-syncs from the ingredient processor's
+        # authoritative session, re-authenticating if it has expired mid-run).
+        if not self._ensure_ekitchen_auth():
+            self._log_and_print("❌ Not authenticated with eKitchen and re-auth failed", 'error')
             return None
         
         # Format steps for eKitchen
@@ -1362,43 +1378,52 @@ Return ONLY the DALL-E prompt, nothing else."""
             "imported_from_url": recipe_data['url'] if user_id else None
         }
         
-        try:
-            response = requests.post(
-                f"{self.ingredient_processor.ekitchen_base_url}/global-recipes",
-                headers={
-                    'Authorization': f'Bearer {self.ekitchen_token}',
-                    'Content-Type': 'application/json'
-                },
-                json=create_data,
-                timeout=30
-            )
-            
-            response.raise_for_status()
-            result = response.json()
-            
-            recipe_id = result.get('id')
-            if recipe_id:
-                self._log_and_print(f"✅ Recipe created successfully: ID {recipe_id}")
-                return recipe_id
-            else:
-                self._log_and_print(f"❌ Recipe creation failed: {result}", 'error')
+        for attempt in range(2):
+            try:
+                response = requests.post(
+                    f"{self.ingredient_processor.ekitchen_base_url}/global-recipes",
+                    headers={
+                        'Authorization': f'Bearer {self.ekitchen_token}',
+                        'Content-Type': 'application/json'
+                    },
+                    json=create_data,
+                    timeout=30
+                )
+
+                response.raise_for_status()
+                result = response.json()
+
+                recipe_id = result.get('id')
+                if recipe_id:
+                    self._log_and_print(f"✅ Recipe created successfully: ID {recipe_id}")
+                    return recipe_id
+                else:
+                    self._log_and_print(f"❌ Recipe creation failed: {result}", 'error')
+                    return None
+
+            except requests.exceptions.HTTPError as e:
+                # Token expired/rejected mid-run — re-authenticate and retry ONCE.
+                status_code = e.response.status_code if e.response is not None else None
+                if status_code in (401, 403) and attempt == 0 and self._ensure_ekitchen_auth():
+                    self._log_and_print("🔄 eKitchen token rejected creating recipe; re-authenticated, retrying...", 'warning')
+                    continue
+                self._log_and_print(f"❌ HTTP Error creating recipe: {e}", 'error')
                 return None
-                
-        except requests.exceptions.RequestException as e:
-            self._log_and_print(f"❌ HTTP Error creating recipe: {e}", 'error')
-            return None
-        except Exception as e:
-            self._log_and_print(f"❌ Error creating recipe: {e}", 'error')
-            return None
+            except requests.exceptions.RequestException as e:
+                self._log_and_print(f"❌ HTTP Error creating recipe: {e}", 'error')
+                return None
+            except Exception as e:
+                self._log_and_print(f"❌ Error creating recipe: {e}", 'error')
+                return None
     
     def upload_recipe_image(self, recipe_id: str, image_path: str) -> bool:
         """Upload recipe image to eKitchen"""
         self._log_and_print(f"📤 Uploading image for recipe {recipe_id}: {image_path}")
         
-        if not self.ekitchen_token:
+        if not self._ensure_ekitchen_auth():
             self._log_and_print("❌ Not authenticated with eKitchen", 'error')
             return False
-        
+
         if not os.path.exists(image_path):
             self._log_and_print(f"❌ Image file not found: {image_path}", 'error')
             return False
@@ -1445,7 +1470,7 @@ Return ONLY the DALL-E prompt, nothing else."""
             self._log_and_print("⚠️  OpenAI client not available, skipping ambiguous match resolution", 'warning')
             return
 
-        if not self.ekitchen_token:
+        if not self._ensure_ekitchen_auth():
             self._log_and_print("⚠️  Not authenticated with eKitchen, skipping ambiguous match resolution", 'warning')
             return
 

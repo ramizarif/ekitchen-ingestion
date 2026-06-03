@@ -212,6 +212,9 @@ class DirectIngredientProcessor:
     
     def authenticate_ekitchen(self, admin_email: str, admin_password: str) -> bool:
         """Authenticate with eKitchen API and get access token"""
+        # Remember creds so we can fully re-authenticate if the token expires mid-run.
+        self._admin_email = admin_email
+        self._admin_password = admin_password
         self._log_and_print(f"🔐 Authenticating with eKitchen as {admin_email}...")
         self._log_and_print(f"DEBUG: Using base URL: {self.ekitchen_base_url}", 'debug')
         
@@ -220,41 +223,40 @@ class DirectIngredientProcessor:
             "password": admin_password
         }
         
-        try:
-            # Prepare the request
-            data = json.dumps(login_data).encode('utf-8')
-            req = urllib.request.Request(
-                f"{self.ekitchen_base_url}/auth/login",
-                data=data,
-                headers={
-                    'Content-Type': 'application/json'
-                }
-            )
-            
-            # Make the request
-            with urllib.request.urlopen(req, timeout=30) as response:
-                result = json.loads(response.read().decode('utf-8'))
-                
-            if result.get('access_token'):
-                self.access_token = result['access_token']
-                self.refresh_token = result.get('refresh_token')  # Store refresh token if provided
-                self._log_and_print("✅ eKitchen authentication successful")
-                self._log_and_print(f"DEBUG: Access token length: {len(self.access_token)}", 'debug')
-                if self.refresh_token:
-                    self._log_and_print(f"DEBUG: Refresh token stored (length: {len(self.refresh_token)})", 'debug')
-                return True
-            else:
+        # Retry transient failures (Railway prod can be slow/cold-starting; a single
+        # timed-out login otherwise leaves the whole worker unauthenticated).
+        data = json.dumps(login_data).encode('utf-8')
+        last_err = None
+        for attempt in range(4):
+            try:
+                req = urllib.request.Request(
+                    f"{self.ekitchen_base_url}/auth/login",
+                    data=data,
+                    headers={'Content-Type': 'application/json'}
+                )
+                with urllib.request.urlopen(req, timeout=45) as response:
+                    result = json.loads(response.read().decode('utf-8'))
+
+                if result.get('access_token'):
+                    self.access_token = result['access_token']
+                    self.refresh_token = result.get('refresh_token')
+                    self._log_and_print("✅ eKitchen authentication successful")
+                    return True
                 self._log_and_print(f"❌ Authentication failed: {result}", 'error')
                 return False
-                
-        except urllib.error.HTTPError as e:
-            error_body = e.read().decode('utf-8') if hasattr(e, 'read') else 'No error body'
-            self._log_and_print(f"❌ HTTP Error during authentication: {e.code} {e.reason}", 'error')
-            self._log_and_print(f"DEBUG: Auth error body: {error_body}", 'debug')
-            return False
-        except Exception as e:
-            self._log_and_print(f"❌ Error during authentication: {e}", 'error')
-            return False
+            except urllib.error.HTTPError as e:
+                # HTTP errors (e.g. 401 bad credentials) are not transient — don't retry.
+                error_body = e.read().decode('utf-8') if hasattr(e, 'read') else 'No error body'
+                self._log_and_print(f"❌ HTTP Error during authentication: {e.code} {e.reason}", 'error')
+                self._log_and_print(f"DEBUG: Auth error body: {error_body}", 'debug')
+                return False
+            except Exception as e:
+                last_err = e
+                self._log_and_print(f"⚠️  Auth attempt {attempt + 1}/4 failed ({e}); retrying...", 'warning')
+                if attempt < 3:
+                    time.sleep(3 * (attempt + 1))  # 3s, 6s, 9s backoff
+        self._log_and_print(f"❌ Error during authentication after retries: {last_err}", 'error')
+        return False
 
     def refresh_authentication(self) -> bool:
         """Refresh authentication tokens using the refresh token"""
@@ -313,60 +315,65 @@ class DirectIngredientProcessor:
             self._log_and_print(f"❌ Error during token refresh: {e}", 'error')
             return False
 
+    def _reauthenticate(self) -> bool:
+        """Restore a valid eKitchen session: try a token refresh first, then a full
+        re-login with stored admin creds. Used when a token expires mid-run."""
+        if self.refresh_token and self.refresh_authentication():
+            return True
+        if getattr(self, '_admin_email', None) and getattr(self, '_admin_password', None):
+            return self.authenticate_ekitchen(self._admin_email, self._admin_password)
+        return False
+
     def search_ekitchen_ingredient(self, query: str) -> List[Dict[str, Any]]:
-        """Search for ingredients in eKitchen database"""
-        if not self.access_token:
-            self._log_and_print("❌ Not authenticated with eKitchen", 'error')
-            return []
-            
-        try:
-            # URL encode the query
-            encoded_query = urllib.parse.quote(query)
-            url = f"{self.ekitchen_base_url}/global-ingredients/search?q={encoded_query}&limit=5"
-            
-            self._log_and_print(f"🔍 DEBUG: Searching for '{query}' at {url}", 'debug')
-            self._log_and_print(f"DEBUG: Using access token: {self.access_token[:20]}...", 'debug')
-            
-            req = urllib.request.Request(
-                url,
-                headers={
-                    'Authorization': f'Bearer {self.access_token}',
-                    'Content-Type': 'application/json'
-                }
+        """Search for ingredients in eKitchen.
+
+        IMPORTANT: this NEVER returns [] for an auth/transport failure — only for a
+        genuine empty result. An auth failure triggers re-auth + retry; if that fails
+        it RAISES. This prevents the caller from mistaking a lost-auth error for
+        'ingredient not found' and creating a duplicate ingredient via Spoonacular.
+        """
+        if not self.access_token and not self._reauthenticate():
+            raise RuntimeError(
+                "eKitchen not authenticated and re-auth failed; refusing to search "
+                f"'{query}' (would risk creating a duplicate ingredient)"
             )
-            
-            with urllib.request.urlopen(req, timeout=30) as response:
-                response_text = response.read().decode('utf-8')
-                self._log_and_print(f"🔍 DEBUG: Search response status: {response.getcode()}", 'debug')
-                self._log_and_print(f"🔍 DEBUG: Raw response: {response_text[:500]}...", 'debug')
-                
-                result = json.loads(response_text)
-                # API returns list directly, not wrapped in object
-                if isinstance(result, list):
-                    ingredients = result
-                else:
-                    ingredients = result.get('ingredients', [])
-                    
-                self._log_and_print(f"🔍 DEBUG: Found {len(ingredients)} ingredients for '{query}'")
-                self._log_and_print(f"DEBUG: Full search result structure: {result}", 'debug')
-                
-                if ingredients:
-                    for i, ingredient in enumerate(ingredients[:2]):  # Show first 2
-                        self._log_and_print(f"   {i+1}. {ingredient.get('name', 'N/A')} (ID: {ingredient.get('id', 'N/A')})")
-                        self._log_and_print(f"      DEBUG: Full ingredient data: {ingredient}", 'debug')
-                else:
-                    self._log_and_print(f"DEBUG: No ingredients found in response for '{query}'", 'debug')
-                
+
+        encoded_query = urllib.parse.quote(query)
+        url = f"{self.ekitchen_base_url}/global-ingredients/search?q={encoded_query}&limit=5"
+
+        for attempt in range(2):
+            try:
+                req = urllib.request.Request(
+                    url,
+                    headers={
+                        'Authorization': f'Bearer {self.access_token}',
+                        'Content-Type': 'application/json',
+                    },
+                )
+                with urllib.request.urlopen(req, timeout=30) as response:
+                    result = json.loads(response.read().decode('utf-8'))
+
+                ingredients = result if isinstance(result, list) else result.get('ingredients', [])
+                self._log_and_print(f"🔍 Found {len(ingredients)} eKitchen ingredients for '{query}'")
                 return ingredients
-            
-        except urllib.error.HTTPError as e:
-            error_body = e.read().decode('utf-8') if hasattr(e, 'read') else 'No error body'
-            self._log_and_print(f"❌ HTTP Error searching '{query}': {e.code} {e.reason}", 'error')
-            self._log_and_print(f"❌ Error body: {error_body}", 'debug')
-            return []
-        except Exception as e:
-            self._log_and_print(f"❌ Error searching '{query}': {e}", 'error')
-            return []
+
+            except urllib.error.HTTPError as e:
+                # Auth rejected mid-run (expired token) — re-authenticate and retry ONCE.
+                # Do NOT fall through to a [] return (which would masquerade as not-found).
+                if e.code in (401, 403) and attempt == 0:
+                    self._log_and_print("🔄 eKitchen token rejected; re-authenticating before retry...", 'warning')
+                    if not self._reauthenticate():
+                        raise RuntimeError(
+                            f"eKitchen auth lost and re-auth failed while searching '{query}'; "
+                            "aborting recipe to avoid duplicate ingredients"
+                        )
+                    continue
+                # Non-auth HTTP errors: raise, don't masquerade as 'not found'.
+                error_body = e.read().decode('utf-8') if hasattr(e, 'read') else 'No error body'
+                self._log_and_print(f"❌ HTTP Error searching '{query}': {e.code} {e.reason} — {error_body[:100]}", 'error')
+                raise
+        # Exhausted retries on auth — never reached for genuine empty results.
+        raise RuntimeError(f"eKitchen ingredient search failed for '{query}' after re-auth")
     
     def search_spoonacular_ingredient_enhanced(self, ingredient_name: str) -> Optional[SpoonacularIngredientData]:
         """Enhanced Spoonacular search with full nutrition data and cost estimation"""
@@ -610,8 +617,11 @@ class DirectIngredientProcessor:
     
     def create_ekitchen_ingredient(self, ingredient_data: IngredientData) -> Optional[str]:
         """Create ingredient in eKitchen database with comprehensive enrichment"""
-        if not self.access_token:
-            print("❌ Not authenticated with eKitchen")
+        # Self-heal a lost/expired session instead of bailing — the auth token is a
+        # short-lived Firebase JWT, and a single cleared token would otherwise poison
+        # every ingredient for the rest of the processor's (singleton) lifetime.
+        if not self.access_token and not self._reauthenticate():
+            self._log_and_print("❌ Not authenticated with eKitchen and re-auth failed", 'error')
             return None
             
         self._log_and_print(f"\n🌱 Creating ingredient with enrichment: {ingredient_data.name}")
@@ -742,35 +752,40 @@ class DirectIngredientProcessor:
         self._log_and_print(f"   📤 FULL REQUEST BODY:")
         self._log_and_print(f"   {json.dumps(create_data, indent=2)}")
             
-        try:
-            data = json.dumps(create_data).encode('utf-8')
-            req = urllib.request.Request(
-                f"{self.ekitchen_base_url}/global-ingredients",
-                data=data,
-                headers={
-                    'Authorization': f'Bearer {self.access_token}',
-                    'Content-Type': 'application/json'
-                }
-            )
-            
-            with urllib.request.urlopen(req, timeout=30) as response:
-                result = json.loads(response.read().decode('utf-8'))
-                
-            ingredient_id = result.get('id')
-            if ingredient_id:
-                status = "🌟 ENRICHED" if not ingredient_data.needs_enrichment else "🔄 BASIC"
-                self._log_and_print(f"   ✅ Created {ingredient_data.name}: ID {ingredient_id} ({status})")
-                return ingredient_id
-            else:
-                self._log_and_print(f"   ❌ Failed to create {ingredient_data.name}: {result}", 'error')
+        data = json.dumps(create_data).encode('utf-8')
+        for attempt in range(2):
+            try:
+                req = urllib.request.Request(
+                    f"{self.ekitchen_base_url}/global-ingredients",
+                    data=data,
+                    headers={
+                        'Authorization': f'Bearer {self.access_token}',
+                        'Content-Type': 'application/json'
+                    }
+                )
+
+                with urllib.request.urlopen(req, timeout=30) as response:
+                    result = json.loads(response.read().decode('utf-8'))
+
+                ingredient_id = result.get('id')
+                if ingredient_id:
+                    status = "🌟 ENRICHED" if not ingredient_data.needs_enrichment else "🔄 BASIC"
+                    self._log_and_print(f"   ✅ Created {ingredient_data.name}: ID {ingredient_id} ({status})")
+                    return ingredient_id
+                else:
+                    self._log_and_print(f"   ❌ Failed to create {ingredient_data.name}: {result}", 'error')
+                    return None
+
+            except urllib.error.HTTPError as e:
+                # Token expired/rejected mid-run — re-authenticate and retry ONCE.
+                if e.code in (401, 403) and attempt == 0 and self._reauthenticate():
+                    self._log_and_print(f"   🔄 eKitchen token rejected creating {ingredient_data.name}; re-authenticated, retrying...", 'warning')
+                    continue
+                self._log_and_print(f"   ❌ HTTP Error creating {ingredient_data.name}: {e.code} {e.reason}", 'error')
                 return None
-                
-        except urllib.error.HTTPError as e:
-            self._log_and_print(f"   ❌ HTTP Error creating {ingredient_data.name}: {e.code} {e.reason}", 'error')
-            return None
-        except Exception as e:
-            self._log_and_print(f"   ❌ Error creating {ingredient_data.name}: {e}", 'error')
-            return None
+            except Exception as e:
+                self._log_and_print(f"   ❌ Error creating {ingredient_data.name}: {e}", 'error')
+                return None
     
     # ─── Similarity / Duplicate Detection ──────────────────────────────
 
@@ -791,7 +806,7 @@ class DirectIngredientProcessor:
         Returns a dict with keys  id, name, match_type  if a likely match is
         found, otherwise None.
         """
-        if not self.access_token:
+        if not self.access_token and not self._reauthenticate():
             self._log_and_print("⚠️  Cannot search for similar ingredients - not authenticated", 'warning')
             return None
 
@@ -935,7 +950,7 @@ Examples:
         Calls PATCH /global-ingredients/{id}/rename-ingredient with {"new_name": new_name}.
         The backend cascades the rename to all recipe step references.
         """
-        if not self.access_token:
+        if not self.access_token and not self._reauthenticate():
             self._log_and_print("❌ Not authenticated with eKitchen – cannot rename ingredient", 'error')
             return False
 
@@ -944,31 +959,37 @@ Examples:
 
         self._log_and_print(f"   ✏️  Renaming ingredient {ingredient_id} → '{new_name}'")
 
-        try:
-            req = urllib.request.Request(
-                url,
-                data=body,
-                method='PATCH',
-                headers={
-                    'Authorization': f'Bearer {self.access_token}',
-                    'Content-Type': 'application/json',
-                },
-            )
-            with urllib.request.urlopen(req, timeout=30) as response:
-                result = json.loads(response.read().decode('utf-8'))
-                self._log_and_print(f"   ✅ Rename successful: {result.get('message', 'OK')}")
-                return True
+        for attempt in range(2):
+            try:
+                req = urllib.request.Request(
+                    url,
+                    data=body,
+                    method='PATCH',
+                    headers={
+                        'Authorization': f'Bearer {self.access_token}',
+                        'Content-Type': 'application/json',
+                    },
+                )
+                with urllib.request.urlopen(req, timeout=30) as response:
+                    result = json.loads(response.read().decode('utf-8'))
+                    self._log_and_print(f"   ✅ Rename successful: {result.get('message', 'OK')}")
+                    return True
 
-        except urllib.error.HTTPError as e:
-            error_body = e.read().decode('utf-8') if hasattr(e, 'read') else 'No error body'
-            self._log_and_print(
-                f"   ❌ HTTP Error renaming ingredient {ingredient_id}: {e.code} {e.reason} — {error_body}",
-                'error',
-            )
-            return False
-        except Exception as e:
-            self._log_and_print(f"   ❌ Error renaming ingredient {ingredient_id}: {e}", 'error')
-            return False
+            except urllib.error.HTTPError as e:
+                # Token expired/rejected mid-run — re-authenticate and retry ONCE.
+                if e.code in (401, 403) and attempt == 0 and self._reauthenticate():
+                    self._log_and_print(f"   🔄 eKitchen token rejected renaming ingredient {ingredient_id}; re-authenticated, retrying...", 'warning')
+                    continue
+                error_body = e.read().decode('utf-8') if hasattr(e, 'read') else 'No error body'
+                self._log_and_print(
+                    f"   ❌ HTTP Error renaming ingredient {ingredient_id}: {e.code} {e.reason} — {error_body}",
+                    'error',
+                )
+                return False
+            except Exception as e:
+                self._log_and_print(f"   ❌ Error renaming ingredient {ingredient_id}: {e}", 'error')
+                return False
+        return False
 
     # ─── End Similarity / Duplicate Detection ────────────────────────────
 
