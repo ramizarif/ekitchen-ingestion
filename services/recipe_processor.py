@@ -194,43 +194,176 @@ class DirectRecipeProcessor:
             self._log_and_print("❌ eKitchen credentials not found in configuration", 'error')
     
     def scrape_recipe_from_url(self, recipe_url: str) -> Optional[Dict[str, Any]]:
-        """Scrape recipe data from URL using recipe-scrapers library"""
+        """Scrape recipe data from a website URL using a tiered strategy.
+
+        Mirrors the cost-tiered approach of the video pipeline — cheapest, highest-
+        quality method first, falling back only when needed:
+          1. recipe-scrapers dedicated parser (~200 supported sites, best quality, free)
+          2. schema.org / JSON-LD via recipe-scrapers wild_mode (most recipe blogs, free)
+          3. page text -> GPT-4o-mini extraction (near-universal, ~$0.002)
+        Tier 4 (Playwright screenshot -> vision) is intentionally not implemented yet.
+        Returns the first COMPLETE result (title + ingredients + steps), else the best
+        partial, else None.
+        """
         self._log_and_print(f"🌐 Scraping recipe from: {recipe_url}")
-        
+
+        # Tier 1: dedicated recipe-scrapers parser
+        tier1 = self._scrape_via_recipe_scrapers(recipe_url)
+        if self._website_recipe_complete(tier1):
+            self._log_and_print(f"✅ Scraped via recipe-scrapers: {tier1['title']} "
+                                f"({len(tier1['ingredients'])} ingredients, {len(tier1['instructions'])} steps)")
+            return tier1
+
+        # Fetch the page once (SSRF-checked) and reuse for tiers 2 & 3
+        html = self._fetch_page_html(recipe_url)
+
+        # Tier 2: schema.org / JSON-LD on any site (recipe-scrapers wild_mode)
+        tier2 = self._scrape_via_jsonld(html, recipe_url) if html else None
+        if self._website_recipe_complete(tier2):
+            self._log_and_print(f"✅ Scraped via JSON-LD/schema.org: {tier2['title']} "
+                                f"({len(tier2['ingredients'])} ingredients, {len(tier2['instructions'])} steps)")
+            return tier2
+
+        # Tier 3: rendered page text -> LLM extraction
+        tier3 = self._scrape_via_llm(html, recipe_url) if html else None
+        if self._website_recipe_complete(tier3):
+            self._log_and_print(f"✅ Scraped via LLM text extraction: {tier3['title']} "
+                                f"({len(tier3['ingredients'])} ingredients, {len(tier3['instructions'])} steps)")
+            return tier3
+
+        # No complete result — return the best partial (something with ingredients) if any
+        for candidate in (tier1, tier2, tier3):
+            if candidate and candidate.get('ingredients'):
+                self._log_and_print("⚠️  Returning partial website scrape (incomplete recipe data)", 'warning')
+                return candidate
+
+        self._log_and_print(f"❌ All website scraping tiers failed for {recipe_url}", 'error')
+        return None
+
+    def _scrape_via_recipe_scrapers(self, recipe_url: str) -> Optional[Dict[str, Any]]:
+        """Tier 1: recipe-scrapers dedicated site parser."""
         try:
-            # Use recipe-scrapers library for reliable scraping
             from recipe_scrapers import scrape_me
-            
-            scraper = scrape_me(recipe_url)
-            
-            # Extract recipe data
-            recipe_data = {
-                "title": scraper.title(),
-                "description": scraper.description() or "",
-                "ingredients": scraper.ingredients(),
-                "instructions": scraper.instructions_list(),
-                "prep_time": self._extract_time_minutes(scraper.prep_time()),
-                "cook_time": self._extract_time_minutes(scraper.cook_time()),
-                "total_time": self._extract_time_minutes(scraper.total_time()),
-                "yields": self._extract_servings(scraper.yields()),
-                "image_url": scraper.image() or "",
-                "author": scraper.author() or "",
-                "url": recipe_url
-            }
-            
-            self._log_and_print(f"✅ Successfully scraped: {recipe_data['title']}")
-            self._log_and_print(f"   Ingredients: {len(recipe_data['ingredients'])}")
-            self._log_and_print(f"   Instructions: {len(recipe_data['instructions'])} steps")
-            
-            return recipe_data
-            
-        except ImportError:
-            self._log_and_print("❌ recipe-scrapers library not installed. Run: pip install recipe-scrapers", 'error')
-            return None
+            return self._scraper_to_recipe_data(scrape_me(recipe_url), recipe_url)
         except Exception as e:
-            self._log_and_print(f"❌ Failed to scrape recipe: {e}", 'error')
+            self._log_and_print(f"   recipe-scrapers (dedicated) miss: {e}", 'debug')
             return None
-    
+
+    def _scrape_via_jsonld(self, html: str, recipe_url: str) -> Optional[Dict[str, Any]]:
+        """Tier 2: schema.org / JSON-LD extraction on any site via wild_mode."""
+        try:
+            from recipe_scrapers import scrape_html
+            scraper = scrape_html(html=html, org_url=recipe_url, wild_mode=True)
+            return self._scraper_to_recipe_data(scraper, recipe_url)
+        except Exception as e:
+            self._log_and_print(f"   JSON-LD/wild_mode miss: {e}", 'debug')
+            return None
+
+    def _scraper_to_recipe_data(self, scraper, recipe_url: str) -> Dict[str, Any]:
+        """Map a recipe-scrapers AbstractScraper to our recipe_data shape.
+        Each field is extracted defensively — wild_mode scrapers often raise on
+        missing optional fields."""
+        def safe(fn, default=None):
+            try:
+                v = fn()
+                return v if v not in (None, "") else default
+            except Exception:
+                return default
+        return {
+            "title": safe(scraper.title),
+            "description": safe(scraper.description, "") or "",
+            "ingredients": safe(scraper.ingredients, []) or [],
+            "instructions": safe(scraper.instructions_list, []) or [],
+            "prep_time": self._extract_time_minutes(safe(scraper.prep_time)),
+            "cook_time": self._extract_time_minutes(safe(scraper.cook_time)),
+            "total_time": self._extract_time_minutes(safe(scraper.total_time)),
+            "yields": self._extract_servings(safe(scraper.yields)),
+            "image_url": safe(scraper.image, "") or "",
+            "author": safe(scraper.author, "") or "",
+            "url": recipe_url,
+        }
+
+    def _fetch_page_html(self, recipe_url: str) -> Optional[str]:
+        """Fetch raw HTML for a URL, with an SSRF guard. Returns None on failure."""
+        try:
+            from app.security import is_safe_url
+            is_safe, reason = is_safe_url(recipe_url)
+            if not is_safe:
+                self._log_and_print(f"   ⛔ URL blocked by SSRF check: {reason}", 'warning')
+                return None
+            headers = {
+                "User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
+                              "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0 Safari/537.36",
+                "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+            }
+            resp = requests.get(recipe_url, headers=headers, timeout=20)
+            resp.raise_for_status()
+            return resp.text
+        except Exception as e:
+            self._log_and_print(f"   Page fetch failed: {e}", 'warning')
+            return None
+
+    def _scrape_via_llm(self, html: str, recipe_url: str) -> Optional[Dict[str, Any]]:
+        """Tier 3: extract a recipe from the page's rendered text via GPT-4o-mini."""
+        if not self.openai_client:
+            return None
+        try:
+            import html_text
+            page_text = html_text.extract_text(html)
+        except Exception:
+            page_text = None
+        if not page_text or len(page_text) < 80:
+            return None
+        page_text = page_text[:14000]  # cap input tokens (~$0.002/call)
+
+        prompt = (
+            "Extract the single recipe from this web page's text. Return ONLY JSON with keys: "
+            "title (string), description (short string), ingredients (array of full ingredient "
+            'lines, e.g. "2 cups flour"), instructions (array of step strings), '
+            "prep_time_minutes (int or null), cook_time_minutes (int or null), "
+            "total_time_minutes (int or null), yields (int servings or null). "
+            'If the page is not a recipe, return {"title": null, "ingredients": [], "instructions": []}.\n\n'
+            f"PAGE TEXT:\n{page_text}"
+        )
+        try:
+            response = self.openai_client.chat.completions.create(
+                model="gpt-4o-mini",
+                messages=[{"role": "user", "content": prompt}],
+                response_format={"type": "json_object"},
+                temperature=0,
+            )
+            data = json.loads(response.choices[0].message.content)
+        except Exception as e:
+            self._log_and_print(f"   LLM text extraction failed: {e}", 'warning')
+            return None
+
+        if not data.get("title") or not data.get("ingredients"):
+            return None
+        return {
+            "title": data.get("title"),
+            "description": data.get("description") or "",
+            "ingredients": data.get("ingredients") or [],
+            "instructions": data.get("instructions") or [],
+            "prep_time": self._extract_time_minutes(data.get("prep_time_minutes")),
+            "cook_time": self._extract_time_minutes(data.get("cook_time_minutes")),
+            "total_time": self._extract_time_minutes(data.get("total_time_minutes")),
+            "yields": self._extract_servings(data.get("yields")),
+            "image_url": "",
+            "author": "",
+            "url": recipe_url,
+        }
+
+    @staticmethod
+    def _website_recipe_complete(recipe_data: Optional[Dict[str, Any]]) -> bool:
+        """A scrape is 'complete' enough to use if it has a title, ingredients, and steps."""
+        return bool(
+            recipe_data
+            and recipe_data.get("title")
+            and recipe_data.get("ingredients")
+            and recipe_data.get("instructions")
+        )
+
+
     def _extract_time_minutes(self, time_value) -> int:
         """Extract time in minutes from various formats"""
         if not time_value:
