@@ -49,6 +49,14 @@ class VideoParser(BaseParser):
         r'(youtube\.com/watch\?v=[\w-]+)',
     ]
 
+    FACEBOOK_PATTERNS = [
+        r'(facebook\.com/[\w.\-]+/videos/[\w\-/]+)',  # page/videos/[slug/]id
+        r'(facebook\.com/watch/?\?v=\d+)',            # watch?v=ID
+        r'(facebook\.com/reel/\d+)',                  # reels
+        r'(facebook\.com/share/[vr]/[\w-]+)',         # share/v/ or share/r/ links
+        r'(fb\.watch/[\w-]+)',                        # short links
+    ]
+
     # Platform-specific optimization configurations
     PLATFORM_CONFIG = {
         'tiktok': {
@@ -75,6 +83,14 @@ class VideoParser(BaseParser):
             'detect_slideshows': False,  # Rare
             'prompt_hints': 'YouTube Shorts typically have professional production and detailed explanations.',
         },
+        'facebook': {
+            'audio_confidence_threshold': 0.75,  # Similar profile to Instagram Reels
+            'hybrid_confidence_threshold': 0.45,
+            'default_frames': 4,
+            'max_frames': 5,
+            'detect_slideshows': False,
+            'prompt_hints': 'Facebook recipe videos often have voiceovers plus on-screen captions/text overlays. Read any visible text for ingredients and steps.',
+        },
         'default': {
             'audio_confidence_threshold': 0.7,
             'hybrid_confidence_threshold': 0.4,
@@ -87,6 +103,9 @@ class VideoParser(BaseParser):
 
     # Path to cookies file for authenticated downloads (bypasses IP blocks)
     COOKIES_FILE = os.path.join(os.path.dirname(os.path.dirname(__file__)), 'config', 'tiktok_cookies.txt')
+
+    # Cached probe result for whether yt-dlp supports --impersonate (needs curl_cffi).
+    _impersonate_supported = None
 
     def __init__(self, timeout: int = 120, openai_client=None):
         """
@@ -110,9 +129,36 @@ class VideoParser(BaseParser):
         proxy = os.environ.get('YTDLP_PROXY')
         if proxy:
             args.extend(['--proxy', proxy])
-        # Impersonate a real browser to avoid bot detection
-        args.extend(['--impersonate', 'chrome'])
+        # Impersonate a real browser to avoid bot detection — but ONLY if this yt-dlp
+        # build actually supports it. The standalone release binary ships without
+        # curl_cffi, and passing --impersonate to it hard-fails before any download
+        # (breaking Instagram/Facebook/YouTube). Gate on a cached capability probe.
+        if self._impersonation_available():
+            args.extend(['--impersonate', 'chrome'])
         return args
+
+    @classmethod
+    def _impersonation_available(cls) -> bool:
+        """Whether the installed yt-dlp supports --impersonate (needs curl_cffi).
+
+        Probed once via `yt-dlp --list-impersonate-targets` and cached for the
+        process lifetime. Falls back to False on any error so a missing/old binary
+        degrades gracefully to a normal (non-impersonated) download instead of
+        crashing the whole ingestion.
+        """
+        if cls._impersonate_supported is None:
+            try:
+                result = subprocess.run(
+                    ['yt-dlp', '--list-impersonate-targets'],
+                    capture_output=True, text=True, timeout=15,
+                )
+                cls._impersonate_supported = 'chrome' in (result.stdout or '').lower()
+                if not cls._impersonate_supported:
+                    logger.warning("yt-dlp impersonation not available; downloading without --impersonate")
+            except Exception as e:
+                logger.warning(f"yt-dlp impersonation probe failed ({e}); downloading without --impersonate")
+                cls._impersonate_supported = False
+        return cls._impersonate_supported
         
     @property
     def openai_client(self):
@@ -134,7 +180,7 @@ class VideoParser(BaseParser):
         """
         Detect which platform the URL belongs to.
 
-        Returns: 'tiktok', 'instagram', 'youtube', or None
+        Returns: 'tiktok', 'instagram', 'youtube', 'facebook', or None
         """
         url_lower = url.lower()
 
@@ -149,6 +195,10 @@ class VideoParser(BaseParser):
         for pattern in self.YOUTUBE_PATTERNS:
             if re.search(pattern, url_lower):
                 return 'youtube'
+
+        for pattern in self.FACEBOOK_PATTERNS:
+            if re.search(pattern, url_lower):
+                return 'facebook'
 
         return None
 
@@ -288,7 +338,7 @@ class VideoParser(BaseParser):
                 return ParseResult(
                     success=False,
                     error_code="UNSUPPORTED_PLATFORM",
-                    error_message=f"URL not recognized as TikTok, Instagram, or YouTube: {url}",
+                    error_message=f"URL not recognized as TikTok, Instagram, YouTube, or Facebook: {url}",
                     parser_name=self.parser_name
                 )
 
