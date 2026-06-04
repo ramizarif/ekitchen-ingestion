@@ -58,31 +58,24 @@ def test_facebook_has_platform_config():
     assert "audio_confidence_threshold" in cfg and "default_frames" in cfg
 
 
-def test_ytdlp_args_skip_impersonate_when_unsupported():
+def test_ytdlp_args_skip_impersonate_by_default():
+    # No YTDLP_IMPERSONATE set → flag must be omitted (standalone binary can't use it).
     vp = _parser()
-    VideoParser._impersonate_supported = None  # reset cache
-    # Probe reports no impersonation targets → flag must be omitted.
-    fake = MagicMock(stdout="(no impersonate targets available)")
-    with patch("parsers.video.subprocess.run", return_value=fake):
+    with patch.dict(os.environ, {}, clear=False):
+        os.environ.pop("YTDLP_IMPERSONATE", None)
         args = vp._ytdlp_base_args()
     assert "--impersonate" not in args
-    VideoParser._impersonate_supported = None  # cleanup
 
 
-def test_ytdlp_args_include_impersonate_when_supported():
+def test_ytdlp_args_include_impersonate_when_opted_in():
     vp = _parser()
-    VideoParser._impersonate_supported = None
-    fake = MagicMock(stdout="Available targets:\nchrome\nchrome-110\nsafari")
-    with patch("parsers.video.subprocess.run", return_value=fake):
+    with patch.dict(os.environ, {"YTDLP_IMPERSONATE": "1"}):
         args = vp._ytdlp_base_args()
     assert "--impersonate" in args and "chrome" in args
-    VideoParser._impersonate_supported = None
 
 
-def test_ytdlp_args_skip_impersonate_when_probe_errors():
+def test_ytdlp_args_skip_impersonate_for_garbage_env():
     vp = _parser()
-    VideoParser._impersonate_supported = None
-    with patch("parsers.video.subprocess.run", side_effect=FileNotFoundError("yt-dlp missing")):
+    with patch.dict(os.environ, {"YTDLP_IMPERSONATE": "maybe"}):
         args = vp._ytdlp_base_args()
     assert "--impersonate" not in args
-    VideoParser._impersonate_supported = None

@@ -104,8 +104,6 @@ class VideoParser(BaseParser):
     # Path to cookies file for authenticated downloads (bypasses IP blocks)
     COOKIES_FILE = os.path.join(os.path.dirname(os.path.dirname(__file__)), 'config', 'tiktok_cookies.txt')
 
-    # Cached probe result for whether yt-dlp supports --impersonate (needs curl_cffi).
-    _impersonate_supported = None
 
     def __init__(self, timeout: int = 120, openai_client=None):
         """
@@ -129,37 +127,28 @@ class VideoParser(BaseParser):
         proxy = os.environ.get('YTDLP_PROXY')
         if proxy:
             args.extend(['--proxy', proxy])
-        # Impersonate a real browser to avoid bot detection — but ONLY if this yt-dlp
-        # build actually supports it. The standalone release binary ships without
-        # curl_cffi, and passing --impersonate to it hard-fails before any download
-        # (breaking Instagram/Facebook/YouTube). Gate on a cached capability probe.
+        # Impersonate a real browser to avoid bot detection — but ONLY if explicitly
+        # enabled. The standalone yt-dlp release binary ships without curl_cffi and
+        # hard-fails on --impersonate before any download (breaking Instagram/Facebook/
+        # YouTube). It also still *lists* "chrome" via --list-impersonate-targets even
+        # though it can't use it, so we can't probe for support — we require an explicit
+        # opt-in via YTDLP_IMPERSONATE=1 (set only on a curl_cffi-capable yt-dlp).
         if self._impersonation_available():
             args.extend(['--impersonate', 'chrome'])
         return args
 
     @classmethod
     def _impersonation_available(cls) -> bool:
-        """Whether the installed yt-dlp supports --impersonate (needs curl_cffi).
+        """Whether to pass --impersonate to yt-dlp.
 
-        Probed once via `yt-dlp --list-impersonate-targets` and cached for the
-        process lifetime. Falls back to False on any error so a missing/old binary
-        degrades gracefully to a normal (non-impersonated) download instead of
-        crashing the whole ingestion.
+        Opt-in only: the standalone release binary lists impersonate targets but
+        can't actually use them (no curl_cffi), so probing is unreliable. Enable
+        explicitly with YTDLP_IMPERSONATE=1 on an impersonation-capable yt-dlp.
+        Default off → plain (non-impersonated) download, which works for public
+        Instagram/Facebook/YouTube videos instead of crashing the ingestion.
         """
-        if cls._impersonate_supported is None:
-            try:
-                result = subprocess.run(
-                    ['yt-dlp', '--list-impersonate-targets'],
-                    capture_output=True, text=True, timeout=15,
-                )
-                cls._impersonate_supported = 'chrome' in (result.stdout or '').lower()
-                if not cls._impersonate_supported:
-                    logger.warning("yt-dlp impersonation not available; downloading without --impersonate")
-            except Exception as e:
-                logger.warning(f"yt-dlp impersonation probe failed ({e}); downloading without --impersonate")
-                cls._impersonate_supported = False
-        return cls._impersonate_supported
-        
+        return os.environ.get('YTDLP_IMPERSONATE', '').strip().lower() in ('1', 'true', 'yes')
+
     @property
     def openai_client(self):
         """Lazy load OpenAI client."""

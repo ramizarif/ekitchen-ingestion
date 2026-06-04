@@ -1268,29 +1268,29 @@ Return ONLY the DALL-E prompt, nothing else."""
             enhanced_prompt = self._enhance_dalle_prompt_for_vibrancy(dalle_prompt)
             self._log_and_print(f"🌟 Enhanced prompt: {enhanced_prompt[:150]}...")
             
-            # Generate image
+            # Generate image. dall-e-3 was removed from this OpenAI account ("model
+            # does not exist"), so use gpt-image-1 — same model the batch orchestrator
+            # (autonomous_ingest), legacy processor, and backfill scripts already use.
+            # gpt-image-1 uses quality low/medium/high and returns base64 (no URL).
             response = self.openai_client.images.generate(
-                model="dall-e-3",
+                model="gpt-image-1",
                 prompt=enhanced_prompt,
                 size="1024x1024",
-                quality="hd",
-                style="natural",  # Natural style for home cooking feel
+                quality="medium",
                 n=1
             )
-            
-            # Download and save image
-            image_url = response.data[0].url
-            image_response = requests.get(image_url, timeout=30)
-            image_response.raise_for_status()
-            
-            # DALL-E returns PNG, so save with .png extension
+
+            # gpt-image-1 returns base64-encoded PNG (no URL to download)
+            image_bytes = base64.b64decode(response.data[0].b64_json)
+
+            # PNG output, so save with .png extension
             if save_path.endswith('.jpg') or save_path.endswith('.jpeg'):
                 save_path = save_path.rsplit('.', 1)[0] + '.png'
-            
+
             with open(save_path, 'wb') as f:
-                f.write(image_response.content)
-            
-            self._log_and_print(f"✅ DALL-E image saved: {save_path}")
+                f.write(image_bytes)
+
+            self._log_and_print(f"✅ Recipe image saved: {save_path}")
             return True
             
         except Exception as e:
