@@ -78,6 +78,7 @@ class MealTypeBackfiller:
             "applied": 0,
             "errors": 0,
             "unclassifiable": 0,
+            "already_classified": 0,
         }
         self.distribution: Dict[str, int] = {}
 
@@ -203,30 +204,39 @@ Return ONLY the meal type word, nothing else."""
             self._log(f"🎯 Processing first {len(recipes)} (limit applied)")
 
         for i, rec in enumerate(recipes):
-            rid = rec.get("id")
-            name = rec.get("name", "")
-            meal_type = seed_from_tags(rec.get("tag_names", []))
-            source = "tags"
-            if meal_type:
-                self.stats["seeded_from_tags"] += 1
-            else:
-                meal_type = self.classify_with_ai(name, rec.get("description", ""))
-                source = "ai"
+            try:
+                rid = rec.get("id")
+                name = rec.get("name", "")
+                # Resume: skip recipes already classified (idempotent re-runs are cheap).
+                if not dry_run and rec.get("meal_type"):
+                    self.stats["already_classified"] += 1
+                    continue
+                meal_type = seed_from_tags(rec.get("tag_names", []))
+                source = "tags"
                 if meal_type:
-                    self.stats["ai_classified"] += 1
-            if not meal_type:
-                self.stats["unclassifiable"] += 1
-                continue
-
-            self.distribution[meal_type] = self.distribution.get(meal_type, 0) + 1
-            if i < 12 or source == "ai":
-                self._log(f"   [{source}] {meal_type:9s} <- {name}")
-            if not dry_run:
-                if self.apply(rid, meal_type):
-                    self.stats["applied"] += 1
+                    self.stats["seeded_from_tags"] += 1
                 else:
-                    self.stats["errors"] += 1
-                time.sleep(0.03)
+                    meal_type = self.classify_with_ai(name, rec.get("description", ""))
+                    source = "ai"
+                    if meal_type:
+                        self.stats["ai_classified"] += 1
+                if not meal_type:
+                    self.stats["unclassifiable"] += 1
+                    continue
+
+                self.distribution[meal_type] = self.distribution.get(meal_type, 0) + 1
+                if i < 12 or source == "ai":
+                    self._log(f"   [{source}] {meal_type:9s} <- {name}")
+                if not dry_run:
+                    if self.apply(rid, meal_type):
+                        self.stats["applied"] += 1
+                    else:
+                        self.stats["errors"] += 1
+                    time.sleep(0.03)
+            except Exception as e:  # noqa: BLE001 — never let one recipe abort the whole run
+                self._log(f"   ❌ error on '{rec.get('name', rec.get('id'))}': {e}", "error")
+                self.stats["errors"] += 1
+                continue
             if (i + 1) % 100 == 0:
                 self._log(f"   ... {i + 1}/{len(recipes)}")
 
