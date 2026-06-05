@@ -14,8 +14,10 @@ that gap:
 1. Fetch all global ingredients from eKitchen
 2. Find those whose unit_conversions has no gram key (and whose cost_unit isn't already
    a gram unit)
-3. Fetch the gram->cost_unit conversion from Spoonacular (reusing the processor's
-   get_unit_conversions), with the AI estimate as a fallback
+3. Determine the gram->cost_unit factor:
+   - weight/volume cost units: Spoonacular convert, AI purchase-estimate fallback
+   - single-item cost units (small/medium/fruit/clove/...): AI per-item gram weight (N6b)
+   - packaging/ambiguous count units (bag/jar/can/...): skipped (weight ill-defined)
 4. PATCH the ingredient's unit_conversions (+ add "gram" to possible_units)
 
 Usage:
@@ -40,7 +42,7 @@ import requests
 
 # Match the canonical scripts/ import style (see backfill_dietary_classification.py).
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
-from services.ingredient_processor import DirectIngredientProcessor, load_env_file
+from services.ingredient_processor import DirectIngredientProcessor, load_env_file, SINGLE_ITEM_UNITS
 
 GRAM_KEYS = {"g", "gram", "grams"}
 
@@ -80,6 +82,7 @@ class GramAnchorBackfiller:
             "failed_fixes": 0,
             "skipped_no_cost_unit": 0,
             "skipped_count_unit": 0,
+            "fixed_via_item_weight": 0,
         }
 
     def _setup_logging(self, log_to_file: bool) -> logging.Logger:
@@ -200,16 +203,26 @@ class GramAnchorBackfiller:
         return None
 
     def fix(self, candidate: GramAnchorCandidate, dry_run: bool) -> str:
-        """Returns 'fixed', 'skipped' (count cost unit), or 'failed'."""
+        """Returns 'fixed', 'skipped' (unanchorable count unit), or 'failed'."""
         self._log(f"\n🔧 {'[DRY RUN] ' if dry_run else ''}{candidate.name} (cost_unit={candidate.cost_unit})")
 
-        # Count cost units (pepper/piece/can...) have no meaningful gram conversion — skip
-        # rather than guess, so we never write a wrong factor. (Saves the API call too.)
-        if candidate.cost_unit.lower() not in WEIGHT_VOLUME_UNITS:
+        cost_unit_l = candidate.cost_unit.lower()
+        via_item_weight = False
+        if cost_unit_l in WEIGHT_VOLUME_UNITS:
+            # Weight/volume cost unit: gram conversion via Spoonacular + AI purchase estimate.
+            gram_factor = self._fetch_gram_factor(candidate.name, candidate.cost_unit)
+        elif cost_unit_l in SINGLE_ITEM_UNITS:
+            # N6b: single edible item (small/medium/fruit/clove/...) — anchor via the AI
+            # per-item gram weight. 1 gram = (1 / grams_per_item) cost_units.
+            grams_per_item = self.processor.estimate_item_weight_grams(candidate.name, candidate.cost_unit)
+            gram_factor = (1.0 / grams_per_item) if (grams_per_item and grams_per_item > 0) else None
+            via_item_weight = True
+        else:
+            # Packaging/ambiguous count unit (bag/jar/can/package...) — weight ill-defined,
+            # skip rather than write a bogus factor (a wrong factor is worse than none).
             self._log(f"   ⏭️  Skipping: count cost_unit '{candidate.cost_unit}' — gram conversion not meaningful", "warning")
             return "skipped"
 
-        gram_factor = self._fetch_gram_factor(candidate.name, candidate.cost_unit)
         if gram_factor is None:
             self._log("   ❌ Could not determine a gram conversion", "error")
             return "failed"
@@ -221,10 +234,17 @@ class GramAnchorBackfiller:
         if not any(u.lower() in GRAM_KEYS for u in possible_units):
             possible_units.append("gram")
 
-        self._log(f"   ✅ 1 gram = {gram_factor} {candidate.cost_unit}  (now {len(conversions)} conversions)")
+        src = " (via AI item-weight)" if via_item_weight else ""
+        self._log(f"   ✅ 1 gram = {gram_factor:.5f} {candidate.cost_unit}{src}  (now {len(conversions)} conversions)")
         if dry_run:
+            if via_item_weight:
+                self.stats["fixed_via_item_weight"] += 1
             return "fixed"
-        return "fixed" if self.update_ingredient(candidate.id, possible_units, conversions) else "failed"
+        if self.update_ingredient(candidate.id, possible_units, conversions):
+            if via_item_weight:
+                self.stats["fixed_via_item_weight"] += 1
+            return "fixed"
+        return "failed"
 
     def update_ingredient(self, ingredient_id: str, possible_units: List[str], conversions: Dict[str, float]) -> bool:
         try:

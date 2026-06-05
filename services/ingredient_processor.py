@@ -88,6 +88,18 @@ class IngredientData:
         if self.possible_units is None:
             self.possible_units = ["cup", "tbsp", "tsp", "oz", "lb", "g", "kg"]
 
+
+# Single-edible-item cost-unit descriptors that have a well-defined per-item gram weight,
+# so grams can be AI-anchored (N6b). Deliberately EXCLUDES packaging/bulk units
+# (bag/jar/can/package/box/bottle/container/...) whose weight varies wildly — anchoring
+# those would massively misstate nutrition. Mirrors the backend's wholeItemKeys whitelist.
+SINGLE_ITEM_UNITS = {
+    "medium", "medium whole", "whole", "each", "piece", "large", "small",
+    "fruit", "clove", "floret", "leaf", "slice", "sprig", "stalk", "rib",
+    "ear", "fillet", "wedge", "link", "half", "head", "bulb", "stick",
+}
+
+
 class DirectIngredientProcessor:
     def __init__(self, log_to_file: bool = True):
         # Load environment configuration
@@ -1453,6 +1465,79 @@ Return ONLY the JSON, no other text."""
             self._log_and_print(f"   ❌ AI nutrition estimation failed for '{ingredient_name}': {e}")
             return None
 
+    def estimate_item_weight_grams(self, ingredient_name: str, item_unit: str) -> Optional[float]:
+        """Use OpenAI to estimate the weight in grams of ONE whole edible item.
+
+        Used to anchor grams for count-cost-unit produce (e.g. cost_unit "small" onion,
+        "fruit" lemon, "medium whole" tomato) that Spoonacular can't gram-convert. Only
+        meaningful for single-item descriptors — callers must NOT pass packaging units
+        (bag/jar/can/...), whose weight is ill-defined. Returns grams (1..5000) or None.
+        """
+        if not self.openai_client:
+            self._log_and_print(f"   ⚠️ OpenAI not available for item-weight estimation of '{ingredient_name}'")
+            return None
+
+        try:
+            prompt = f"""Estimate the typical edible weight in grams of ONE "{item_unit}" of "{ingredient_name}".
+
+This is the weight of a single whole item as commonly used in a recipe (e.g. one medium
+onion, one fruit lemon, one clove of garlic).
+
+Provide your answer in this EXACT JSON format (number only, grams):
+{{"grams": [grams for one {item_unit}]}}
+
+Rules:
+- Use well-known reference weights for the food at the given size descriptor.
+- Account for the size word ("small" < "medium" < "large").
+- If "{ingredient_name}" is not a single countable edible item (e.g. a liquid, powder,
+  or bulk package), return {{"grams": 0}}.
+
+Examples:
+- one small onion: {{"grams": 70}}
+- one medium whole tomato: {{"grams": 123}}
+- one fruit lemon: {{"grams": 58}}
+- one clove garlic: {{"grams": 3}}
+- one rib green onion: {{"grams": 15}}
+
+Return ONLY the JSON, no other text."""
+
+            response = self.openai_client.chat.completions.create(
+                model="gpt-4o",
+                messages=[{"role": "user", "content": prompt}],
+                max_tokens=40,
+                temperature=0.1,
+            )
+            response_text = response.choices[0].message.content.strip()
+            if response_text.startswith('```json'):
+                response_text = response_text.replace('```json', '').replace('```', '').strip()
+            elif response_text.startswith('```'):
+                response_text = response_text.replace('```', '').strip()
+
+            try:
+                data = json.loads(response_text)
+            except json.JSONDecodeError:
+                self._log_and_print(f"   ⚠️ AI item-weight invalid JSON for '{ingredient_name}': {response_text}")
+                return None
+
+            if 'grams' not in data:
+                self._log_and_print(f"   ⚠️ AI item-weight missing 'grams' for '{ingredient_name}'")
+                return None
+            try:
+                grams = float(data['grams'])
+            except (TypeError, ValueError):
+                self._log_and_print(f"   ⚠️ AI item-weight non-numeric for '{ingredient_name}'")
+                return None
+            if not (0 < grams <= 5000):
+                # 0 = AI says not a countable item; >5000 = implausible single item.
+                self._log_and_print(f"   ⚠️ AI item-weight not usable ({grams}g) for '{item_unit} {ingredient_name}'")
+                return None
+
+            self._log_and_print(f"   ⚖️ AI item-weight: 1 {item_unit} {ingredient_name} = {grams:.0f}g")
+            return grams
+        except Exception as e:
+            self._log_and_print(f"   ❌ AI item-weight estimation failed for '{ingredient_name}': {e}")
+            return None
+
     def get_unit_conversions(self, ingredient_name: str, possible_units: List[str], cost_unit: str) -> Dict[str, float]:
         """Get conversion factors from all possible units to the cost unit"""
         api_key = self.spoonacular_config.get('api_key')
@@ -1533,10 +1618,19 @@ Return ONLY the JSON, no other text."""
         
         # Always include the identity conversion (cost_unit to itself)
         conversions[cost_unit] = 1.0
-        
+
+        # N6b: if Spoonacular couldn't anchor grams and the cost unit is a single edible
+        # item (small/medium/fruit/clove/...), AI-estimate the per-item gram weight so the
+        # ingredient still gets a gram anchor. 1 gram = (1 / grams_per_item) cost_units.
+        if not any(k.lower() in ('g', 'gram', 'grams') for k in conversions) \
+                and cost_unit and cost_unit.lower() in SINGLE_ITEM_UNITS:
+            grams_per_item = self.estimate_item_weight_grams(ingredient_name, cost_unit)
+            if grams_per_item and grams_per_item > 0:
+                conversions['gram'] = 1.0 / grams_per_item
+
         self._log_and_print(f"   📄 Got {len(conversions)} conversion factors")
         return conversions
-    
+
     def estimate_purchase_unit_conversion(self, ingredient_name: str, purchase_unit: str, cost_unit: str, purchase_quantity: float) -> float:
         """Use AI to estimate how purchase unit converts to cost unit"""
         if not self.openai_client:
@@ -1646,6 +1740,14 @@ Return ONLY a number (the conversion factor)."""
             if gram_conversion and gram_conversion > 0:
                 conversions['gram'] = gram_conversion
                 self._log_and_print(f"     ✅ Gram anchor: 1 gram = {gram_conversion} {cost_unit}")
+            elif cost_unit and cost_unit.lower() in SINGLE_ITEM_UNITS:
+                # N6b: single edible item (small/medium/fruit/...) — anchor via per-item weight.
+                grams_per_item = self.estimate_item_weight_grams(ingredient_name, cost_unit)
+                if grams_per_item and grams_per_item > 0:
+                    conversions['gram'] = 1.0 / grams_per_item
+                    self._log_and_print(f"     ✅ Gram anchor (item-weight): 1 {cost_unit} = {grams_per_item:.0f}g")
+                else:
+                    self._log_and_print(f"     ⚠️ Could not anchor grams for {ingredient_name}", 'warning')
             else:
                 self._log_and_print(f"     ⚠️ Could not anchor grams for {ingredient_name}", 'warning')
 
