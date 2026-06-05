@@ -1538,6 +1538,77 @@ Return ONLY the JSON, no other text."""
             self._log_and_print(f"   ❌ AI item-weight estimation failed for '{ingredient_name}': {e}")
             return None
 
+    def estimate_grams_per_cup(self, ingredient_name: str) -> Optional[float]:
+        """Use OpenAI to estimate the weight in grams of ONE US cup of this ingredient.
+
+        Used to add a volume->gram density anchor (N7b) for ingredients measured by cup/
+        tbsp/tsp that lack one. With a cup anchor present the backend's unit bridge derives
+        tablespoon/teaspoon/fluid-ounce automatically. Returns grams (1..1000) or None.
+        """
+        if not self.openai_client:
+            self._log_and_print(f"   ⚠️ OpenAI not available for cup-density estimation of '{ingredient_name}'")
+            return None
+
+        try:
+            prompt = f"""Estimate the weight in grams of ONE US cup (237 ml) of: "{ingredient_name}"
+
+This is the standard cooking density (how much one packed/standard cup weighs).
+
+Provide your answer in this EXACT JSON format (number only, grams):
+{{"grams_per_cup": [grams in one cup]}}
+
+Rules:
+- Use well-known cooking reference densities.
+- For chopped/loose items use the typical chopped-cup weight.
+- If "{ingredient_name}" is not something measured by volume (e.g. a whole large item
+  or non-food), return {{"grams_per_cup": 0}}.
+
+Examples:
+- granulated sugar: {{"grams_per_cup": 200}}
+- all-purpose flour: {{"grams_per_cup": 125}}
+- chicken broth: {{"grams_per_cup": 240}}
+- chopped parsley: {{"grams_per_cup": 60}}
+- cornstarch: {{"grams_per_cup": 128}}
+
+Return ONLY the JSON, no other text."""
+
+            response = self.openai_client.chat.completions.create(
+                model="gpt-4o",
+                messages=[{"role": "user", "content": prompt}],
+                max_tokens=40,
+                temperature=0.1,
+            )
+            response_text = response.choices[0].message.content.strip()
+            if response_text.startswith('```json'):
+                response_text = response_text.replace('```json', '').replace('```', '').strip()
+            elif response_text.startswith('```'):
+                response_text = response_text.replace('```', '').strip()
+
+            try:
+                data = json.loads(response_text)
+            except json.JSONDecodeError:
+                self._log_and_print(f"   ⚠️ AI cup-density invalid JSON for '{ingredient_name}': {response_text}")
+                return None
+
+            if 'grams_per_cup' not in data:
+                self._log_and_print(f"   ⚠️ AI cup-density missing field for '{ingredient_name}'")
+                return None
+            try:
+                grams = float(data['grams_per_cup'])
+            except (TypeError, ValueError):
+                self._log_and_print(f"   ⚠️ AI cup-density non-numeric for '{ingredient_name}'")
+                return None
+            if not (0 < grams <= 1000):
+                # 0 = not volume-measured; >1000 = implausible for one cup of food.
+                self._log_and_print(f"   ⚠️ AI cup-density not usable ({grams}g) for '{ingredient_name}'")
+                return None
+
+            self._log_and_print(f"   🥣 AI cup-density: 1 cup {ingredient_name} = {grams:.0f}g")
+            return grams
+        except Exception as e:
+            self._log_and_print(f"   ❌ AI cup-density estimation failed for '{ingredient_name}': {e}")
+            return None
+
     def get_unit_conversions(self, ingredient_name: str, possible_units: List[str], cost_unit: str) -> Dict[str, float]:
         """Get conversion factors from all possible units to the cost unit"""
         api_key = self.spoonacular_config.get('api_key')
