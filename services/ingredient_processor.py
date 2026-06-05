@@ -1380,7 +1380,79 @@ Return ONLY the JSON, no other text."""
         except Exception as e:
             self._log_and_print(f"   ❌ AI cost estimation failed for '{ingredient_name}': {e}")
             return None
-    
+
+    def estimate_nutrition_with_ai(self, ingredient_name: str) -> Optional[Dict[str, float]]:
+        """Use OpenAI to estimate per-100g nutrition when Spoonacular has no data.
+
+        Returns {calories, protein, fat, carbohydrates, sugar} per 100g, or None. Values
+        are approximate (caller should flag them as AI-sourced). Calories are sanity-capped
+        — nothing edible exceeds ~900 kcal/100g (pure fat).
+        """
+        if not self.openai_client:
+            self._log_and_print(f"   ⚠️ OpenAI not available for nutrition estimation of '{ingredient_name}'")
+            return None
+
+        try:
+            prompt = f"""Estimate the nutrition per 100 grams of this food ingredient: "{ingredient_name}"
+
+Provide typical USDA-style values in this EXACT JSON format (numbers only, per 100g):
+{{
+  "calories": [kcal per 100g],
+  "protein": [grams per 100g],
+  "fat": [grams per 100g],
+  "carbohydrates": [grams per 100g],
+  "sugar": [grams per 100g]
+}}
+
+Rules:
+- Use well-known reference values for the food.
+- For a blend/compound name (e.g. "salt and pepper"), estimate the dominant edible component.
+- If it is not a real edible food, return all zeros.
+
+Examples:
+- egg white: {{"calories": 52, "protein": 11, "fat": 0.2, "carbohydrates": 0.7, "sugar": 0.7}}
+- olive oil: {{"calories": 884, "protein": 0, "fat": 100, "carbohydrates": 0, "sugar": 0}}
+- cayenne powder: {{"calories": 318, "protein": 12, "fat": 17, "carbohydrates": 57, "sugar": 10}}
+
+Return ONLY the JSON, no other text."""
+
+            response = self.openai_client.chat.completions.create(
+                model="gpt-4o",
+                messages=[{"role": "user", "content": prompt}],
+                max_tokens=120,
+                temperature=0.1,
+            )
+            response_text = response.choices[0].message.content.strip()
+            if response_text.startswith('```json'):
+                response_text = response_text.replace('```json', '').replace('```', '').strip()
+            elif response_text.startswith('```'):
+                response_text = response_text.replace('```', '').strip()
+
+            try:
+                data = json.loads(response_text)
+            except json.JSONDecodeError:
+                self._log_and_print(f"   ⚠️ AI nutrition returned invalid JSON for '{ingredient_name}': {response_text}")
+                return None
+
+            required = ['calories', 'protein', 'fat', 'carbohydrates', 'sugar']
+            if not all(f in data for f in required):
+                self._log_and_print(f"   ⚠️ AI nutrition missing fields for '{ingredient_name}'")
+                return None
+            try:
+                nutrition = {k: float(data[k]) for k in required}
+            except (TypeError, ValueError):
+                self._log_and_print(f"   ⚠️ AI nutrition non-numeric for '{ingredient_name}'")
+                return None
+            if not (0 <= nutrition['calories'] <= 1000):
+                self._log_and_print(f"   ⚠️ AI nutrition implausible calories ({nutrition['calories']}) for '{ingredient_name}'")
+                return None
+
+            self._log_and_print(f"   🥗 AI nutrition: {nutrition['calories']:.0f} cal/100g for '{ingredient_name}'")
+            return nutrition
+        except Exception as e:
+            self._log_and_print(f"   ❌ AI nutrition estimation failed for '{ingredient_name}': {e}")
+            return None
+
     def get_unit_conversions(self, ingredient_name: str, possible_units: List[str], cost_unit: str) -> Dict[str, float]:
         """Get conversion factors from all possible units to the cost unit"""
         api_key = self.spoonacular_config.get('api_key')

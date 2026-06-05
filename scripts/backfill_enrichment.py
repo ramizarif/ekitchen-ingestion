@@ -231,6 +231,19 @@ def build_update_payload(ingredient: Dict[str, Any],
             update["category"] = ai_category
             update_mask.append("Category")
 
+    # AI fallback for nutrition if calories still missing after Spoonacular. Many
+    # calorie-missing ingredients have compound/odd names Spoonacular can't find, so GPT
+    # per-100g estimates are the only path to coverage (flagged as AI-sourced).
+    if current_calories == 0 and "Calories" not in update_mask:
+        ai_nutrition = processor.estimate_nutrition_with_ai(name)
+        if ai_nutrition and ai_nutrition.get("calories", 0) > 0:
+            update["calories"] = ai_nutrition["calories"]
+            update["protein"] = ai_nutrition["protein"]
+            update["fat"] = ai_nutrition["fat"]
+            update["carbohydrates"] = ai_nutrition["carbohydrates"]
+            update["sugar"] = ai_nutrition["sugar"]
+            update_mask.extend(["Calories", "Protein", "Fat", "Carbohydrates", "Sugar"])
+
     # AI fallback for cost if still missing after Spoonacular
     if current_cost == 0 and "EstimatedCostValue" not in update_mask:
         source = "ai"
