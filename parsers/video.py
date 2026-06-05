@@ -400,11 +400,25 @@ class VideoParser(BaseParser):
                 download_info = self._download_audio(resolved_url, audio_path)
 
                 if not download_info.get('success'):
-                    return ParseResult(
-                        success=False,
-                        error_code="DOWNLOAD_FAILED",
-                        error_message=download_info.get('error', 'Failed to download audio'),
-                        parser_name=self.parser_name
+                    # Audio download/extraction failed. Common causes: ffprobe can't
+                    # read the audio codec, the reel has no audio track, or the chosen
+                    # format has no usable audio stream. Rather than hard-failing, fall
+                    # back to vision-only extraction on the full video (frames don't
+                    # need a usable audio stream). Only give up if the *video* can't be
+                    # fetched either.
+                    audio_error = download_info.get('error', 'Failed to download audio')
+                    logger.warning(
+                        f"Audio download failed ({audio_error[:160]}); "
+                        f"falling back to vision-only extraction"
+                    )
+                    return self._vision_only_fallback(
+                        platform=platform,
+                        url=url,
+                        resolved_url=resolved_url,
+                        temp_dir=temp_dir,
+                        tikwm_metadata=tikwm_metadata,
+                        start_time=start_time,
+                        audio_error=audio_error,
                     )
 
             # Add metadata to download_info for downstream methods
@@ -669,6 +683,97 @@ class VideoParser(BaseParser):
                     shutil.rmtree(temp_dir)
                 except Exception as e:
                     logger.warning(f"Failed to cleanup temp dir: {e}")
+
+    def _vision_only_fallback(
+        self,
+        platform: str,
+        url: str,
+        resolved_url: str,
+        temp_dir: str,
+        tikwm_metadata: Optional[Dict[str, Any]],
+        start_time: float,
+        audio_error: str,
+    ) -> ParseResult:
+        """
+        Vision-only extraction used when the audio pipeline can't run.
+
+        Downloads the full video and extracts a recipe from key frames via
+        GPT-4 Vision, with no audio transcript. This recovers reels where audio
+        extraction fails (e.g. ffprobe "unable to obtain file audio codec",
+        no audio track) but the visual content is still a usable recipe.
+
+        Returns a successful ParseResult on success, or a failure ParseResult
+        (DOWNLOAD_FAILED if the video itself can't be fetched, otherwise
+        RECIPE_EXTRACTION_FAILED) so the caller can return it directly.
+        """
+        platform_config = self._get_platform_config(platform)
+        frames_used = platform_config['max_frames']
+
+        # Download the full video (frame extraction doesn't need a usable audio stream).
+        try:
+            video_path = self._download_video_for_platform(
+                platform, resolved_url, temp_dir, tikwm_metadata
+            )
+        except Exception as e:
+            logger.error(f"Vision fallback: video download failed: {e}")
+            return ParseResult(
+                success=False,
+                error_code="DOWNLOAD_FAILED",
+                # Surface the original audio error too; the video download is the
+                # secondary failure that closed off the fallback.
+                error_message=f"Audio extraction failed ({audio_error}); "
+                              f"video fallback also failed: {e}",
+                parser_name=self.parser_name,
+            )
+
+        frames = self._extract_key_frames(video_path, num_frames=frames_used)
+        if not frames:
+            return ParseResult(
+                success=False,
+                error_code="DOWNLOAD_FAILED",
+                error_message=f"Audio extraction failed ({audio_error}); "
+                              f"could not extract frames from video for vision fallback",
+                parser_name=self.parser_name,
+            )
+
+        final_recipe = self._vision_extract_recipe(
+            frames=frames,
+            audio_transcript=None,
+            video_metadata={'platform': platform, 'url': url},
+            platform=platform,
+        )
+
+        if not final_recipe:
+            return ParseResult(
+                success=False,
+                error_code="RECIPE_EXTRACTION_FAILED",
+                error_message="Could not extract recipe from video (vision fallback)",
+                parser_name=self.parser_name,
+                extraction_method="vision_only",
+                frames_used=len(frames),
+            )
+
+        warnings = self._generate_warnings(final_recipe)
+        processing_time_ms = int((time.time() - start_time) * 1000)
+
+        logger.info(
+            f"✓ Recovered recipe via vision-only fallback: "
+            f"{final_recipe.get('name', 'Unknown')} ({len(frames)} frames)"
+        )
+
+        return ParseResult(
+            success=True,
+            data=final_recipe,
+            parser_name=self.parser_name,
+            confidence_score=0.0,  # No audio confidence; recipe came from frames.
+            warnings=warnings,
+            extraction_method="vision_only",
+            frames_used=len(frames),
+            estimated_cost=self._estimate_cost("vision_only", frames_used=len(frames)),
+            fallback_reason="audio_download_failed",
+            processing_time_ms=processing_time_ms,
+            output_tokens=500,
+        )
 
     def _fetch_tiktok_metadata_via_tikwm(self, url: str) -> Dict[str, Any]:
         """
