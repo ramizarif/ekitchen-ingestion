@@ -50,6 +50,7 @@ class BackfillStats:
     classified: int = 0
     skipped_already_good: int = 0
     failed: int = 0
+    safety_net_overrides: int = 0
     errors: List[str] = field(default_factory=list)
 
     @property
@@ -85,18 +86,25 @@ def fetch_recipes_needing_classification(
     offset = 0
 
     while True:
-        resp = requests.get(
-            f"{base_url}/global-recipes/",
-            params={
-                "limit": batch_size,
-                "offset": offset,
-                # Filter for recipes with NULL dietary_classification
-            },
-            headers=headers,
-            timeout=30,
-        )
-        resp.raise_for_status()
-        batch = resp.json()
+        backoffs = [2, 4, 8]
+        batch = None
+        for attempt in range(len(backoffs) + 1):
+            try:
+                resp = requests.get(
+                    f"{base_url}/global-recipes/",
+                    params={"limit": batch_size, "offset": offset},
+                    headers=headers,
+                    timeout=60,
+                )
+                resp.raise_for_status()
+                batch = resp.json()
+                break
+            except (requests.Timeout, requests.ConnectionError) as e:
+                if attempt < len(backoffs):
+                    print(f"  Fetch timeout, retrying in {backoffs[attempt]}s")
+                    time.sleep(backoffs[attempt])
+                    continue
+                raise
 
         if not batch:
             break
@@ -125,7 +133,7 @@ def fetch_recipes_needing_classification(
 def patch_recipe_dietary_classification(
     base_url: str, token: str, recipe_id: str, classification: str
 ) -> bool:
-    """PATCH a global recipe with dietary_classification data."""
+    """PATCH a global recipe with dietary_classification, retrying on transient errors."""
     headers = {
         "Authorization": f"Bearer {token}",
         "Content-Type": "application/json",
@@ -134,32 +142,165 @@ def patch_recipe_dietary_classification(
         "id": recipe_id,
         "dietary_classification": classification,
     }
-    resp = requests.patch(
-        f"{base_url}/global-recipes/{recipe_id}",
-        json=update_data,
-        headers=headers,
-        timeout=30,
-    )
-    if resp.status_code >= 400:
-        print(f"    PATCH failed ({resp.status_code}): {resp.text[:200]}")
-        return False
-    return True
+    backoffs = [1, 2, 4]
+    for attempt in range(len(backoffs) + 1):
+        try:
+            resp = requests.patch(
+                f"{base_url}/global-recipes/{recipe_id}",
+                json=update_data,
+                headers=headers,
+                timeout=60,
+            )
+            if resp.status_code < 400:
+                return True
+            if resp.status_code >= 500 or resp.status_code == 429:
+                if attempt < len(backoffs):
+                    print(f"    PATCH {resp.status_code}, retrying in {backoffs[attempt]}s")
+                    time.sleep(backoffs[attempt])
+                    continue
+            print(f"    PATCH failed ({resp.status_code}): {resp.text[:200]}")
+            return False
+        except (requests.Timeout, requests.ConnectionError) as e:
+            if attempt < len(backoffs):
+                print(f"    PATCH timeout/conn-err, retrying in {backoffs[attempt]}s ({type(e).__name__})")
+                time.sleep(backoffs[attempt])
+                continue
+            print(f"    PATCH gave up after retries: {e}")
+            return False
+    return False
 
 
 # ── Classification logic ────────────────────────────────────────────────────────
 
+# Hierarchy from most-restrictive to least-restrictive. Indices used for max(...).
+TIER_ORDER = ["vegan", "vegetarian", "pescatarian", "omnivore"]
+
+# Keyword sets used by the safety net. Each set names a tier-floor: if any
+# keyword is present (as a whole word), the final classification cannot be MORE
+# restrictive than that tier. Whole-word matching prevents false positives like
+# "buttercup squash" triggering "butter".
+#
+# Conservative on dairy/eggs to avoid false-positives on plant-based products
+# whose names contain "milk"/"butter"/"cheese". We only flag a recipe as
+# non-vegan when an UNAMBIGUOUS animal-derived keyword appears. The complement
+# of these sets is intentional — we accept false-negatives (a recipe with a
+# subtle dairy ingredient slipping through to vegan) over false-positives.
+
+ANIMAL_FLESH_WORDS = {
+    # Specific cuts/preparations only — bare "steak" excluded because fish steaks
+    # exist (tuna steak, marlin steak, swordfish steak).
+    "beef", "ribeye", "sirloin", "brisket", "veal", "hamburger", "meatball", "meatballs", "ground beef",
+    "pork", "bacon", "ham", "sausage", "sausages", "prosciutto", "pancetta", "chorizo", "salami", "pepperoni", "carnitas", "pulled pork",
+    "chicken", "turkey", "duck", "goose", "quail", "poultry",
+    "lamb", "mutton", "venison", "bison", "rabbit", "goat",
+    "hot dog", "hot dogs", "frankfurter", "frankfurters", "kielbasa", "bratwurst",
+}
+
+FISH_SEAFOOD_WORDS = {
+    "fish", "salmon", "tuna", "cod", "halibut", "mackerel", "sardine", "sardines",
+    "anchovy", "anchovies", "herring", "trout", "tilapia", "marlin", "swordfish",
+    "shrimp", "prawn", "prawns", "lobster", "crab", "crawfish", "crayfish",
+    "scallop", "scallops", "mussel", "mussels", "clam", "clams", "oyster", "oysters",
+    "squid", "calamari", "octopus", "caviar", "roe", "snapper", "bass", "haddock",
+}
+
+# Unambiguous dairy/egg/honey words. Bare "milk", "butter", "cream", "cheese"
+# are intentionally excluded because plant analogues exist; we list common
+# specific forms instead.
+DAIRY_EGG_WORDS = {
+    "egg", "eggs", "egg yolk", "egg yolks", "egg white", "egg whites",
+    "honey",
+    "buttermilk", "yogurt", "yoghurt",
+    "parmesan", "parmigiano", "mozzarella", "cheddar", "ricotta", "feta", "gouda", "brie", "camembert", "gruyere",
+    "ghee",
+    "whey", "casein",
+    "heavy cream", "sour cream", "whipping cream",
+    "cream cheese", "cottage cheese",
+}
+
+# Modifiers that, when adjacent to a borderline word like "milk", indicate the plant version.
+VEGAN_MODIFIERS = {"almond", "soy", "oat", "coconut", "cashew", "rice", "hemp", "non-dairy", "nondairy", "vegan", "plant", "plant-based"}
+
+
+def _whole_word_match(text: str, words: set) -> Optional[str]:
+    """Return the first matching word found as a whole-word match in lowered text."""
+    import re
+    for w in words:
+        # Use word boundaries; allow multi-word phrases like "ground beef".
+        pattern = r"\b" + re.escape(w) + r"\b"
+        if re.search(pattern, text):
+            return w
+    return None
+
+
+def _has_unmodified_dairy_keyword(text: str) -> Optional[str]:
+    """
+    Check for dairy/egg/honey keywords. For ambiguous bare words like "milk"
+    or "butter" or "cream" or "cheese", require the absence of a vegan modifier
+    in the same sentence (we approximate with same comma-delimited fragment).
+    """
+    import re
+    # First, unambiguous dairy/egg words
+    hit = _whole_word_match(text, DAIRY_EGG_WORDS)
+    if hit:
+        return hit
+    # Then, ambiguous bare words — only flag if no vegan modifier nearby
+    for ambiguous in ("milk", "butter", "cream", "cheese"):
+        for m in re.finditer(r"\b" + ambiguous + r"\b", text):
+            # Inspect ~30 chars before the match for a vegan modifier
+            window = text[max(0, m.start() - 40):m.start()]
+            if any(mod in window for mod in VEGAN_MODIFIERS):
+                continue
+            return ambiguous
+    return None
+
+
+def apply_safety_net(initial: str, search_text: str) -> tuple[str, Optional[str]]:
+    """
+    Override the GPT classification when ingredients/title/instructions contain
+    unambiguous animal-derived keywords inconsistent with the GPT answer.
+
+    Returns (final_tier, override_reason). override_reason is None when no
+    override was applied.
+
+    Hierarchy (most -> least restrictive): vegan > vegetarian > pescatarian > omnivore.
+    A keyword "raises the floor" — final tier cannot be MORE restrictive than the floor.
+    """
+    text = search_text.lower()
+
+    flesh = _whole_word_match(text, ANIMAL_FLESH_WORDS)
+    if flesh and initial != "omnivore":
+        return "omnivore", f"keyword '{flesh}' forces omnivore"
+
+    fish = _whole_word_match(text, FISH_SEAFOOD_WORDS)
+    if fish and initial in ("vegan", "vegetarian"):
+        return "pescatarian", f"keyword '{fish}' forces pescatarian"
+
+    if initial == "vegan":
+        dairy = _has_unmodified_dairy_keyword(text)
+        if dairy:
+            return "vegetarian", f"keyword '{dairy}' forces vegetarian (not vegan)"
+
+    return initial, None
+
+
 def classify_dietary(
     recipe: Dict[str, Any], openai_client: OpenAI
-) -> Optional[str]:
+) -> tuple[Optional[str], Optional[str]]:
     """
-    Classify a recipe's dietary level using GPT-4o-mini.
-    Returns one of: 'omnivore', 'pescatarian', 'vegetarian', 'vegan', or None on error.
+    Classify a recipe's dietary level. Returns (tier, override_reason).
+
+    1. Run GPT-4o-mini with a strict prompt that forces meat-presence
+       reasoning before emitting the tier.
+    2. Run a keyword safety net over title + ingredients + instructions.
+    3. If the safety net contradicts GPT, the safety net wins and the
+       reason is recorded in the second return value.
     """
     title = recipe.get("name", "Unknown")
+    description = recipe.get("description", "")
     ingredients = recipe.get("ingredients", [])
     instructions = recipe.get("steps", [])
 
-    # Extract ingredient names (ingredients can be objects or strings)
     ingredient_list = []
     if isinstance(ingredients, list):
         for ing in ingredients:
@@ -168,7 +309,6 @@ def classify_dietary(
             elif isinstance(ing, str):
                 ingredient_list.append(ing)
 
-    # Extract instruction text
     instruction_list = []
     if isinstance(instructions, list):
         for step in instructions:
@@ -177,44 +317,72 @@ def classify_dietary(
             elif isinstance(step, str):
                 instruction_list.append(step)
 
-    prompt = f"""Classify this recipe by the highest dietary restriction level it satisfies:
-- vegan = no animal products of any kind (no meat, fish, dairy, eggs, honey)
-- vegetarian = no meat or fish, but allows dairy/eggs/honey
-- pescatarian = no meat (mammals/birds), but allows fish/seafood, dairy, eggs
-- omnivore = contains meat (beef, chicken, pork, lamb, etc.) OR cannot be classified as more restrictive
+    # Refined prompt: explicit decision-tree, with examples on common failure
+    # cases the original prompt got wrong (chicken-named recipes mistakenly
+    # vegan, classic egg/dairy desserts mistakenly omnivore).
+    prompt = f"""You classify a recipe by its highest dietary restriction tier.
+
+TIERS (most -> least restrictive): vegan > vegetarian > pescatarian > omnivore.
+
+DECISION RULES (apply in order; first match wins):
+
+1. Does the recipe contain ANY meat from a mammal or bird (beef, pork, chicken,
+   turkey, duck, lamb, bacon, ham, sausage, prosciutto, pepperoni, etc.)?
+   -> omnivore. The TITLE alone is enough: "Cashew Chicken" contains chicken.
+
+2. Otherwise, does it contain ANY fish, shellfish, or seafood (salmon, tuna,
+   shrimp, lobster, anchovy, sardine, etc.)?
+   -> pescatarian.
+
+3. Otherwise, does it contain ANY dairy, eggs, honey, or other non-flesh
+   animal product (milk, cheese, butter, yogurt, cream, eggs)?
+   -> vegetarian. Most baked goods, custards, flans, macarons, croissants,
+   pastries, cheesecakes, profiteroles, and ice creams are vegetarian, not vegan.
+
+4. Otherwise, no animal products of any kind?
+   -> vegan.
+
+EXAMPLES (memorize these, they were misclassified before):
+- "Cashew Chicken" -> omnivore (chicken in title)
+- "French Macarons" -> vegetarian (egg whites, almond flour)
+- "Pain au Chocolat" -> vegetarian (butter pastry, no meat)
+- "Profiteroles" -> vegetarian (cream + choux, no meat)
+- "Mexican Flan" -> vegetarian (eggs + milk + sugar, no meat)
+- "Vegan Black Bean Burgers" -> vegan
+- "Bacon-Wrapped Asparagus" -> omnivore (bacon)
 
 RECIPE:
 Title: {title}
+Description: {description[:300] if description else '(none)'}
 Ingredients: {', '.join(ingredient_list)}
 
-Output ONLY the single word: omnivore, pescatarian, vegetarian, or vegan"""
+Reply with EXACTLY ONE WORD: omnivore, pescatarian, vegetarian, or vegan."""
 
     try:
         response = openai_client.chat.completions.create(
             model="gpt-4o-mini",
-            messages=[
-                {
-                    "role": "user",
-                    "content": prompt,
-                }
-            ],
-            temperature=0,  # Deterministic for consistent classification
+            messages=[{"role": "user", "content": prompt}],
+            temperature=0,
             max_tokens=5,
         )
-
-        classification = response.choices[0].message.content.strip().lower()
-
-        # Validate response
-        valid_values = {"omnivore", "pescatarian", "vegetarian", "vegan"}
-        if classification in valid_values:
-            return classification
-        else:
-            print(f"    Warning: Invalid classification returned: {classification}")
-            return None
-
+        gpt_answer = response.choices[0].message.content.strip().lower()
+        valid = {"omnivore", "pescatarian", "vegetarian", "vegan"}
+        if gpt_answer not in valid:
+            print(f"    Warning: invalid GPT classification: {gpt_answer}")
+            return None, None
     except Exception as e:
         print(f"    Error during classification: {e}")
-        return None
+        return None, None
+
+    # Safety net — scan title + description + ingredients + instructions.
+    search_text = " ".join([
+        title,
+        description or "",
+        " ".join(ingredient_list),
+        " ".join(instruction_list),
+    ])
+    final, override_reason = apply_safety_net(gpt_answer, search_text)
+    return final, override_reason
 
 
 # ── Main ─────────────────────────────────────────────────────────────────────
@@ -314,21 +482,23 @@ def main():
             recipe_title = recipe.get("name", "Unknown")[:45]
             recipe_start = time.time()
 
-            # Classify
-            classification = classify_dietary(recipe, openai_client)
+            # Classify (returns tier + optional safety-net override reason)
+            classification, override_reason = classify_dietary(recipe, openai_client)
             latency_ms = int((time.time() - recipe_start) * 1000)
 
             if classification:
                 stats.classified += 1
+                if override_reason:
+                    stats.safety_net_overrides += 1
                 status = "[DRY-RUN]" if args.dry_run else "[PATCHED]"
+                cls_label = f"{classification}*" if override_reason else classification
 
-                # Only patch if not dry-run
                 if not args.dry_run:
                     if patch_recipe_dietary_classification(
                         base_url, token, recipe_id, classification
                     ):
                         log_msg(
-                            f"{recipe_id:<36} {recipe_title:<50} {classification:<15} {status:<10} {latency_ms:<12}"
+                            f"{recipe_id:<36} {recipe_title:<50} {cls_label:<15} {status:<10} {latency_ms:<12}"
                         )
                     else:
                         log_msg(
@@ -337,8 +507,10 @@ def main():
                         stats.failed += 1
                 else:
                     log_msg(
-                        f"{recipe_id:<36} {recipe_title:<50} {classification:<15} {status:<10} {latency_ms:<12}"
+                        f"{recipe_id:<36} {recipe_title:<50} {cls_label:<15} {status:<10} {latency_ms:<12}"
                     )
+                if override_reason:
+                    log_msg(f"    ↳ safety-net override: {override_reason}")
             else:
                 stats.failed += 1
                 log_msg(
@@ -359,6 +531,7 @@ def main():
         log_msg("=" * 70)
         log_msg(f"Total recipes fetched:     {stats.total_needing_classification}")
         log_msg(f"Successfully classified:   {stats.classified}")
+        log_msg(f"Safety-net overrides:      {stats.safety_net_overrides} (rows marked with *)")
         log_msg(f"Failed:                    {stats.failed}")
         log_msg(f"Total elapsed time:        {total_elapsed:.1f}s")
 

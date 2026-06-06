@@ -7,11 +7,31 @@ No image scraping - just URL discovery for the enhanced batch processor
 
 import json
 import os
+import re
 import time
 from pathlib import Path
 from playwright.sync_api import sync_playwright
 from urllib.parse import urlparse
 from typing import List, Dict, Optional
+
+# Per-site patterns matching a *recipe page* path (not category/search/collection
+# pages). Sites use different conventions: AllRecipes uses /recipe/<id>/ (singular)
+# while FoodNetwork/BBC/Epicurious use /recipes/ (plural) with distinct shapes.
+RECIPE_URL_PATTERNS = {
+    "allrecipes.com": re.compile(r"^/recipe/\d+/", re.I),
+    "foodnetwork.com": re.compile(r"^/recipes/.+-\d{3,}/?$", re.I),
+    "bbcgoodfood.com": re.compile(r"^/recipes/[a-z0-9][a-z0-9-]+/?$", re.I),
+    "epicurious.com": re.compile(r"^/recipes/food/views/[a-z0-9][a-z0-9-]+/?$", re.I),
+}
+# Generic fallback for sites without an explicit pattern.
+_FALLBACK_PATTERN = re.compile(r"/recipe/|/recipes/[a-z0-9-]+", re.I)
+# Path segments that indicate an index/collection/listing page, never a recipe.
+_EXCLUDE_SEGMENTS = {
+    "search", "collection", "collections", "category", "categories", "cuisine",
+    "cuisines", "course", "courses", "howto", "how-to", "budget", "health",
+    "occasion", "tag", "tags", "author", "authors", "photos", "packages",
+    "videos", "video", "articles", "reviews", "gallery", "a-z", "ingredients",
+}
 
 class SimplifiedRecipeDiscovery:
     def __init__(self, sites_config_path="src/mcp_servers/recipe_discovery_mcp/config/sites.json"):
@@ -78,49 +98,32 @@ class SimplifiedRecipeDiscovery:
                 # Wait for search results to load
                 page.wait_for_timeout(3000)
                 
-                # Extract recipe links with better filtering
-                recipe_links = page.eval_on_selector_all(
-                    "a[href]",
-                    """elements => elements
-                        .filter(el => {
-                            const href = el.href;
-                            if (!href || !href.startsWith('http')) return false;
-                            
-                            const text = el.textContent?.toLowerCase() || '';
-                            const title = el.title?.toLowerCase() || '';
-                            const href_lower = href.toLowerCase();
-                            
-                            // Must contain recipe indicators
-                            return href_lower.includes('/recipe/') && 
-                                   (text.includes('recipe') || 
-                                    text.includes('view') || 
-                                    text.length > 10 ||  // Recipe title links
-                                    title.includes('recipe') ||
-                                    href_lower.match(/\\/recipe\\/\\d+\\//));
-                        })
-                        .map(el => el.href)"""
+                # Grab every link on the page; filter in Python with per-site patterns.
+                all_hrefs = page.eval_on_selector_all(
+                    "a[href]", "elements => elements.map(el => el.href)"
                 )
-                
                 browser.close()
-                
-                # Clean up and filter URLs
-                recipe_urls = []
+
                 base_domain = urlparse(search_url).netloc
-                
-                for url in recipe_links:
-                    parsed_url = urlparse(url)
-                    
-                    # Must be from the same domain
-                    if parsed_url.netloc != base_domain:
+                site_pattern = RECIPE_URL_PATTERNS.get(site_domain, _FALLBACK_PATTERN)
+
+                recipe_urls = []
+                for url in all_hrefs:
+                    if not url or not url.startswith("http"):
                         continue
-                    
-                    # Filter out category pages, search pages, etc.
-                    if any(exclude in url.lower() for exclude in ['/search', '/category', '/tag', '/author']):
+                    parsed = urlparse(url)
+                    # Same site only (allow www / bare-domain variants)
+                    if parsed.netloc.replace("www.", "") != base_domain.replace("www.", ""):
                         continue
-                    
-                    recipe_urls.append(url)
-                
-                # Remove duplicates and return first few
+                    path = parsed.path
+                    # Skip index/collection/listing pages
+                    if any(seg in _EXCLUDE_SEGMENTS for seg in path.lower().split("/")):
+                        continue
+                    # Must match this site's recipe-page shape
+                    if not site_pattern.search(path):
+                        continue
+                    recipe_urls.append(url.split("?")[0])  # drop query/tracking params
+
                 unique_urls = list(dict.fromkeys(recipe_urls))
                 print(f"  ✅ Found {len(unique_urls)} recipe URLs")
                 return unique_urls[:3]  # Return first 3 unique URLs

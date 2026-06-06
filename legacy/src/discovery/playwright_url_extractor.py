@@ -7,9 +7,39 @@ Uses Playwright browser automation for intelligent URL extraction from search re
 import sys
 import os
 import json
+import re
 import time
 from typing import List, Optional, Dict
 from urllib.parse import urlparse, urljoin
+
+# Per-site patterns matching an INDIVIDUAL recipe-page path (not category/index
+# pages). Sites mix conventions — e.g. EatingWell uses /recipe/<id>/ for recipes
+# but /recipes/<id>/<category>/ for listings — so a single generic regex isn't
+# enough; match each verified site explicitly.
+_SITE_RECIPE_PATTERNS = {
+    "tasty.co": re.compile(r"^/recipe/[a-z0-9][a-z0-9-]+/?$", re.I),
+    "simplyrecipes.com": re.compile(r"^/recipes/[a-z0-9][a-z0-9_-]+/?$", re.I),
+    "eatingwell.com": re.compile(r"^/recipe/\d+/", re.I),
+    "allrecipes.com": re.compile(r"^/recipe/\d+/", re.I),
+    "foodnetwork.com": re.compile(r"^/recipes/.+-\d{3,}/?$", re.I),
+    "bbcgoodfood.com": re.compile(r"^/recipes/[a-z0-9][a-z0-9-]+/?$", re.I),
+    "epicurious.com": re.compile(r"^/recipes/food/views/[a-z0-9][a-z0-9-]+/?$", re.I),
+}
+# Generic fallback for sites without an explicit pattern (best-effort).
+_RECIPE_PATH = re.compile(r"(^|/)recipe/[a-z0-9]|/recipes/[a-z0-9][a-z0-9_-]{2,}", re.I)
+# Path segments that signal an index/listing page, never an individual recipe.
+# NOTE: never include 'recipe'/'recipes'/'food'/'views' here — they are part of
+# legitimate recipe paths.
+_EXCLUDE_SEGMENTS = {
+    "search", "collection", "collections", "category", "categories", "cuisine",
+    "cuisines", "course", "courses", "howto", "how-to", "occasion", "tag", "tags",
+    "author", "authors", "photos", "packages", "videos", "video", "articles",
+    "reviews", "gallery", "a-z", "ingredients", "page", "latest", "trending",
+    "popular", "profile", "login", "register", "breakfast", "lunch", "dinner",
+    "dessert", "desserts", "appetizer", "appetizers", "snacks", "drinks",
+    "mains", "sides",
+}
+_BAD_SUFFIXES = (".jpg", ".jpeg", ".png", ".gif", ".pdf", ".zip")
 
 
 class PlaywrightRecipeExtractor:
@@ -97,97 +127,24 @@ class PlaywrightRecipeExtractor:
                 except Exception:
                     print(f"⚠️  Could not get page title")
                 
-                # Extract recipe links with JavaScript filtering (more efficient and reliable)
-                print(f"🔗 Extracting recipe URLs using JavaScript evaluation...")
-                
+                # Grab every link on the page (plain JS, no filtering), then filter
+                # in Python with per-site-agnostic recipe patterns. This handles both
+                # singular '/recipe/' (Tasty, EatingWell) and plural '/recipes/<slug>'
+                # (SimplyRecipes, BBC, Epicurious) URL conventions.
+                print(f"🔗 Extracting recipe URLs...")
                 try:
-                    recipe_links = page.eval_on_selector_all(
-                        "a[href]",
-f"""elements => elements
-                            .filter(el => {{
-                                const href = el.href;
-                                if (!href || !href.startsWith('http')) return false;
-                                
-                                const text = el.textContent?.toLowerCase() || '';
-                                const title = el.title?.toLowerCase() || '';
-                                const href_lower = href.toLowerCase();
-                                
-                                // STRICT FILTERING: Must contain recipe indicators in URL
-                                const hasRecipeInUrl = href_lower.includes('/recipe/') || 
-                                                      href_lower.match(/\\/recipe\\/\\d+\\//);
-                                
-                                if (!hasRecipeInUrl) return false;
-                                
-                                // Additional validation for recipe content
-                                const hasRecipeContent = text.includes('recipe') || 
-                                                        text.includes('view') || 
-                                                        text.length > 10 ||  // Recipe title links
-                                                        title.includes('recipe');
-                                
-                                // Skip navigation, ads, social media links  
-                                const skipPatterns = ['/search', '/category', '/tag', '/author', 
-                                                    '/page', '/login', '/register', '/profile',
-                                                    '/latest', '/trending', '/popular',
-                                                    'facebook.', 'twitter.', 'instagram.',
-                                                    'pinterest.', 'youtube.', 'tiktok.',
-                                                    '.jpg', '.png', '.gif', '.pdf'];
-                                
-                                const shouldSkip = skipPatterns.some(pattern => 
-                                    href_lower.includes(pattern));
-                                
-                                return !shouldSkip && hasRecipeContent;
-                            }})
-                            .map(el => el.href)
-                            .slice(0, {max_urls})"""
+                    all_hrefs = page.eval_on_selector_all(
+                        "a[href]", "elements => elements.map(el => el.href)"
                     )
-                    
-                    recipe_urls = recipe_links
-                    print(f"✅ JavaScript extraction found {len(recipe_urls)} recipe URLs")
-                    
-                    for i, url in enumerate(recipe_urls[:5]):  # Show first 5
+                    recipe_urls = self._filter_recipe_urls(all_hrefs, search_url, max_urls)
+                    print(f"✅ Extraction found {len(recipe_urls)} recipe URLs")
+                    for i, url in enumerate(recipe_urls[:5]):
                         print(f"  {i+1}. {url}")
-                    
                     if len(recipe_urls) > 5:
                         print(f"  ... and {len(recipe_urls) - 5} more")
-                        
                 except Exception as e:
-                    print(f"❌ JavaScript extraction failed: {e}")
-                    print(f"⚠️  Falling back to manual link extraction...")
-                    
-                    # Fallback to manual extraction
-                    try:
-                        links = page.query_selector_all('a[href]')
-                        print(f"🔗 Found {len(links)} total links on page (fallback)")
-                        
-                        parsed_base = urlparse(search_url)
-                        base_domain = parsed_base.netloc
-                        
-                        for link in links:
-                            if len(recipe_urls) >= max_urls:
-                                break
-                                
-                            try:
-                                href = link.get_attribute('href')
-                                if not href:
-                                    continue
-                                
-                                # Convert relative URLs to absolute
-                                if href.startswith('/'):
-                                    href = urljoin(search_url, href)
-                                elif not href.startswith('http'):
-                                    continue
-                                
-                                # Check if it looks like a recipe URL
-                                if self._looks_like_recipe_url(href, base_domain):
-                                    recipe_urls.append(href)
-                                    print(f"  ✅ Found recipe URL: {href}")
-                            
-                            except Exception as e:
-                                continue  # Skip problematic links
-                                
-                    except Exception as e2:
-                        print(f"❌ Fallback extraction also failed: {e2}")
-                
+                    print(f"❌ Extraction failed: {e}")
+
                 if len(recipe_urls) == 0:
                     print(f"⚠️  No recipe URLs found - trying debug screenshot...")
                     try:
@@ -205,6 +162,34 @@ f"""elements => elements
             print(f"❌ Playwright extraction failed: {e}")
             return []
     
+    def _filter_recipe_urls(self, hrefs: List[str], search_url: str, max_urls: int) -> List[str]:
+        """Filter a flat list of hrefs down to same-site individual recipe pages."""
+        base = urlparse(search_url).netloc.replace("www.", "")
+        pattern = _SITE_RECIPE_PATTERNS.get(base, _RECIPE_PATH)
+        out: List[str] = []
+        for h in hrefs:
+            if not h or not h.startswith("http"):
+                continue
+            parsed = urlparse(h)
+            if parsed.netloc.replace("www.", "") != base:
+                continue
+            path = parsed.path
+            segs = {s for s in path.lower().strip("/").split("/") if s}
+            if segs & _EXCLUDE_SEGMENTS:
+                continue
+            if not pattern.search(path):
+                continue
+            if h.lower().split("?")[0].endswith(_BAD_SUFFIXES):
+                continue
+            out.append(h.split("?")[0])  # strip query/tracking params
+        # de-duplicate, preserve order
+        seen, uniq = set(), []
+        for u in out:
+            if u not in seen:
+                seen.add(u)
+                uniq.append(u)
+        return uniq[:max_urls]
+
     def _looks_like_recipe_url(self, url: str, base_domain: str) -> bool:
         """Heuristic to determine if a URL looks like a recipe page"""
         try:

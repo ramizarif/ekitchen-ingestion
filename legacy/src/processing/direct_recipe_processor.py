@@ -4,6 +4,7 @@ Direct Recipe Processor - Autonomous Recipe Ingestion Pipeline
 Handles complete recipe processing flow with direct API calls and OpenAI for AI decisions
 """
 
+import io
 import json
 import urllib.request
 import urllib.parse
@@ -18,9 +19,149 @@ from datetime import datetime
 from typing import Dict, List, Any, Optional, Tuple
 from dataclasses import dataclass
 from openai import OpenAI
+from PIL import Image
 
 # Import our existing ingredient processor
 from ingredient_processor_direct import DirectIngredientProcessor, IngredientData, load_env_file
+
+
+# Publisher/site names whose attribution gets baked into scraped titles.
+# Add new ones as they're encountered. The trailer-stripper below is
+# case-insensitive and handles common forms: "by X", "Recipe by X", "| X",
+# "- X", "(X)", and trailing whitespace/punctuation.
+# KEEP IN SYNC across: services/recipe_processor.py,
+# legacy/src/processing/direct_recipe_processor.py, scripts/backfill_recipe_names.py
+KNOWN_SOURCES = [
+    "Tasty", "Simply Recipes", "SimplyRecipes", "EatingWell", "Eating Well",
+    "Food Network", "Allrecipes", "All Recipes", "Epicurious", "BBC Good Food",
+    "Serious Eats", "Budget Bytes", "Delish", "Bon Appétit", "Bon Appetit",
+    "NYT Cooking", "Food.com", "The Kitchn", "Taste of Home",
+]
+
+
+def clean_recipe_title(title: str) -> str:
+    """Strip publisher attribution and a trailing 'Recipe' from a scraped title.
+    Handles 'X Recipe by Tasty', 'X by Tasty', 'X | Food Network',
+    'X - Simply Recipes', 'X (Epicurious)', 'X from EatingWell', and a bare
+    trailing 'Recipe'/'Recipes'. Case-insensitive; never returns empty."""
+    if not title:
+        return title
+    cleaned = title.strip()
+    for source in KNOWN_SOURCES:
+        s = re.escape(source)
+        for pat in (
+            rf"\s+Recipes?\s+by\s+{s}\s*$",
+            rf"\s+by\s+{s}\s*$",
+            rf"\s+from\s+{s}\s*$",
+            rf"\s*[|\-–—:]\s*{s}\s*$",
+            rf"\s*\(\s*{s}\s*\)\s*$",
+        ):
+            cleaned = re.sub(pat, "", cleaned, flags=re.IGNORECASE)
+    cleaned = re.sub(r"\s+Recipes?\s*$", "", cleaned, flags=re.IGNORECASE)
+    cleaned = re.sub(r"\s{2,}", " ", cleaned).strip(" |-–—:")
+    return cleaned.strip() or title.strip()
+
+
+# ── Dietary classification (mirror of scripts/backfill_dietary_classification.py) ──
+# These constants and helpers are kept in sync with the backfill script so
+# newly-ingested recipes get the same classification logic the corpus-wide
+# backfill applied. If you tweak one, mirror the change.
+
+DIETARY_TIER_ORDER = ["vegan", "vegetarian", "pescatarian", "omnivore"]
+
+DIETARY_FLESH_WORDS = {
+    "beef", "ribeye", "sirloin", "brisket", "veal", "hamburger", "meatball", "meatballs", "ground beef",
+    "pork", "bacon", "ham", "sausage", "sausages", "prosciutto", "pancetta", "chorizo", "salami", "pepperoni", "carnitas", "pulled pork",
+    "chicken", "turkey", "duck", "goose", "quail", "poultry",
+    "lamb", "mutton", "venison", "bison", "rabbit", "goat",
+    "hot dog", "hot dogs", "frankfurter", "frankfurters", "kielbasa", "bratwurst",
+}
+
+DIETARY_FISH_WORDS = {
+    "fish", "salmon", "tuna", "cod", "halibut", "mackerel", "sardine", "sardines",
+    "anchovy", "anchovies", "herring", "trout", "tilapia", "marlin", "swordfish",
+    "shrimp", "prawn", "prawns", "lobster", "crab", "crawfish", "crayfish",
+    "scallop", "scallops", "mussel", "mussels", "clam", "clams", "oyster", "oysters",
+    "squid", "calamari", "octopus", "caviar", "roe", "snapper", "bass", "haddock",
+}
+
+DIETARY_DAIRY_EGG_WORDS = {
+    "egg", "eggs", "egg yolk", "egg yolks", "egg white", "egg whites",
+    "honey",
+    "buttermilk", "yogurt", "yoghurt",
+    "parmesan", "parmigiano", "mozzarella", "cheddar", "ricotta", "feta", "gouda", "brie", "camembert", "gruyere",
+    "ghee",
+    "whey", "casein",
+    "heavy cream", "sour cream", "whipping cream",
+    "cream cheese", "cottage cheese",
+}
+
+DIETARY_VEGAN_MODIFIERS = {"almond", "soy", "oat", "coconut", "cashew", "rice", "hemp", "non-dairy", "nondairy", "vegan", "plant", "plant-based"}
+
+
+def _dietary_whole_word_match(text: str, words: set) -> Optional[str]:
+    for w in words:
+        if re.search(r"\b" + re.escape(w) + r"\b", text):
+            return w
+    return None
+
+
+def _dietary_has_unmodified_dairy(text: str) -> Optional[str]:
+    hit = _dietary_whole_word_match(text, DIETARY_DAIRY_EGG_WORDS)
+    if hit:
+        return hit
+    for ambiguous in ("milk", "butter", "cream", "cheese"):
+        for m in re.finditer(r"\b" + ambiguous + r"\b", text):
+            window = text[max(0, m.start() - 40):m.start()]
+            if any(mod in window for mod in DIETARY_VEGAN_MODIFIERS):
+                continue
+            return ambiguous
+    return None
+
+
+def _dietary_explicit_label(title: str, description: str) -> Optional[str]:
+    """If the recipe author's title or description explicitly states 'vegan' or
+    'vegetarian' as a whole word, return that tier. The author's stated intent
+    is the strongest signal we have — stronger than keyword scans of step text
+    that may mention veggie analogues like 'meatballs' (cannellini) or
+    'chicken' (plant-based)."""
+    text = f"{title or ''} {description or ''}".lower()
+    if re.search(r"\bvegan\b", text):
+        return "vegan"
+    if re.search(r"\bvegetarian\b", text):
+        return "vegetarian"
+    return None
+
+
+def _dietary_apply_safety_net(initial: str, search_text: str, title: str = "", description: str = "") -> Tuple[str, Optional[str]]:
+    """Override GPT classification when text contradicts it. Returns (final_tier, override_reason).
+
+    Order of precedence:
+    1. Explicit author label in title/description (vegan / vegetarian) — wins
+       absolutely, even over flesh keywords elsewhere in the recipe text.
+    2. Flesh keyword anywhere → omnivore.
+    3. Fish keyword anywhere → pescatarian (when GPT said vegan/vegetarian).
+    4. Unambiguous dairy/egg keyword → vegetarian (when GPT said vegan).
+    """
+    label = _dietary_explicit_label(title, description)
+    if label and initial != label:
+        return label, f"author labeled recipe '{label}' in title/description"
+    if label:
+        return label, None  # GPT already agreed, no override needed but anchor the result
+
+    text = search_text.lower()
+    flesh = _dietary_whole_word_match(text, DIETARY_FLESH_WORDS)
+    if flesh and initial != "omnivore":
+        return "omnivore", f"keyword '{flesh}' forces omnivore"
+    fish = _dietary_whole_word_match(text, DIETARY_FISH_WORDS)
+    if fish and initial in ("vegan", "vegetarian"):
+        return "pescatarian", f"keyword '{fish}' forces pescatarian"
+    if initial == "vegan":
+        dairy = _dietary_has_unmodified_dairy(text)
+        if dairy:
+            return "vegetarian", f"keyword '{dairy}' forces vegetarian"
+    return initial, None
+
 
 @dataclass
 class RecipeProcessingResult:
@@ -32,6 +173,7 @@ class RecipeProcessingResult:
     ingredients_processed: int = 0
     image_generated: bool = False
     processing_time_seconds: float = 0.0
+    skipped: bool = False  # True when the URL was skipped pre-work (e.g. duplicate title), not a real failure
 
 class DirectRecipeProcessor:
     """Autonomous recipe processor using direct API calls"""
@@ -54,6 +196,11 @@ class DirectRecipeProcessor:
         
         # Global ingredients cache for deduplication during ingestion
         self.global_ingredients_cache = {}
+
+        # Cached set of existing global-recipe names (lowercased, stripped) for
+        # duplicate detection. Lazily populated on first lookup; updated after
+        # every successful create.
+        self._existing_recipe_names: Optional[set] = None
     
     def _load_configuration(self) -> Dict[str, str]:
         """Load configuration from environment files"""
@@ -147,6 +294,60 @@ class DirectRecipeProcessor:
         else:
             self._log_and_print("❌ eKitchen credentials not found in configuration", 'error')
     
+    def _load_existing_recipe_names(self) -> set:
+        """Paginate /global-recipes/ and build a set of lowercased stripped names.
+        Cached on the instance — only paginates once per processor lifetime."""
+        if self._existing_recipe_names is not None:
+            return self._existing_recipe_names
+
+        names: set = set()
+        if not self.ekitchen_token:
+            self._log_and_print("⚠️  No eKitchen token; skipping duplicate-name pre-check")
+            self._existing_recipe_names = names
+            return names
+
+        base_url = self.ingredient_processor.ekitchen_base_url
+        headers = {"Authorization": f"Bearer {self.ekitchen_token}"}
+        offset = 0
+        batch_size = 200
+        try:
+            while True:
+                resp = requests.get(
+                    f"{base_url}/global-recipes/",
+                    params={"limit": batch_size, "offset": offset},
+                    headers=headers,
+                    timeout=60,
+                )
+                resp.raise_for_status()
+                batch = resp.json() or []
+                for r in batch:
+                    n = (r.get("name") or "").strip().lower()
+                    if n:
+                        names.add(n)
+                if len(batch) < batch_size:
+                    break
+                offset += batch_size
+        except Exception as e:
+            self._log_and_print(f"⚠️  Could not load existing recipe names ({e}); duplicate check disabled this session")
+
+        self._log_and_print(f"📚 Loaded {len(names)} existing recipe names for duplicate detection")
+        self._existing_recipe_names = names
+        return names
+
+    def _recipe_already_exists(self, title: str) -> bool:
+        """Check whether a recipe with this title already exists in eKitchen."""
+        if not title:
+            return False
+        return title.strip().lower() in self._load_existing_recipe_names()
+
+    def _remember_created_recipe(self, title: str) -> None:
+        """Add a freshly-created title to the cache so subsequent ingests in the same session see it."""
+        if not title:
+            return
+        if self._existing_recipe_names is None:
+            self._existing_recipe_names = set()
+        self._existing_recipe_names.add(title.strip().lower())
+
     def scrape_recipe_from_url(self, recipe_url: str) -> Optional[Dict[str, Any]]:
         """Scrape recipe data from URL using recipe-scrapers library"""
         self._log_and_print(f"🌐 Scraping recipe from: {recipe_url}")
@@ -156,19 +357,27 @@ class DirectRecipeProcessor:
             from recipe_scrapers import scrape_me
             
             scraper = scrape_me(recipe_url)
-            
+
+            # recipe-scrapers raises on missing schema fields. Only title/ingredients/
+            # instructions are essential; optional metadata must degrade gracefully.
+            def _safe(fn, default):
+                try:
+                    return fn()
+                except Exception:
+                    return default
+
             # Extract recipe data
             recipe_data = {
-                "title": scraper.title(),
-                "description": scraper.description() or "",
+                "title": clean_recipe_title(scraper.title()),
+                "description": _safe(scraper.description, "") or "",
                 "ingredients": scraper.ingredients(),
                 "instructions": scraper.instructions_list(),
-                "prep_time": self._extract_time_minutes(scraper.prep_time()),
-                "cook_time": self._extract_time_minutes(scraper.cook_time()),
-                "total_time": self._extract_time_minutes(scraper.total_time()),
-                "yields": self._extract_servings(scraper.yields()),
-                "image_url": scraper.image() or "",
-                "author": scraper.author() or "",
+                "prep_time": self._extract_time_minutes(_safe(scraper.prep_time, 0)),
+                "cook_time": self._extract_time_minutes(_safe(scraper.cook_time, 0)),
+                "total_time": self._extract_time_minutes(_safe(scraper.total_time, 0)),
+                "yields": self._extract_servings(_safe(scraper.yields, "")),
+                "image_url": _safe(scraper.image, "") or "",
+                "author": _safe(scraper.author, "") or "",
                 "url": recipe_url
             }
             
@@ -760,6 +969,108 @@ Category:"""
         
         return processed_ingredients, ingredient_id_map, formatted_ingredients, ingredients_skipped_by_user
     
+    def classify_dietary(self, recipe_data: Dict[str, Any]) -> Optional[str]:
+        """
+        Classify a recipe into vegan / vegetarian / pescatarian / omnivore using
+        GPT-4o-mini, then run the keyword safety net. Returns one of the four
+        tiers, or None on failure (caller should send None to leave the field
+        unset on create — the backfill script can pick it up later).
+
+        Mirrors scripts/backfill_dietary_classification.py.classify_dietary so
+        ingestion-time and backfill-time results stay consistent.
+        """
+        if not self.openai_client:
+            self._log_and_print("⚠️  No OpenAI client; skipping dietary classification")
+            return None
+
+        title = recipe_data.get('title', '') or ''
+        description = recipe_data.get('description', '') or ''
+        ingredients = recipe_data.get('ingredients', []) or []
+        instructions = recipe_data.get('instructions', []) or []
+
+        ingredient_strs = []
+        for ing in ingredients:
+            if isinstance(ing, str):
+                ingredient_strs.append(ing)
+            elif isinstance(ing, dict):
+                ingredient_strs.append(ing.get('name') or ing.get('ingredient_name') or '')
+
+        instruction_strs = []
+        for step in instructions:
+            if isinstance(step, str):
+                instruction_strs.append(step)
+            elif isinstance(step, dict):
+                instruction_strs.append(step.get('template') or step.get('instruction') or '')
+
+        prompt = f"""You classify a recipe by its highest dietary restriction tier.
+
+TIERS (most -> least restrictive): vegan > vegetarian > pescatarian > omnivore.
+
+DECISION RULES (apply in order; first match wins):
+
+1. Does the recipe contain ANY meat from a mammal or bird (beef, pork, chicken,
+   turkey, duck, lamb, bacon, ham, sausage, prosciutto, pepperoni, etc.)?
+   -> omnivore. The TITLE alone is enough: "Cashew Chicken" contains chicken.
+
+2. Otherwise, does it contain ANY fish, shellfish, or seafood (salmon, tuna,
+   shrimp, lobster, anchovy, sardine, etc.)?
+   -> pescatarian.
+
+3. Otherwise, does it contain ANY dairy, eggs, honey, or other non-flesh
+   animal product (milk, cheese, butter, yogurt, cream, eggs)?
+   -> vegetarian. Most baked goods, custards, flans, macarons, croissants,
+   pastries, cheesecakes, profiteroles, and ice creams are vegetarian, not vegan.
+
+4. Otherwise, no animal products of any kind?
+   -> vegan.
+
+EXAMPLES (memorize these, they were misclassified before):
+- "Cashew Chicken" -> omnivore (chicken in title)
+- "French Macarons" -> vegetarian (egg whites, almond flour)
+- "Pain au Chocolat" -> vegetarian (butter pastry, no meat)
+- "Profiteroles" -> vegetarian (cream + choux, no meat)
+- "Mexican Flan" -> vegetarian (eggs + milk + sugar, no meat)
+- "Vegan Black Bean Burgers" -> vegan
+- "Bacon-Wrapped Asparagus" -> omnivore (bacon)
+
+RECIPE:
+Title: {title}
+Description: {description[:300] if description else '(none)'}
+Ingredients: {', '.join(ingredient_strs)}
+
+Reply with EXACTLY ONE WORD: omnivore, pescatarian, vegetarian, or vegan."""
+
+        valid = {"omnivore", "pescatarian", "vegetarian", "vegan"}
+        try:
+            self._log_and_print("🥗 Classifying dietary tier (GPT-4o-mini)...")
+            response = self.openai_client.chat.completions.create(
+                model="gpt-4o-mini",
+                messages=[{"role": "user", "content": prompt}],
+                temperature=0,
+                max_tokens=5,
+                timeout=30,
+            )
+            gpt_answer = response.choices[0].message.content.strip().lower()
+            if gpt_answer not in valid:
+                self._log_and_print(f"⚠️  GPT returned invalid tier '{gpt_answer}'; leaving unclassified")
+                return None
+        except Exception as e:
+            self._log_and_print(f"⚠️  Dietary classification call failed: {e}; leaving unclassified")
+            return None
+
+        search_text = " ".join([
+            title,
+            description,
+            " ".join(ingredient_strs),
+            " ".join(instruction_strs),
+        ])
+        final, override_reason = _dietary_apply_safety_net(gpt_answer, search_text, title=title, description=description)
+        if override_reason:
+            self._log_and_print(f"🛡️  Safety net override: GPT said '{gpt_answer}', final tier '{final}' ({override_reason})")
+        else:
+            self._log_and_print(f"✅ Dietary classification: {final}")
+        return final
+
     def generate_ai_decisions(self, recipe_data: Dict[str, Any]) -> Dict[str, Any]:
         """Use OpenAI to make AI-driven decisions about the recipe with timeout and retry"""
         self._log_and_print("🤖 Generating AI decisions for recipe...")
@@ -1084,29 +1395,34 @@ Return ONLY the DALL-E prompt, nothing else."""
             enhanced_prompt = self._enhance_dalle_prompt_for_vibrancy(dalle_prompt)
             self._log_and_print(f"🌟 Enhanced prompt: {enhanced_prompt[:150]}...")
             
-            # Generate image
+            # Generate image — "standard" quality is ~half the bytes of "hd" with no
+            # perceptible difference for food photography at app display sizes.
             response = self.openai_client.images.generate(
-                model="dall-e-3",
+                model="gpt-image-1",
                 prompt=enhanced_prompt,
                 size="1024x1024",
-                quality="hd",
-                style="natural",  # Natural style for home cooking feel
+                quality="high",
                 n=1
             )
-            
-            # Download and save image
-            image_url = response.data[0].url
-            image_response = requests.get(image_url, timeout=30)
-            image_response.raise_for_status()
-            
-            # DALL-E returns PNG, so save with .png extension
-            if save_path.endswith('.jpg') or save_path.endswith('.jpeg'):
-                save_path = save_path.rsplit('.', 1)[0] + '.png'
-            
-            with open(save_path, 'wb') as f:
-                f.write(image_response.content)
-            
-            self._log_and_print(f"✅ DALL-E image saved: {save_path}")
+
+            # gpt-image-1 returns base64-encoded PNG (no URL); dall-e-3 is no longer
+            # available on this account.
+            image_content = base64.b64decode(response.data[0].b64_json)
+
+            # PNG (~2–3MB) re-encoded to JPEG q=88 to land at ~150–400KB before upload —
+            # keeps us comfortably under the API body cap.
+            if save_path.lower().endswith('.png'):
+                save_path = save_path.rsplit('.', 1)[0] + '.jpg'
+            elif not (save_path.lower().endswith('.jpg') or save_path.lower().endswith('.jpeg')):
+                save_path = save_path + '.jpg'
+
+            with Image.open(io.BytesIO(image_content)) as img:
+                if img.mode != 'RGB':
+                    img = img.convert('RGB')
+                img.save(save_path, format='JPEG', quality=88, optimize=True, progressive=True)
+
+            saved_kb = os.path.getsize(save_path) / 1024
+            self._log_and_print(f"✅ DALL-E image saved: {save_path} ({saved_kb:.0f} KB)")
             return True
             
         except Exception as e:
@@ -1131,6 +1447,11 @@ Return ONLY the DALL-E prompt, nothing else."""
                 "template": instruction
             })
         
+        # Classify dietary tier (vegan/vegetarian/pescatarian/omnivore) so the
+        # recipe lands in prod with the correct filter membership. None is
+        # acceptable — the backfill script can fill it in later if GPT fails.
+        dietary_classification = self.classify_dietary(recipe_data)
+
         # Prepare recipe data for API
         create_data = {
             "name": recipe_data['title'],
@@ -1145,7 +1466,8 @@ Return ONLY the DALL-E prompt, nothing else."""
             "inspired_by_url": recipe_data['url'],
             "ingredients": formatted_ingredients,
             "tag_names": ai_decisions['tags'],
-            
+            "dietary_classification": dietary_classification,
+
             # Nutrition data
             "calories": nutrition_data['calories'],
             "protein": nutrition_data['protein'],
@@ -1256,7 +1578,7 @@ Return ONLY the DALL-E prompt, nothing else."""
         """
         # Convert video parser format to internal recipe_data format
         recipe_data = {
-            "title": parsed_recipe.get('name', 'Untitled Recipe'),
+            "title": clean_recipe_title(parsed_recipe.get('name', 'Untitled Recipe')),
             "description": parsed_recipe.get('description', ''),
             "ingredients": parsed_recipe.get('ingredients', []),
             "instructions": parsed_recipe.get('steps', []),
@@ -1285,8 +1607,19 @@ Return ONLY the DALL-E prompt, nothing else."""
         self._log_and_print("="*80)
         self._log_and_print(f"🎯 Recipe: {recipe_data.get('title', 'Unknown')}")
         self._log_and_print(f"   Source: {recipe_data.get('url', 'N/A')}")
-        
+
         try:
+            # Phase 1.5: Skip if recipe with this title already exists in eKitchen.
+            if self._recipe_already_exists(recipe_data.get('title', '')):
+                self._log_and_print(f"\n⏭️  SKIP: '{recipe_data['title']}' already exists in eKitchen — moving on")
+                return RecipeProcessingResult(
+                    success=False,
+                    skipped=True,
+                    recipe_name=recipe_data.get('title'),
+                    error_message=f"Recipe already exists: {recipe_data.get('title')}",
+                    processing_time_seconds=time.time() - start_time
+                )
+
             # Phase 2: Process ingredients
             if use_enhanced_ingredients:
                 self._log_and_print("\n🥘 PHASE 2: ENHANCED INGREDIENT PROCESSING (AI + Proper Quantities/Units)")
@@ -1338,7 +1671,7 @@ Return ONLY the DALL-E prompt, nothing else."""
                 if dalle_prompt:
                     os.makedirs(save_images_dir, exist_ok=True)
                     safe_filename = re.sub(r'[^\w\s-]', '', recipe_data['title']).strip().replace(' ', '_')[:50]
-                    image_path = os.path.join(save_images_dir, f"{safe_filename}.png")
+                    image_path = os.path.join(save_images_dir, f"{safe_filename}.jpg")
                     if self.generate_recipe_image_dalle(dalle_prompt, image_path):
                         self._log_and_print(f"✅ Image saved: {image_path}")
                     else:
@@ -1374,7 +1707,9 @@ Return ONLY the DALL-E prompt, nothing else."""
             self._log_and_print(f"📊 Ingredients Processed: {len(ingredient_id_map)}")
             self._log_and_print(f"📊 Image Generated: {image_path is not None}")
             self._log_and_print(f"📊 Processing Time: {processing_time:.1f}s")
-            
+
+            self._remember_created_recipe(recipe_data['title'])
+
             return RecipeProcessingResult(
                 success=True,
                 recipe_id=recipe_id,
@@ -1424,7 +1759,20 @@ Return ONLY the DALL-E prompt, nothing else."""
                     error_message="Failed to scrape recipe data",
                     processing_time_seconds=time.time() - start_time
                 )
-            
+
+            # Phase 1.5: Skip if a recipe with this title already exists in eKitchen.
+            # Done early (before ingredient/AI/DALL-E spend) — duplicates are common in
+            # search-results scraping when the corpus already covers a popular dish.
+            if self._recipe_already_exists(recipe_data['title']):
+                self._log_and_print(f"\n⏭️  SKIP: '{recipe_data['title']}' already exists in eKitchen — moving on")
+                return RecipeProcessingResult(
+                    success=False,
+                    skipped=True,
+                    recipe_name=recipe_data['title'],
+                    error_message=f"Recipe already exists: {recipe_data['title']}",
+                    processing_time_seconds=time.time() - start_time
+                )
+
             # Phase 2: Process ingredients
             ingredients_skipped_by_user = False
             if use_enhanced_ingredients:
@@ -1496,7 +1844,7 @@ Return ONLY the DALL-E prompt, nothing else."""
                 # Create safe filename
                 safe_name = re.sub(r'[^\w\s-]', '', recipe_data['title'])
                 safe_name = re.sub(r'[-\s]+', '-', safe_name)
-                image_path = os.path.join(save_images_dir, f"{safe_name}.png")
+                image_path = os.path.join(save_images_dir, f"{safe_name}.jpg")
                 
                 # Generate DALL-E prompt using baseline style and recipe data
                 dalle_prompt = ai_decisions['dalle_prompt']  # fallback
@@ -1547,7 +1895,9 @@ Return ONLY the DALL-E prompt, nothing else."""
             self._log_and_print(f"✅ Image Generated: {image_generated}")
             self._log_and_print(f"✅ Processing Time: {processing_time:.1f} seconds")
             self._log_and_print("="*80)
-            
+
+            self._remember_created_recipe(recipe_data['title'])
+
             return RecipeProcessingResult(
                 success=True,
                 recipe_id=recipe_id,
