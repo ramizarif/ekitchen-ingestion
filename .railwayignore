@@ -1,0 +1,40 @@
+# Mirror of .dockerignore — railway up uses this to trim the upload bundle
+# (without it the 960M venv/ + logs/ push the upload past Cloudflare's limit).
+
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+venv/
+env/
+ENV/
+.venv
+
+# Git
+.git/
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# Logs
+logs/
+*.log
+
+# Environment
+.env
+local.env*
+
+# Data files
+data/
+legacy/
+tools/
+
+# Temporary files
+*.tmp
+*.bak
+tmp/
