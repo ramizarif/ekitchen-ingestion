@@ -26,11 +26,15 @@ import re
 from typing import List, Dict, Any, Optional
 from openai import OpenAI
 
-# Add the processing directory to path
-sys.path.append(os.path.join(os.path.dirname(__file__), 'src', 'processing'))
+# Repo root for the shared ingredient-name validation gate, and the legacy
+# processing dir for the legacy processors this tool still uses.
+_REPO_ROOT = os.path.abspath(os.path.join(os.path.dirname(os.path.abspath(__file__)), '..', '..'))
+sys.path.insert(0, _REPO_ROOT)
+sys.path.append(os.path.join(_REPO_ROOT, 'legacy', 'src', 'processing'))
 
 from ingredient_processor_direct import DirectIngredientProcessor
 from direct_recipe_processor import DirectRecipeProcessor
+from services.ingredient_validator import validate_ingredient_name
 
 
 class ComprehensiveIngredientRebuilder:
@@ -477,14 +481,21 @@ Examples:
                 except:
                     pass
             
-            # If no exact match found, create new ingredient
+            # If no exact match found, create new ingredient — but only if the
+            # name passes the shared validation gate (no garbage in the catalog,
+            # docs/CATALOG_POLLUTION_HANDOFF.md).
+            is_valid, reject_reason = validate_ingredient_name(standardized_name)
+            if not is_valid:
+                print(f"   ⛔ REFUSING to create global ingredient '{standardized_name}': {reject_reason}")
+                return None
+
             create_url = f"{base_url}/global-ingredients"
             ingredient_data = {
                 'name': standardized_name,
                 'category': 'other',  # Default category
                 'needs_enrichment': True  # Mark for later enrichment
             }
-            
+
             response = requests.post(create_url, json=ingredient_data, headers=headers, timeout=30)
             
             if response.status_code in [200, 201]:

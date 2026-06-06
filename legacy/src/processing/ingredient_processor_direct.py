@@ -22,6 +22,16 @@ import requests
 import time
 from unit_conversion_validator import UnitConversionValidator
 
+# Ingredient-name validation gate (shared with the current services pipeline).
+# Legacy modules load via PYTHONPATH=legacy/src/processing, so put the repo
+# root on sys.path to reach services/. This gate must hold on EVERY creation
+# path, legacy included (docs/CATALOG_POLLUTION_HANDOFF.md).
+import sys
+_REPO_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), '..', '..', '..'))
+if _REPO_ROOT not in sys.path:
+    sys.path.insert(0, _REPO_ROOT)
+from services.ingredient_validator import validate_ingredient_name
+
 def load_env_file(file_path: str) -> Dict[str, str]:
     """Load environment variables from a file"""
     env_vars = {}
@@ -491,6 +501,15 @@ class DirectIngredientProcessor:
     
     def create_ekitchen_ingredient(self, ingredient_data: IngredientData) -> Optional[str]:
         """Create ingredient in eKitchen database with comprehensive enrichment"""
+        # Hard validation gate — same as services/ingredient_processor.py. No
+        # code path (legacy included) may create a garbage-named ingredient.
+        is_valid, reject_reason = validate_ingredient_name(ingredient_data.name)
+        if not is_valid:
+            self._log_and_print(
+                f"⛔ REFUSING to create global ingredient '{ingredient_data.name}': {reject_reason}"
+            )
+            return None
+
         if not self.access_token:
             print("❌ Not authenticated with eKitchen")
             return None

@@ -11,10 +11,12 @@ import time
 from datetime import datetime
 from typing import List, Dict, Any, Optional
 
-# Add src to path
-sys.path.append(os.path.join(os.path.dirname(__file__), 'src', 'processing'))
+# Repo root on path → use the CURRENT services pipeline, NOT the legacy
+# processors (the legacy ones bypass the ingredient validation gate and
+# catalog-wide dedup matching — docs/CATALOG_POLLUTION_HANDOFF.md).
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))))
 
-from direct_recipe_processor import DirectRecipeProcessor, RecipeProcessingResult
+from services.recipe_processor import DirectRecipeProcessor, RecipeProcessingResult
 
 class EnhancedBatchProcessor:
     """Enhanced batch processor with recipe discovery capabilities"""
@@ -225,34 +227,48 @@ class EnhancedBatchProcessor:
         print(f"📋 Found {len(recipe_urls)} recipes to process")
         return self.process_recipe_list(recipe_urls, image_output_dir)
     
-    def process_recipe_list(self, recipe_urls: List[Dict[str, str]], image_output_dir: str = "./batch-generated-images") -> Dict[str, Any]:
-        """Process a list of recipe URLs (same as original batch processor)"""
+    def process_recipe_list(self, recipe_urls: List[Dict[str, str]], image_output_dir: str = "./batch-generated-images", target_success_count: Optional[int] = None) -> Dict[str, Any]:
+        """Process a list of recipe URLs.
+
+        If target_success_count is set, iteration stops as soon as that many recipes
+        have been successfully created. Skipped duplicates do not count as failures
+        and do not consume one of the target slots — they're just bypassed.
+        """
         self.start_time = time.time()
         self.results = []
-        
+
         print("🚀 STARTING BATCH RECIPE PROCESSING")
         print("="*80)
-        print(f"📊 Total Recipes: {len(recipe_urls)}")
+        print(f"📊 Total Recipes Available: {len(recipe_urls)}")
+        if target_success_count:
+            print(f"🎯 Target Successes: {target_success_count} (will stop iterating once reached)")
         print(f"🖼️  Image Directory: {image_output_dir}")
         print(f"🕒 Start Time: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
         print("="*80)
-        
+
         successful_count = 0
         failed_count = 0
-        
+        skipped_count = 0
+        attempted = 0
+
         for i, recipe_info in enumerate(recipe_urls, 1):
+            if target_success_count is not None and successful_count >= target_success_count:
+                print(f"\n🎯 Target reached ({successful_count}/{target_success_count}) — stopping early")
+                break
+
             recipe_name = recipe_info['name']
             recipe_url = recipe_info['url']
-            
+            attempted += 1
+
             print(f"\n🔄 PROCESSING RECIPE {i}/{len(recipe_urls)}")
             print(f"📋 Name: {recipe_name}")
             print(f"🌐 URL: {recipe_url}")
             print("-" * 60)
-            
+
             # Process individual recipe
             try:
                 result = self.processor.process_recipe_autonomous(recipe_url, image_output_dir)
-                
+
                 # Add recipe info to result
                 result.recipe_name = result.recipe_name or recipe_name
                 self.results.append({
@@ -261,18 +277,21 @@ class EnhancedBatchProcessor:
                     'input_url': recipe_url,
                     'result': result
                 })
-                
+
                 if result.success:
                     successful_count += 1
                     print(f"✅ Recipe {i} completed successfully: {result.recipe_name}")
-                    
+
                     # Mark this dish as scraped immediately
                     if hasattr(self, 'existing_recipes') and hasattr(self, 'recipes_json_path'):
                         self._mark_dish_as_scraped(recipe_name, recipe_url, result)
+                elif getattr(result, 'skipped', False):
+                    skipped_count += 1
+                    print(f"⏭️  Recipe {i} skipped: {result.error_message}")
                 else:
                     failed_count += 1
                     print(f"❌ Recipe {i} failed: {result.error_message}")
-                
+
             except Exception as e:
                 failed_count += 1
                 print(f"❌ Recipe {i} failed with exception: {e}")
@@ -285,9 +304,10 @@ class EnhancedBatchProcessor:
                         error_message=f"Exception: {e}"
                     )
                 })
-            
+
             # Brief pause between recipes to avoid overwhelming APIs
-            if i < len(recipe_urls):
+            still_have_more = (target_success_count is None or successful_count < target_success_count) and i < len(recipe_urls)
+            if still_have_more:
                 print("⏳ Pausing 5 seconds before next recipe...")
                 time.sleep(5)
         
@@ -298,23 +318,29 @@ class EnhancedBatchProcessor:
         print("🎉 BATCH PROCESSING COMPLETE!")
         print("="*80)
         print(f"📊 Final Results:")
-        print(f"   Total Recipes: {len(recipe_urls)}")
+        print(f"   URLs Available: {len(recipe_urls)}")
+        print(f"   URLs Attempted: {attempted}")
         print(f"   ✅ Successful: {successful_count}")
+        print(f"   ⏭️  Skipped (duplicates): {skipped_count}")
         print(f"   ❌ Failed: {failed_count}")
-        print(f"   📈 Success Rate: {(successful_count / len(recipe_urls) * 100):.1f}%")
+        denom = max(attempted, 1)
+        print(f"   📈 Success Rate (of attempted): {(successful_count / denom * 100):.1f}%")
         print(f"   ⏱️  Total Time: {total_time:.1f} seconds")
-        print(f"   ⏱️  Avg Time per Recipe: {(total_time / len(recipe_urls)):.1f} seconds")
+        if attempted > 0:
+            print(f"   ⏱️  Avg Time per Attempt: {(total_time / attempted):.1f} seconds")
         print("="*80)
-        
+
         # Save detailed report
         self._save_batch_report(image_output_dir, total_time)
-        
+
         return {
             "success": True,
             "total_recipes": len(recipe_urls),
+            "attempted_count": attempted,
             "successful_count": successful_count,
+            "skipped_count": skipped_count,
             "failed_count": failed_count,
-            "success_rate": successful_count / len(recipe_urls) * 100,
+            "success_rate": (successful_count / denom * 100),
             "total_time_seconds": total_time,
             "results": self.results
         }

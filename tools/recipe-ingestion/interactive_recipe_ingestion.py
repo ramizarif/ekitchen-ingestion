@@ -13,13 +13,16 @@ from datetime import datetime
 from typing import List, Dict, Any, Optional
 from pathlib import Path
 
-# Add src to path
-sys.path.append(os.path.join(os.path.dirname(os.path.dirname(__file__)), 'src', 'processing'))
-sys.path.append(os.path.join(os.path.dirname(os.path.dirname(__file__)), 'src', 'discovery'))
+# Repo root on path → use the CURRENT services pipeline, NOT the legacy
+# processors. The services DirectRecipeProcessor carries the ingredient
+# validation gate + catalog-wide dedup matching; the legacy one bypasses both
+# (docs/CATALOG_POLLUTION_HANDOFF.md).
+_REPO_ROOT = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+sys.path.insert(0, _REPO_ROOT)
 
-from direct_recipe_processor import DirectRecipeProcessor
+from services.recipe_processor import DirectRecipeProcessor
 from enhanced_batch_processor import EnhancedBatchProcessor
-from playwright_url_extractor import PlaywrightRecipeExtractor
+from playwright_url_extractor import PlaywrightRecipeExtractor  # legacy discovery (via Makefile PYTHONPATH)
 
 class InteractiveRecipeIngestion:
     """Interactive recipe ingestion system with multiple processing modes"""
@@ -370,28 +373,35 @@ class InteractiveRecipeIngestion:
         self.results_summary['processing_modes_used'].append('search_scrape')
         
         try:
-            # Use Playwright URL extractor
-            print(f"🕷️  Extracting recipe URLs from search page...")
-            
-            extracted_urls = self.url_extractor.extract_recipe_urls_from_search_page(search_url, target_count)
-            
+            # Overfetch URLs so duplicates/scrape-failures have backups available.
+            overfetch = max(target_count * 3, target_count + 5)
+            print(f"🕷️  Extracting recipe URLs from search page (fetching {overfetch}, target {target_count} successes)...")
+
+            extracted_urls = self.url_extractor.extract_recipe_urls_from_search_page(search_url, overfetch)
+
             if not extracted_urls:
                 print("❌ No recipe URLs found on the search page")
                 return
-            
+
             print(f"✅ Found {len(extracted_urls)} recipe URLs")
-            
-            # Process each URL
+
+            # Process URLs, stopping once we hit target_count successes
             recipe_list = [{"name": f"Recipe_{i+1}", "url": url} for i, url in enumerate(extracted_urls)]
-            result = self.batch_processor.process_recipe_list(recipe_list, image_dir)
-            
+            result = self.batch_processor.process_recipe_list(
+                recipe_list,
+                image_dir,
+                target_success_count=target_count,
+            )
+
             if result.get('success', False):
                 successful = result.get('successful_count', 0)
-                total = result.get('total_recipes', 0)
-                print(f"✅ Search & scrape completed: {successful}/{total} recipes successful")
+                skipped = result.get('skipped_count', 0)
+                failed = result.get('failed_count', 0)
+                attempted = result.get('attempted_count', successful + skipped + failed)
+                print(f"✅ Search & scrape completed: {successful} successful, {skipped} skipped, {failed} failed (attempted {attempted}/{len(extracted_urls)})")
                 self.results_summary['successful_recipes'] += successful
-                self.results_summary['failed_recipes'] += (total - successful)
-                self.results_summary['total_recipes_processed'] += total
+                self.results_summary['failed_recipes'] += failed
+                self.results_summary['total_recipes_processed'] += attempted
             else:
                 print(f"❌ Search & scrape failed: {result.get('error', 'Unknown error')}")
                 
@@ -448,25 +458,30 @@ class InteractiveRecipeIngestion:
         self.results_summary['processing_modes_used'].append('multi_query')
         
         try:
-            # Use the multi-query extraction method
-            print(f"🎲 Starting multi-query URL extraction...")
-            query_results = self.url_extractor.extract_from_multiple_searches(url_template, queries, per_query)
-            
+            # Overfetch URLs from the search page so we have backups for any
+            # that get skipped (duplicate titles already in eKitchen) or fail
+            # to scrape. The batch processor stops once `per_query` successes
+            # land, so unused backups cost nothing.
+            overfetch = max(per_query * 3, per_query + 5)
+            print(f"🎲 Starting multi-query URL extraction (fetching {overfetch} per query, target {per_query} successes)...")
+            query_results = self.url_extractor.extract_from_multiple_searches(url_template, queries, overfetch)
+
             print(f"🎯 Multi-query extraction complete")
             print(f"📊 Processing recipes by query with organized image directories:")
-            
+
             # Process each query's recipes separately to organize images by query
             total_successful = 0
+            total_skipped = 0
             total_failed = 0
-            total_processed = 0
-            
+            total_attempted = 0
+
             for query_num, (query, urls) in enumerate(query_results.items(), 1):
                 if not urls:
                     print(f"   ⚠️  Query '{query}': No URLs found")
                     continue
-                
-                print(f"\n   🔍 Processing Query {query_num}/{len(queries)}: '{query}' ({len(urls)} recipes)")
-                
+
+                print(f"\n   🔍 Processing Query {query_num}/{len(queries)}: '{query}' ({len(urls)} URLs available, target {per_query})")
+
                 # Create query-specific recipe list and image directory
                 query_recipes = []
                 for j, url in enumerate(urls):
@@ -474,41 +489,48 @@ class InteractiveRecipeIngestion:
                         "name": f"{query.title()}_Recipe_{j+1}",
                         "url": url
                     })
-                
+
                 # Clean query name for directory
                 clean_query = query.replace(' ', '-').replace('+', '-').lower()
                 clean_query = ''.join(c for c in clean_query if c.isalnum() or c in '-_')
                 query_image_dir = f"./generated-recipe-images/search/{clean_query}"
-                
+
                 print(f"   📸 Images for '{query}' → {query_image_dir}")
-                
-                # Process this query's recipes
+
+                # Process this query's recipes, stopping once we hit per_query successes
                 try:
-                    result = self.batch_processor.process_recipe_list(query_recipes, query_image_dir)
-                    
+                    result = self.batch_processor.process_recipe_list(
+                        query_recipes,
+                        query_image_dir,
+                        target_success_count=per_query,
+                    )
+
                     if result.get('success', False):
                         successful = result.get('successful_count', 0)
-                        total = result.get('total_recipes', 0)
+                        skipped = result.get('skipped_count', 0)
+                        failed = result.get('failed_count', 0)
+                        attempted = result.get('attempted_count', successful + skipped + failed)
                         total_successful += successful
-                        total_failed += (total - successful)
-                        total_processed += total
-                        print(f"   ✅ Query '{query}': {successful}/{total} recipes successful")
+                        total_skipped += skipped
+                        total_failed += failed
+                        total_attempted += attempted
+                        print(f"   ✅ Query '{query}': {successful} successful, {skipped} skipped, {failed} failed (attempted {attempted}/{len(urls)})")
                     else:
                         total_failed += len(urls)
-                        total_processed += len(urls)
+                        total_attempted += len(urls)
                         print(f"   ❌ Query '{query}': Processing failed")
-                        
+
                 except Exception as e:
                     print(f"   ❌ Query '{query}': Error during processing: {e}")
                     total_failed += len(urls)
-                    total_processed += len(urls)
-            
+                    total_attempted += len(urls)
+
             # Update summary with totals
             self.results_summary['successful_recipes'] += total_successful
             self.results_summary['failed_recipes'] += total_failed
-            self.results_summary['total_recipes_processed'] += total_processed
-            
-            print(f"\n✅ Multi-query processing completed: {total_successful}/{total_processed} recipes successful")
+            self.results_summary['total_recipes_processed'] += total_attempted
+
+            print(f"\n✅ Multi-query processing completed: {total_successful} successful, {total_skipped} skipped, {total_failed} failed")
             
         except Exception as e:
             print(f"❌ Error in multi-query URL extraction: {e}")
