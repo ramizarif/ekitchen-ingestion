@@ -1156,7 +1156,14 @@ REQUIRED JSON RESPONSE FORMAT:
 GUIDELINES:
 1. DIFFICULTY: Easy (≤5 ingredients, ≤30min, simple techniques), Medium (6-12 ingredients, 30-90min), Hard (>12 ingredients, >90min, complex techniques)
 
-2. CUISINE: Identify the cuisine type (Italian, Mexican, American, Thai, etc.)
+2. CUISINE: Choose the single best match from this canonical list (these are the
+   values users filter by in the app): Italian, Mexican, American, Chinese, Indian,
+   Thai, Japanese, Mediterranean, French, Korean, Middle Eastern, Caribbean.
+   Always prefer the broad canonical bucket over a regional sub-cuisine
+   (e.g. "Caribbean" not "Jamaican"/"Trinidadian", "Middle Eastern" not
+   "Lebanese"/"Turkish"/"Persian", "Chinese" not "Sichuan", "Indian" not "Punjabi").
+   Only if the recipe genuinely fits none of the canonical values (e.g. Vietnamese,
+   Greek, Spanish, Ethiopian), name that cuisine plainly in English.
 
 3. TAGS: Include 5-8 relevant tags like dietary restrictions (gluten-free, dairy-free, vegan), cooking method (baked, fried, grilled), meal type, cuisine, etc.
 
