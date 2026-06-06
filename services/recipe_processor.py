@@ -1581,7 +1581,10 @@ Return ONLY the DALL-E prompt, nothing else."""
                         'Content-Type': 'application/json'
                     },
                     json=create_data,
-                    timeout=30
+                    # Heavy recipes (many new ingredients) regularly take >30s to
+                    # create server-side; a short timeout makes the client report
+                    # failure while the backend finishes anyway (phantom failures).
+                    timeout=120
                 )
 
                 response.raise_for_status()
@@ -1603,12 +1606,43 @@ Return ONLY the DALL-E prompt, nothing else."""
                     continue
                 self._log_and_print(f"❌ HTTP Error creating recipe: {e}", 'error')
                 return None
+            except requests.exceptions.Timeout:
+                # The backend may still complete the create after we time out.
+                # Look the recipe up by name before declaring failure (and never
+                # blind-retry the POST — that's how duplicates happen).
+                self._log_and_print("⏳ Create timed out; checking if backend finished it anyway...", 'warning')
+                found = self._find_recipe_id_by_name(create_data['name'])
+                if found:
+                    self._log_and_print(f"✅ Recipe was created despite timeout: ID {found}")
+                    return found
+                self._log_and_print("❌ Create timed out and recipe not found in catalog", 'error')
+                return None
             except requests.exceptions.RequestException as e:
                 self._log_and_print(f"❌ HTTP Error creating recipe: {e}", 'error')
                 return None
             except Exception as e:
                 self._log_and_print(f"❌ Error creating recipe: {e}", 'error')
                 return None
+
+    def _find_recipe_id_by_name(self, name: str) -> Optional[str]:
+        """Find a recipe id by exact name match (newest first). Used to reconcile
+        creates that timed out client-side but finished server-side."""
+        try:
+            import time as _time
+            _time.sleep(10)  # give the backend a moment to finish committing
+            resp = requests.get(
+                f"{self.ingredient_processor.ekitchen_base_url}/global-recipes/",
+                params={"limit": 100, "offset": 0},
+                headers={'Authorization': f'Bearer {self.ekitchen_token}'},
+                timeout=60,
+            )
+            resp.raise_for_status()
+            for r in resp.json() or []:
+                if (r.get('name') or '').strip() == name.strip():
+                    return r.get('id')
+        except Exception as e:
+            self._log_and_print(f"   recipe-by-name lookup failed: {e}", 'warning')
+        return None
     
     def upload_recipe_image(self, recipe_id: str, image_path: str) -> bool:
         """Upload recipe image to eKitchen"""
