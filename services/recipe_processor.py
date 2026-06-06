@@ -22,6 +22,41 @@ from openai import OpenAI
 # Import ingredient processor from same package
 from services.ingredient_processor import DirectIngredientProcessor, IngredientData, load_env_file
 
+
+# Publisher attribution stripped from scraped recipe titles at ingestion.
+# KEEP IN SYNC across: services/recipe_processor.py,
+# legacy/src/processing/direct_recipe_processor.py, scripts/backfill_recipe_names.py
+KNOWN_SOURCES = [
+    "Tasty", "Simply Recipes", "SimplyRecipes", "EatingWell", "Eating Well",
+    "Food Network", "Allrecipes", "All Recipes", "Epicurious", "BBC Good Food",
+    "Serious Eats", "Budget Bytes", "Delish", "Bon Appétit", "Bon Appetit",
+    "NYT Cooking", "Food.com", "The Kitchn", "Taste of Home",
+]
+
+
+def clean_recipe_title(title):
+    """Strip publisher attribution and a trailing 'Recipe' from a scraped title.
+    Handles 'X Recipe by Tasty', 'X by Tasty', 'X | Food Network',
+    'X - Simply Recipes', 'X (Epicurious)', 'X from EatingWell', and a bare
+    trailing 'Recipe'/'Recipes'. Case-insensitive; never returns empty."""
+    if not title:
+        return title
+    cleaned = title.strip()
+    for source in KNOWN_SOURCES:
+        s = re.escape(source)
+        for pat in (
+            rf"\s+Recipes?\s+by\s+{s}\s*$",
+            rf"\s+by\s+{s}\s*$",
+            rf"\s+from\s+{s}\s*$",
+            rf"\s*[|\-–—:]\s*{s}\s*$",
+            rf"\s*\(\s*{s}\s*\)\s*$",
+        ):
+            cleaned = re.sub(pat, "", cleaned, flags=re.IGNORECASE)
+    cleaned = re.sub(r"\s+Recipes?\s*$", "", cleaned, flags=re.IGNORECASE)
+    cleaned = re.sub(r"\s{2,}", " ", cleaned).strip(" |-–—:")
+    return cleaned.strip() or title.strip()
+
+
 # Non-ingredient blocklist: equipment, tools, prepared foods, and non-food items
 # that GPT-4 sometimes includes when parsing recipes
 NON_INGREDIENT_BLOCKLIST = {
@@ -192,7 +227,61 @@ class DirectRecipeProcessor:
                 self._log_and_print("❌ eKitchen authentication failed", 'error')
         else:
             self._log_and_print("❌ eKitchen credentials not found in configuration", 'error')
-    
+
+    def _load_existing_recipe_names(self) -> set:
+        """Paginate /global-recipes/ and build a set of lowercased stripped names.
+        Cached on the instance — only paginates once per processor lifetime."""
+        if getattr(self, '_existing_recipe_names', None) is not None:
+            return self._existing_recipe_names
+
+        names: set = set()
+        if not self._ensure_ekitchen_auth():
+            self._log_and_print("⚠️  No eKitchen token; skipping duplicate-name pre-check")
+            self._existing_recipe_names = names
+            return names
+
+        base_url = self.ingredient_processor.ekitchen_base_url
+        headers = {"Authorization": f"Bearer {self.ekitchen_token}"}
+        offset = 0
+        batch_size = 200
+        try:
+            while True:
+                resp = requests.get(
+                    f"{base_url}/global-recipes/",
+                    params={"limit": batch_size, "offset": offset},
+                    headers=headers,
+                    timeout=60,
+                )
+                resp.raise_for_status()
+                batch = resp.json() or []
+                for r in batch:
+                    n = (r.get("name") or "").strip().lower()
+                    if n:
+                        names.add(n)
+                if len(batch) < batch_size:
+                    break
+                offset += batch_size
+        except Exception as e:
+            self._log_and_print(f"⚠️  Could not load existing recipe names ({e}); duplicate check disabled this session")
+
+        self._log_and_print(f"📚 Loaded {len(names)} existing recipe names for duplicate detection")
+        self._existing_recipe_names = names
+        return names
+
+    def _recipe_already_exists(self, title: str) -> bool:
+        """Check whether a recipe with this title already exists in eKitchen."""
+        if not title:
+            return False
+        return title.strip().lower() in self._load_existing_recipe_names()
+
+    def _remember_created_recipe(self, title: str) -> None:
+        """Add a freshly-created title to the cache so subsequent ingests in the same session see it."""
+        if not title:
+            return
+        if getattr(self, '_existing_recipe_names', None) is None:
+            self._existing_recipe_names = set()
+        self._existing_recipe_names.add(title.strip().lower())
+
     def scrape_recipe_from_url(self, recipe_url: str) -> Optional[Dict[str, Any]]:
         """Scrape recipe data from URL using recipe-scrapers library"""
         self._log_and_print(f"🌐 Scraping recipe from: {recipe_url}")
@@ -202,19 +291,28 @@ class DirectRecipeProcessor:
             from recipe_scrapers import scrape_me
             
             scraper = scrape_me(recipe_url)
-            
+
+            # recipe-scrapers raises on missing schema fields. Only title/ingredients/
+            # instructions are essential; optional metadata (times, yields, image,
+            # author, description) must degrade gracefully rather than fail the recipe.
+            def _safe(fn, default):
+                try:
+                    return fn()
+                except Exception:
+                    return default
+
             # Extract recipe data
             recipe_data = {
-                "title": scraper.title(),
-                "description": scraper.description() or "",
+                "title": clean_recipe_title(scraper.title()),
+                "description": _safe(scraper.description, "") or "",
                 "ingredients": scraper.ingredients(),
                 "instructions": scraper.instructions_list(),
-                "prep_time": self._extract_time_minutes(scraper.prep_time()),
-                "cook_time": self._extract_time_minutes(scraper.cook_time()),
-                "total_time": self._extract_time_minutes(scraper.total_time()),
-                "yields": self._extract_servings(scraper.yields()),
-                "image_url": scraper.image() or "",
-                "author": scraper.author() or "",
+                "prep_time": self._extract_time_minutes(_safe(scraper.prep_time, 0)),
+                "cook_time": self._extract_time_minutes(_safe(scraper.cook_time, 0)),
+                "total_time": self._extract_time_minutes(_safe(scraper.total_time, 0)),
+                "yields": self._extract_servings(_safe(scraper.yields, "")),
+                "image_url": _safe(scraper.image, "") or "",
+                "author": _safe(scraper.author, "") or "",
                 "url": recipe_url
             }
             
@@ -995,7 +1093,7 @@ REQUIRED JSON RESPONSE FORMAT:
     "Step 2 instruction rewritten in warm, cozy language..."
   ],
   "dalle_prompt": "Professional food photography prompt for DALL-E...",
-  "category": "breakfast|lunch|dinner|snack|dessert",
+  "meal_type": "breakfast|lunch|dinner|dessert|snack|appetizer|side",
   "estimated_prep_time_minutes": number (only if original prep_time is 0 or missing),
   "estimated_cook_time_minutes": number (only if original cook_time is 0 or missing),
   "estimated_total_time_minutes": number (only if original total_time is 0 or missing)
@@ -1012,6 +1110,12 @@ GUIDELINES:
    - pescatarian = no meat (mammals/birds), but allows fish/seafood, dairy, eggs
    - omnivore = contains meat (beef, chicken, pork, lamb, etc.) OR cannot be classified as more restrictive
    Return exactly one value. Note: broth or stock from animals (e.g., chicken broth) means omnivore.
+
+3b. MEAL_TYPE: Classify into exactly ONE primary meal type from: breakfast, lunch, dinner, dessert, snack, appetizer, side.
+   - Pick the single most typical meal type for this dish.
+   - Sweet baked goods / treats -> dessert. Dips/small bites served before a meal -> appetizer.
+   - Side dishes (not a main) -> side. Light/handheld between-meal food -> snack.
+   - A substantial savory main -> dinner (default for mains).
 
 4. TAGS: Include 5-8 relevant tags like dietary restrictions (gluten-free, dairy-free, vegan), cooking method (baked, fried, grilled), meal type, cuisine, etc.
 
@@ -1106,7 +1210,7 @@ Respond with ONLY the JSON object, no additional text.
             "cozy_description": recipe_data.get('description', f"A delicious homemade {recipe_data['title']} that brings comfort and flavor to your table."),
             "cozy_instructions": cozy_instructions,
             "dalle_prompt": f"A cozy home-cooked {recipe_data['title']} served in a warm family kitchen with natural lighting, inviting home cooking photography",
-            "category": "dinner"  # Default
+            "meal_type": "dinner"  # Default
         }
 
         # Add estimated times if calculated
@@ -1276,29 +1380,27 @@ Return ONLY the DALL-E prompt, nothing else."""
             enhanced_prompt = self._enhance_dalle_prompt_for_vibrancy(dalle_prompt)
             self._log_and_print(f"🌟 Enhanced prompt: {enhanced_prompt[:150]}...")
             
-            # Generate image
+            # Generate image (gpt-image-1 — dall-e-3 is no longer available on this
+            # account; gpt-image-1 uses quality low/medium/high and returns base64).
             response = self.openai_client.images.generate(
-                model="dall-e-3",
+                model="gpt-image-1",
                 prompt=enhanced_prompt,
                 size="1024x1024",
-                quality="hd",
-                style="natural",  # Natural style for home cooking feel
+                quality="medium",
                 n=1
             )
-            
-            # Download and save image
-            image_url = response.data[0].url
-            image_response = requests.get(image_url, timeout=30)
-            image_response.raise_for_status()
-            
-            # DALL-E returns PNG, so save with .png extension
+
+            # gpt-image-1 returns base64-encoded PNG (no URL to download)
+            image_bytes = base64.b64decode(response.data[0].b64_json)
+
+            # PNG output, so save with .png extension
             if save_path.endswith('.jpg') or save_path.endswith('.jpeg'):
                 save_path = save_path.rsplit('.', 1)[0] + '.png'
-            
+
             with open(save_path, 'wb') as f:
-                f.write(image_response.content)
-            
-            self._log_and_print(f"✅ DALL-E image saved: {save_path}")
+                f.write(image_bytes)
+
+            self._log_and_print(f"✅ Recipe image saved: {save_path}")
             return True
             
         except Exception as e:
@@ -1319,17 +1421,33 @@ Return ONLY the DALL-E prompt, nothing else."""
             return True
         return False
 
+    def _ensure_ekitchen_auth(self) -> bool:
+        """Guarantee a usable eKitchen token, re-authenticating if it has been lost.
+
+        The ingredient_processor owns the authoritative session; we delegate to its
+        re-auth (refresh → full re-login from stored admin creds) and re-sync our
+        local token copy so the two never drift. Without this, our copy — taken once
+        at init — goes stale the moment the ingredient processor re-authenticates,
+        and every recipe write would fail with a token the backend already rejected.
+        Returns True if a valid token is available.
+        """
+        ip = self.ingredient_processor
+        if not ip.access_token and not ip._reauthenticate():
+            return False
+        self.ekitchen_token = ip.access_token
+        self.ekitchen_refresh_token = ip.refresh_token
+        return True
+
     def create_ekitchen_recipe(self, recipe_data: Dict[str, Any], ai_decisions: Dict[str, Any],
                              formatted_ingredients: List[Dict[str, str]],
                              nutrition_data: Dict[str, float], user_id: Optional[str] = None) -> Optional[str]:
         """Create recipe in eKitchen database using direct API call"""
         self._log_and_print(f"🏗️  Creating recipe in eKitchen: {recipe_data['title']}")
 
-        # Refresh tokens before making API call
-        self._refresh_ekitchen_tokens()
-
-        if not self.ekitchen_token:
-            self._log_and_print("❌ Not authenticated with eKitchen", 'error')
+        # Guarantee a fresh, valid token (re-syncs from the ingredient processor's
+        # authoritative session, re-authenticating if it has expired mid-run).
+        if not self._ensure_ekitchen_auth():
+            self._log_and_print("❌ Not authenticated with eKitchen and re-auth failed", 'error')
             return None
         
         # Format steps for eKitchen
@@ -1352,6 +1470,7 @@ Return ONLY the DALL-E prompt, nothing else."""
             "cuisine": ai_decisions['cuisine'],
             "difficulty": ai_decisions['difficulty'],
             "dietary_classification": ai_decisions.get('dietary_classification'),
+            "meal_type": ai_decisions.get('meal_type'),
             "inspired_by_url": recipe_data['url'],
             "ingredients": formatted_ingredients,
             "tag_names": ai_decisions['tags'],
@@ -1371,43 +1490,52 @@ Return ONLY the DALL-E prompt, nothing else."""
             "imported_from_url": recipe_data['url'] if user_id else None
         }
         
-        try:
-            response = requests.post(
-                f"{self.ingredient_processor.ekitchen_base_url}/global-recipes",
-                headers={
-                    'Authorization': f'Bearer {self.ekitchen_token}',
-                    'Content-Type': 'application/json'
-                },
-                json=create_data,
-                timeout=30
-            )
-            
-            response.raise_for_status()
-            result = response.json()
-            
-            recipe_id = result.get('id')
-            if recipe_id:
-                self._log_and_print(f"✅ Recipe created successfully: ID {recipe_id}")
-                return recipe_id
-            else:
-                self._log_and_print(f"❌ Recipe creation failed: {result}", 'error')
+        for attempt in range(2):
+            try:
+                response = requests.post(
+                    f"{self.ingredient_processor.ekitchen_base_url}/global-recipes",
+                    headers={
+                        'Authorization': f'Bearer {self.ekitchen_token}',
+                        'Content-Type': 'application/json'
+                    },
+                    json=create_data,
+                    timeout=30
+                )
+
+                response.raise_for_status()
+                result = response.json()
+
+                recipe_id = result.get('id')
+                if recipe_id:
+                    self._log_and_print(f"✅ Recipe created successfully: ID {recipe_id}")
+                    return recipe_id
+                else:
+                    self._log_and_print(f"❌ Recipe creation failed: {result}", 'error')
+                    return None
+
+            except requests.exceptions.HTTPError as e:
+                # Token expired/rejected mid-run — re-authenticate and retry ONCE.
+                status_code = e.response.status_code if e.response is not None else None
+                if status_code in (401, 403) and attempt == 0 and self._ensure_ekitchen_auth():
+                    self._log_and_print("🔄 eKitchen token rejected creating recipe; re-authenticated, retrying...", 'warning')
+                    continue
+                self._log_and_print(f"❌ HTTP Error creating recipe: {e}", 'error')
                 return None
-                
-        except requests.exceptions.RequestException as e:
-            self._log_and_print(f"❌ HTTP Error creating recipe: {e}", 'error')
-            return None
-        except Exception as e:
-            self._log_and_print(f"❌ Error creating recipe: {e}", 'error')
-            return None
+            except requests.exceptions.RequestException as e:
+                self._log_and_print(f"❌ HTTP Error creating recipe: {e}", 'error')
+                return None
+            except Exception as e:
+                self._log_and_print(f"❌ Error creating recipe: {e}", 'error')
+                return None
     
     def upload_recipe_image(self, recipe_id: str, image_path: str) -> bool:
         """Upload recipe image to eKitchen"""
         self._log_and_print(f"📤 Uploading image for recipe {recipe_id}: {image_path}")
         
-        if not self.ekitchen_token:
+        if not self._ensure_ekitchen_auth():
             self._log_and_print("❌ Not authenticated with eKitchen", 'error')
             return False
-        
+
         if not os.path.exists(image_path):
             self._log_and_print(f"❌ Image file not found: {image_path}", 'error')
             return False
@@ -1454,7 +1582,7 @@ Return ONLY the DALL-E prompt, nothing else."""
             self._log_and_print("⚠️  OpenAI client not available, skipping ambiguous match resolution", 'warning')
             return
 
-        if not self.ekitchen_token:
+        if not self._ensure_ekitchen_auth():
             self._log_and_print("⚠️  Not authenticated with eKitchen, skipping ambiguous match resolution", 'warning')
             return
 
@@ -1602,7 +1730,7 @@ Return ONLY the DALL-E prompt, nothing else."""
         """
         # Convert video parser format to internal recipe_data format
         recipe_data = {
-            "title": parsed_recipe.get('name', 'Untitled Recipe'),
+            "title": clean_recipe_title(parsed_recipe.get('name', 'Untitled Recipe')),
             "description": parsed_recipe.get('description', ''),
             "ingredients": parsed_recipe.get('ingredients', []),
             "instructions": parsed_recipe.get('steps', []),
@@ -1791,7 +1919,18 @@ Return ONLY the DALL-E prompt, nothing else."""
                     error_message="Failed to scrape recipe data",
                     processing_time_seconds=time.time() - start_time
                 )
-            
+
+            # Early duplicate pre-check: abort BEFORE paying for AI enrichment + image
+            # generation if a recipe with this (cleaned) title already exists.
+            if self._recipe_already_exists(recipe_data.get('title')):
+                self._log_and_print(f"⏭️  Duplicate — '{recipe_data.get('title')}' already exists; skipping before enrichment/image")
+                return RecipeProcessingResult(
+                    success=False,
+                    error_message="DUPLICATE_RECIPE",
+                    recipe_name=recipe_data.get('title'),
+                    processing_time_seconds=time.time() - start_time
+                )
+
             # Phase 2: Process ingredients
             ingredients_skipped_by_user = False
             if use_enhanced_ingredients:
@@ -1910,7 +2049,9 @@ Return ONLY the DALL-E prompt, nothing else."""
                     image_generated=image_generated,
                     processing_time_seconds=time.time() - start_time
                 )
-            
+
+            self._remember_created_recipe(recipe_data.get('title'))
+
             # Phase 8: Upload image (if generated)
             if image_generated and recipe_id:
                 self._log_and_print("\n📤 PHASE 7: IMAGE UPLOAD")
