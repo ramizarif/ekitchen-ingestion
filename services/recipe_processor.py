@@ -663,6 +663,13 @@ Examples:
             # Parse JSON response with better error handling
             try:
                 result = json.loads(result_text)
+                # GPT occasionally returns an array of objects (e.g. for compound
+                # lines like "salt and pepper") — use the first dict rather than
+                # crashing the whole recipe on list.get().
+                if isinstance(result, list):
+                    result = next((x for x in result if isinstance(x, dict)), {})
+                if not isinstance(result, dict):
+                    raise json.JSONDecodeError("non-object JSON", result_text, 0)
                 standardized_name = result.get("standardized_name", "").lower().strip()
                 reference_as = result.get("reference_as", "").strip()
                 
