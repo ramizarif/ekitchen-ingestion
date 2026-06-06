@@ -4,6 +4,7 @@ Direct API Ingredient Processor
 Handles complete ingredient pipeline using direct HTTP API calls to eKitchen and Spoonacular
 """
 
+import difflib
 import json
 import urllib.request
 import urllib.parse
@@ -21,6 +22,7 @@ import urllib.error
 import requests
 import time
 from services.unit_conversion_validator import UnitConversionValidator
+from services.ingredient_validator import validate_ingredient_name
 
 def load_env_file(file_path: str) -> Dict[str, str]:
     """Load environment variables from a file"""
@@ -128,7 +130,13 @@ class DirectIngredientProcessor:
 
         # Initialize unit conversion validator
         self.conversion_validator = UnitConversionValidator(self.logger)
-        
+
+        # Full global-ingredient catalog cache (~1k rows), fetched lazily once
+        # per processor instance and appended to on create. Used for
+        # catalog-wide fuzzy matching so spelling variants like
+        # 'escallion'→'scallion' resolve instead of minting duplicate rows.
+        self._catalog_cache: Optional[List[Dict[str, Any]]] = None
+
     def _load_env_config(self) -> Dict[str, str]:
         """Load environment configuration from environment variables first, then local.env file"""
         env_vars = {}
@@ -629,6 +637,18 @@ class DirectIngredientProcessor:
     
     def create_ekitchen_ingredient(self, ingredient_data: IngredientData) -> Optional[str]:
         """Create ingredient in eKitchen database with comprehensive enrichment"""
+        # Hard validation gate: NO code path may create a global ingredient with
+        # an invalid name. This is the last line of defense against catalog
+        # pollution (docs/CATALOG_POLLUTION_HANDOFF.md) and covers every caller,
+        # including legacy pipelines that skip the upstream per-recipe gate.
+        is_valid, reject_reason = validate_ingredient_name(ingredient_data.name)
+        if not is_valid:
+            self._log_and_print(
+                f"⛔ REFUSING to create global ingredient '{ingredient_data.name}': {reject_reason}",
+                'error'
+            )
+            return None
+
         # Self-heal a lost/expired session instead of bailing — the auth token is a
         # short-lived Firebase JWT, and a single cleared token would otherwise poison
         # every ingredient for the rest of the processor's (singleton) lifetime.
@@ -713,7 +733,15 @@ class DirectIngredientProcessor:
         if not spoon_data:
             ingredient_data.needs_enrichment = True
             ingredient_data.tag_names.append("Needs Review")  # Flag for manual review
-        
+
+        # Step 4.5: Quarantine tag — every ingestion-created row is unreviewed
+        # by definition (it matched nothing in the curated catalog). The
+        # quarantine_review tool (tools/data-maintenance/) later promotes,
+        # merges, or deletes these rows; without the tag they were terminal
+        # (docs/CATALOG_POLLUTION_HANDOFF.md).
+        if "Quarantine" not in ingredient_data.tag_names:
+            ingredient_data.tag_names.append("Quarantine")
+
         # Prepare ingredient data for API
         create_data = {
             "name": ingredient_data.name,
@@ -783,6 +811,11 @@ class DirectIngredientProcessor:
                 if ingredient_id:
                     status = "🌟 ENRICHED" if not ingredient_data.needs_enrichment else "🔄 BASIC"
                     self._log_and_print(f"   ✅ Created {ingredient_data.name}: ID {ingredient_id} ({status})")
+                    # Keep the catalog cache consistent so later ingredients in
+                    # this run can match against the row we just created.
+                    # (getattr: tests build processors via __new__, skipping __init__)
+                    if getattr(self, '_catalog_cache', None) is not None:
+                        self._catalog_cache.append({'id': ingredient_id, 'name': ingredient_data.name})
                     return ingredient_id
                 else:
                     self._log_and_print(f"   ❌ Failed to create {ingredient_data.name}: {result}", 'error')
@@ -903,6 +936,201 @@ class DirectIngredientProcessor:
         # If we stripped everything, return original
         return result if result else name.strip()
 
+    # ── Catalog-wide matching ──────────────────────────────────────────
+    # The backend search is one-directional ILIKE '%query%': searching
+    # 'escallion' can never return 'scallion', so spelling variants were
+    # minting duplicate rows (docs/CATALOG_POLLUTION_HANDOFF.md). The catalog
+    # is small (~1k rows) — fetch it whole and match locally instead.
+
+    def get_full_catalog(self, force_refresh: bool = False) -> List[Dict[str, Any]]:
+        """Fetch and cache the entire global ingredient catalog (paginated).
+
+        Cached per processor instance; create_ekitchen_ingredient appends new
+        rows so the cache stays consistent within a run.
+        """
+        # getattr: tests build processors via __new__, skipping __init__.
+        if getattr(self, '_catalog_cache', None) is not None and not force_refresh:
+            return self._catalog_cache
+
+        if not self.access_token and not self._reauthenticate():
+            raise RuntimeError("eKitchen not authenticated; cannot fetch ingredient catalog")
+
+        all_rows: List[Dict[str, Any]] = []
+        offset, limit = 0, 100
+        while True:
+            url = f"{self.ekitchen_base_url}/global-ingredients?limit={limit}&offset={offset}"
+            headers = {
+                'Authorization': f'Bearer {self.access_token}',
+                'Content-Type': 'application/json',
+            }
+            resp = requests.get(url, headers=headers, timeout=30)
+            if resp.status_code in (401, 403):
+                if not self._reauthenticate():
+                    raise RuntimeError("eKitchen auth lost while fetching ingredient catalog")
+                headers['Authorization'] = f'Bearer {self.access_token}'
+                resp = requests.get(url, headers=headers, timeout=30)
+            if resp.status_code != 200:
+                raise RuntimeError(
+                    f"Failed to fetch ingredient catalog page (offset={offset}): {resp.status_code}"
+                )
+            data = resp.json()
+            rows = data if isinstance(data, list) else data.get('ingredients', [])
+            if not rows:
+                break
+            all_rows.extend(rows)
+            if len(rows) < limit:
+                break
+            offset += limit
+
+        self._catalog_cache = all_rows
+        self._log_and_print(f"📚 Cached full ingredient catalog: {len(all_rows)} rows")
+        return all_rows
+
+    def _find_match_candidates(self, standardized_name: str, max_candidates: int = 5,
+                               catalog: Optional[List[Dict[str, Any]]] = None) -> List[Dict[str, Any]]:
+        """Generate match candidates for *standardized_name* across the FULL catalog.
+
+        *catalog* overrides the cached full catalog (e.g. the quarantine review
+        tool passes canonical-only rows so duplicates can't match each other).
+
+        Signals (any qualifies a row as a candidate):
+        - exact:      case-insensitive equality (short-circuits, score 1.0)
+        - contains:   whole-word phrase containment ('pork loin' ⊂ 'pork loin chop');
+                      word boundaries prevent the old 'ice' ⊂ 'olive juice' noise
+        - prefix:     one name is a prefix of the other ('cod' / 'codfish')
+        - base_name:  equality after stripping suffix modifiers
+        - fuzzy:      difflib ratio ≥ 0.72 ('escallion'~'scallion' = 0.94)
+
+        Candidates are NOT matches — everything except exact goes through the
+        GPT resolve-or-NONE arbiter before being treated as the same ingredient.
+        """
+        query = standardized_name.lower().strip()
+        if not query:
+            return []
+        query_base = self._strip_ingredient_suffixes(query)
+
+        candidates: List[Dict[str, Any]] = []
+        for row in (catalog if catalog is not None else self.get_full_catalog()):
+            name = (row.get('name') or '').lower().strip()
+            if not name:
+                continue
+
+            if name == query:
+                return [{
+                    'id': row.get('id'), 'name': row.get('name'),
+                    'score': 1.0, 'match_type': 'exact',
+                }]
+
+            score = difflib.SequenceMatcher(None, query, name).ratio()
+            match_type = 'fuzzy'
+
+            if re.search(rf'(?:^|\s){re.escape(name)}(?:\s|$)', query) or \
+               re.search(rf'(?:^|\s){re.escape(query)}(?:\s|$)', name):
+                match_type = 'contains'
+                score = max(score, 0.85)
+            elif (query.startswith(name) or name.startswith(query)) and min(len(name), len(query)) >= 3:
+                match_type = 'prefix'
+                score = max(score, 0.75)
+            else:
+                name_base = self._strip_ingredient_suffixes(name)
+                if query_base and name_base and query_base == name_base:
+                    match_type = 'base_name'
+                    score = max(score, 0.9)
+
+            if match_type != 'fuzzy' or score >= 0.72:
+                candidates.append({
+                    'id': row.get('id'), 'name': row.get('name'),
+                    'score': round(score, 3), 'match_type': match_type,
+                })
+
+        candidates.sort(key=lambda c: c['score'], reverse=True)
+        return candidates[:max_candidates]
+
+    def _resolve_to_catalog(self, new_name: str, candidates: List[Dict[str, Any]]) -> Dict[str, Any]:
+        """GPT arbiter: is *new_name* the same ingredient as one of *candidates*?
+
+        Returns {'match': <candidate dict or None>, 'canonical_name': str, 'reason': str}.
+        canonical_name is GPT's preferred standard name for the matched
+        ingredient (drives the existing rename-to-canonical behavior).
+        """
+        if not candidates:
+            return {'match': None, 'canonical_name': new_name, 'reason': 'no candidates'}
+
+        if candidates[0]['match_type'] == 'exact':
+            return {'match': candidates[0], 'canonical_name': candidates[0]['name'],
+                    'reason': 'exact name match'}
+
+        if not self.openai_client:
+            # No arbiter available — be conservative: never auto-merge on a
+            # fuzzy signal alone, that's how 'olive juice'→'ice' happened.
+            self._log_and_print("⚠️  OpenAI unavailable — skipping fuzzy merge, treating as new ingredient", 'warning')
+            return {'match': None, 'canonical_name': new_name, 'reason': 'OpenAI unavailable'}
+
+        candidate_names = [c['name'] for c in candidates]
+        prompt = f"""A recipe import extracted the ingredient "{new_name}".
+The ingredient catalog already contains these similar entries:
+{json.dumps(candidate_names)}
+
+Is "{new_name}" the SAME catalog ingredient as one of these? Treat as SAME:
+spelling/regional variants, plural forms, and minor cut/form variants that a
+shopper would buy as the same item.
+
+Treat as DIFFERENT: prepared dishes/compound products vs their base
+ingredient, distinct purchasable products, and genuinely different
+plants/herbs that merely have similar names.
+
+Examples:
+- "escallion" vs "scallion" → same (spelling variant)
+- "codfish" vs "cod" → same
+- "pork loin chop" vs "pork loin" → same (minor cut variant)
+- "thyme sprig" vs "thyme" → same (form variant)
+- "corned beef brisket" vs "corn" → different
+- "olive juice" vs "ice" → different
+- "almond milk" vs "almond" → different (distinct product)
+- "thai basil" vs "basil" → different (distinct variety)
+- "spinach artichoke dip" vs "spinach" → different (prepared dish, not its base ingredient)
+- "kelp and anchovy stock" vs "anchovy" → different (prepared stock)
+- "rice cake" vs "rice" → different (distinct product)
+- "coconut sugar" vs "sugar" → different (distinct product a shopper buys separately)
+- "culantro" vs "cilantro" → different (different herbs despite similar names)
+
+Respond in JSON only — no markdown fences:
+{{"match_name": "<exact name from the list, or null if none match>", "canonical_name": "<most standard name for this ingredient>", "reason": "brief explanation"}}"""
+
+        try:
+            response = self.openai_client.chat.completions.create(
+                model="gpt-4o-mini",
+                messages=[{"role": "user", "content": prompt}],
+                temperature=0.0,
+                max_tokens=200,
+            )
+            raw = response.choices[0].message.content.strip()
+            if raw.startswith("```"):
+                raw = re.sub(r"^```(?:json)?\s*", "", raw)
+                raw = re.sub(r"\s*```$", "", raw)
+            result = json.loads(raw)
+
+            match_name = result.get('match_name')
+            match = None
+            if match_name:
+                for c in candidates:
+                    if c['name'].lower().strip() == str(match_name).lower().strip():
+                        match = c
+                        break
+            self._log_and_print(
+                f"   🤖 Catalog resolution for '{new_name}': "
+                f"match={match['name'] if match else 'NONE'} — {result.get('reason')}"
+            )
+            return {
+                'match': match,
+                'canonical_name': result.get('canonical_name') or new_name,
+                'reason': result.get('reason', ''),
+            }
+        except Exception as e:
+            self._log_and_print(f"   ⚠️  Catalog resolution failed: {e} — treating as new ingredient", 'warning')
+            return {'match': None, 'canonical_name': new_name, 'reason': f'Error: {e}'}
+    # ── End catalog-wide matching ──────────────────────────────────────
+
     def _resolve_canonical_name(self, new_name: str, existing_name: str) -> Dict:
         """
         Use GPT-4o-mini to decide whether *new_name* and *existing_name* refer to
@@ -985,6 +1213,13 @@ Examples:
                 with urllib.request.urlopen(req, timeout=30) as response:
                     result = json.loads(response.read().decode('utf-8'))
                     self._log_and_print(f"   ✅ Rename successful: {result.get('message', 'OK')}")
+                    # Keep the catalog cache consistent with the rename.
+                    # (getattr: tests build processors via __new__, skipping __init__)
+                    if getattr(self, '_catalog_cache', None) is not None:
+                        for row in self._catalog_cache:
+                            if row.get('id') == ingredient_id:
+                                row['name'] = new_name
+                                break
                     return True
 
             except urllib.error.HTTPError as e:

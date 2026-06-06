@@ -21,6 +21,7 @@ from openai import OpenAI
 
 # Import ingredient processor from same package
 from services.ingredient_processor import DirectIngredientProcessor, IngredientData, load_env_file
+from services.ingredient_validator import validate_ingredient_name
 
 
 # Publisher attribution stripped from scraped recipe titles at ingestion.
@@ -571,73 +572,93 @@ Examples:
 "1 can (14 oz) diced tomatoes" → {{"standardized_name": "diced tomatoes", "reference_as": "diced tomatoes"}}
 """
 
-            response = self.openai_client.chat.completions.create(
-                model="gpt-4o",
-                messages=[{"role": "user", "content": prompt}],
-                max_tokens=100,
-                temperature=0.1
-            )
+            # Up to 2 GPT attempts: a malformed-JSON response used to fall
+            # straight through to raw-text extraction, which is how un-parsed
+            # recipe lines became global ingredient names (catalog pollution).
+            result_text = ""
+            for parse_attempt in range(2):
+                response = self.openai_client.chat.completions.create(
+                    model="gpt-4o",
+                    messages=[{"role": "user", "content": prompt}],
+                    max_tokens=100,
+                    temperature=0.1
+                )
+
+                result_text = response.choices[0].message.content.strip()
+                self._log_and_print(f"🤖 AI raw response: '{result_text}'", 'debug')
+
+                # Clean markdown code blocks if present
+                if result_text.startswith('```json') and result_text.endswith('```'):
+                    result_text = result_text[7:-3].strip()  # Remove ```json and ```
+                elif result_text.startswith('```') and result_text.endswith('```'):
+                    result_text = result_text[3:-3].strip()  # Remove generic ```
+
+                # Parse JSON response with better error handling
+                try:
+                    result = json.loads(result_text)
+                    standardized_name = result.get("standardized_name", "").lower().strip()
+                    reference_as = result.get("reference_as", "").strip()
+
+                    # Clean any JSON artifacts that might have slipped through
+                    standardized_name = standardized_name.strip(' "\'{}[](),')
+                    reference_as = reference_as.strip(' "\'{}[](),')
+
+                    if not standardized_name or len(standardized_name) < 2:
+                        raise ValueError(f"Invalid standardized_name: '{standardized_name}'")
+
+                    # Apply singularization to the standardized name
+                    singular_name = self.pluralize_to_singular(standardized_name)
+
+                    self._log_and_print(f"✅ AI JSON parsed successfully", 'debug')
+                    return {
+                        "standardized_name": singular_name,
+                        "reference_as": reference_as or ingredient_text.strip()
+                    }
+                except json.JSONDecodeError:
+                    self._log_and_print(
+                        f"⚠️  JSON parsing failed (attempt {parse_attempt + 1}/2) for: '{result_text}'",
+                        'warning'
+                    )
+                    continue  # retry the GPT call once before falling back
+
+            # Both GPT attempts returned unparseable JSON. Try key extraction
+            # from the text; NEVER fall back to the raw ingredient line — that
+            # path minted garbage catalog rows like
+            # '1 cup dried channa (chickpeas) or 1 can...' (see
+            # docs/CATALOG_POLLUTION_HANDOFF.md).
+            lines = result_text.split('\n')
+            standardized_name = ""
+            reference_as = ""
+
+            for line in lines:
+                if 'standardized_name' in line.lower():
+                    # Better cleaning - remove all JSON artifacts
+                    name_part = line.split(':')[-1]
+                    standardized_name = name_part.strip(' "\'{}[](),').lower()
+                elif 'reference_as' in line.lower():
+                    # Better cleaning for reference_as too
+                    ref_part = line.split(':')[-1]
+                    reference_as = ref_part.strip(' "\'{}[](),')
+
+            if not standardized_name:
+                raise ValueError(
+                    f"AI standardization failed twice and no name could be extracted "
+                    f"from response — refusing raw-text fallback for: '{ingredient_text}'"
+                )
+            if not reference_as:
+                reference_as = ingredient_text.strip()
+
+            # Apply singularization to the standardized name
+            singular_name = self.pluralize_to_singular(standardized_name)
+
+            return {
+                "standardized_name": singular_name,
+                "reference_as": reference_as
+            }
             
-            result_text = response.choices[0].message.content.strip()
-            self._log_and_print(f"🤖 AI raw response: '{result_text}'", 'debug')
-            
-            # Clean markdown code blocks if present
-            if result_text.startswith('```json') and result_text.endswith('```'):
-                result_text = result_text[7:-3].strip()  # Remove ```json and ```
-            elif result_text.startswith('```') and result_text.endswith('```'):
-                result_text = result_text[3:-3].strip()  # Remove generic ```
-            
-            # Parse JSON response with better error handling
-            try:
-                result = json.loads(result_text)
-                standardized_name = result.get("standardized_name", "").lower().strip()
-                reference_as = result.get("reference_as", "").strip()
-                
-                # Clean any JSON artifacts that might have slipped through
-                standardized_name = standardized_name.strip(' "\'{}[](),')
-                reference_as = reference_as.strip(' "\'{}[](),')
-                
-                if not standardized_name or len(standardized_name) < 2:
-                    raise ValueError(f"Invalid standardized_name: '{standardized_name}'")
-                    
-                # Apply singularization to the standardized name
-                singular_name = self.pluralize_to_singular(standardized_name)
-                
-                self._log_and_print(f"✅ AI JSON parsed successfully", 'debug')
-                return {
-                    "standardized_name": singular_name,
-                    "reference_as": reference_as or ingredient_text.strip()
-                }
-            except json.JSONDecodeError:
-                # Fallback: try to extract from text response with proper cleaning
-                self._log_and_print(f"⚠️  JSON parsing failed for: '{result_text}' - using fallback extraction", 'warning')
-                lines = result_text.split('\n')
-                standardized_name = ""
-                reference_as = ""
-                
-                for line in lines:
-                    if 'standardized_name' in line.lower():
-                        # Better cleaning - remove all JSON artifacts
-                        name_part = line.split(':')[-1]
-                        standardized_name = name_part.strip(' "\'{}[](),').lower()
-                    elif 'reference_as' in line.lower():
-                        # Better cleaning for reference_as too
-                        ref_part = line.split(':')[-1]
-                        reference_as = ref_part.strip(' "\'{}[](),')
-                
-                if not standardized_name:
-                    standardized_name = ingredient_text.split(',')[0].strip().lower()
-                if not reference_as:
-                    reference_as = ingredient_text.strip()
-                    
-                # Apply singularization to the standardized name
-                singular_name = self.pluralize_to_singular(standardized_name)
-                
-                return {
-                    "standardized_name": singular_name,
-                    "reference_as": reference_as
-                }
-            
+        except ValueError:
+            # Single un-extractable line — caller skips just this ingredient.
+            raise
         except Exception as e:
             self._log_and_print(f"❌ AI standardization failed for '{ingredient_text}': {e}", 'error')
             self._log_and_print("❌ Recipe processing will be aborted - OpenAI parsing is required for data quality", 'error')
@@ -651,68 +672,53 @@ Examples:
             return self.global_ingredients_cache[standardized_name]
         
         try:
-            # Use the SAME search logic as the working ingredient_processor_direct.py
-            existing_ingredients = self.ingredient_processor.search_ekitchen_ingredient(standardized_name)
-            
-            # If found with exact name match, use the existing ingredient
-            if existing_ingredients:
-                # Check for true exact match first (case-insensitive)
-                exact_match = None
-                for ing in existing_ingredients:
-                    if ing.get('name', '').lower().strip() == standardized_name.lower().strip():
-                        exact_match = ing
-                        break
+            # ── Catalog-wide matching ─────────────────────────────────
+            # Exact + fuzzy candidate generation over the FULL catalog (the
+            # old per-query ILIKE search could never surface 'scallion' for
+            # 'escallion'), then a GPT resolve-or-NONE arbiter. Only an exact
+            # name match skips the arbiter.
+            candidates = self.ingredient_processor._find_match_candidates(standardized_name)
+            resolution = self.ingredient_processor._resolve_to_catalog(standardized_name, candidates)
+            match = resolution.get('match')
 
-                if exact_match:
-                    ingredient_id = exact_match.get('id')
-                    self.global_ingredients_cache[standardized_name] = ingredient_id
-                    self._log_and_print(f"   ♻️ Found existing global ingredient '{standardized_name}' → {ingredient_id}")
-                    return ingredient_id
+            if match:
+                canonical = (resolution.get('canonical_name') or standardized_name).strip()
+                existing_id = match['id']
+                existing_name = match['name']
 
-            # ── Similarity / duplicate detection ──────────────────────
-            # Before creating a new ingredient, check if a similar one exists
-            similar = self.ingredient_processor._find_similar_ingredient(standardized_name)
-            if similar:
-                resolution = self.ingredient_processor._resolve_canonical_name(
-                    standardized_name, similar['name']
-                )
-                if resolution.get('same_ingredient'):
-                    canonical = resolution.get('canonical_name', standardized_name)
-                    existing_id = similar['id']
-                    existing_name = similar['name']
-
-                    if canonical.lower().strip() == existing_name.lower().strip():
-                        # Existing name IS canonical → just reuse it
+                if canonical.lower() == existing_name.lower().strip() or match['match_type'] == 'exact':
+                    # Existing name IS canonical → just reuse it
+                    self.global_ingredients_cache[standardized_name] = existing_id
+                    self._log_and_print(
+                        f"   ♻️ Dedup: '{standardized_name}' is same as existing "
+                        f"'{existing_name}' ({match['match_type']}) → {existing_id}"
+                    )
+                    return existing_id
+                else:
+                    # New name is canonical → rename existing ingredient, then reuse
+                    self._log_and_print(
+                        f"   ✏️  Dedup: renaming '{existing_name}' → '{canonical}' (canonical)"
+                    )
+                    renamed = self.ingredient_processor.rename_ingredient(existing_id, canonical)
+                    if renamed:
                         self.global_ingredients_cache[standardized_name] = existing_id
-                        self._log_and_print(
-                            f"   ♻️ Dedup: '{standardized_name}' is same as existing "
-                            f"'{existing_name}' (canonical) → {existing_id}"
-                        )
+                        # Also cache under canonical name
+                        self.global_ingredients_cache[canonical] = existing_id
                         return existing_id
                     else:
-                        # New name is canonical → rename existing ingredient, then reuse
+                        # Rename failed – still reuse existing to avoid duplicate
                         self._log_and_print(
-                            f"   ✏️  Dedup: renaming '{existing_name}' → '{canonical}' (canonical)"
+                            f"   ⚠️  Rename failed, reusing existing '{existing_name}' → {existing_id}",
+                            'warning',
                         )
-                        renamed = self.ingredient_processor.rename_ingredient(existing_id, canonical)
-                        if renamed:
-                            self.global_ingredients_cache[standardized_name] = existing_id
-                            # Also cache under canonical name
-                            self.global_ingredients_cache[canonical] = existing_id
-                            return existing_id
-                        else:
-                            # Rename failed – still reuse existing to avoid duplicate
-                            self._log_and_print(
-                                f"   ⚠️  Rename failed, reusing existing '{existing_name}' → {existing_id}",
-                                'warning',
-                            )
-                            self.global_ingredients_cache[standardized_name] = existing_id
-                            return existing_id
-                else:
-                    self._log_and_print(
-                        f"   🔀 AI says '{standardized_name}' ≠ '{similar['name']}' — creating new ingredient"
-                    )
-            # ── End similarity detection ──────────────────────────────
+                        self.global_ingredients_cache[standardized_name] = existing_id
+                        return existing_id
+            elif candidates:
+                self._log_and_print(
+                    f"   🔀 AI says '{standardized_name}' matches none of "
+                    f"{[c['name'] for c in candidates]} — creating new ingredient"
+                )
+            # ── End catalog-wide matching ─────────────────────────────
 
             # If not found, create with COMPREHENSIVE 2-step enrichment process
             self._log_and_print(f"   🌶️ Starting 2-step enrichment for '{standardized_name}'...")
@@ -964,8 +970,19 @@ Category:"""
             unit = parsed['unit']
             self._log_and_print(f"   📏 Parsed: {quantity} {unit}")
             
-            # Standardize the ingredient name with AI and get reference_as
-            ai_result = self.standardize_ingredient_with_ai(ingredient_text)
+            # Standardize the ingredient name with AI and get reference_as.
+            # ValueError = this one line is un-extractable → skip it (logged
+            # loudly), NOT passed through raw and NOT fatal to the recipe.
+            # Any other exception (e.g. OpenAI outage) still aborts the recipe
+            # so we never import recipes with most ingredients missing.
+            try:
+                ai_result = self.standardize_ingredient_with_ai(ingredient_text)
+            except ValueError as e:
+                self._log_and_print(
+                    f"   ⛔ Skipping un-standardizable ingredient line: '{ingredient_text}' — {e}",
+                    'error'
+                )
+                continue
             standardized_name = ai_result["standardized_name"]
             reference_as = ai_result["reference_as"]
             self._log_and_print(f"   🤖 AI processed: '{ingredient_text}' → standardized: '{standardized_name}', reference: '{reference_as}'")
@@ -973,6 +990,16 @@ Category:"""
             # Check against non-ingredient blocklist
             if standardized_name.lower() in NON_INGREDIENT_BLOCKLIST:
                 self._log_and_print(f"   ⛔ Skipping non-ingredient: {standardized_name}")
+                continue
+
+            # Validation gate: reject extraction garbage before it can reach
+            # the global catalog (raw recipe lines, placeholders, fragments).
+            is_valid, reject_reason = validate_ingredient_name(standardized_name)
+            if not is_valid:
+                self._log_and_print(
+                    f"   ⛔ Rejected invalid ingredient name '{standardized_name}' "
+                    f"({reject_reason}) — from line: '{ingredient_text}'", 'warning'
+                )
                 continue
 
             # Get or create global ingredient
