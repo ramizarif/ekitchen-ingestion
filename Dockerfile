@@ -41,7 +41,11 @@ EXPOSE ${PORT}
 HEALTHCHECK --interval=30s --timeout=10s --start-period=5s --retries=3 \
     CMD python -c "import httpx; import os; httpx.get(f'http://localhost:{os.environ.get(\"PORT\", os.environ.get(\"API_PORT\", 8000))}/health', timeout=5.0)" || exit 1
 
-# Run the application - bind to both IPv4 (0.0.0.0) and IPv6 (::) for Railway private networking.
-# Multiple workers so a single in-flight request (recipe import OR receipt scan) can't
-# head-of-line block the whole container. UVICORN_WORKERS overrides; default 4.
-CMD sh -c "uvicorn app.main:app --host 0.0.0.0 --port ${PORT:-${API_PORT:-8000}} --workers ${UVICORN_WORKERS:-4}"
+# Run the application. Bind to IPv6 wildcard '::' — Railway's private network
+# (*.railway.internal) is IPv6-only, so the backend's dial to this service fails
+# with "connection refused" if uvicorn binds IPv4-only (0.0.0.0). On Linux's
+# dual-stack default (bindv6only=0) '::' also accepts IPv4, so this covers both.
+# (Restores fix 77a62d0, silently reverted by a9a530e.)
+# Multiple workers so a single in-flight request (recipe import OR receipt scan)
+# can't head-of-line block the whole container. UVICORN_WORKERS overrides; default 4.
+CMD sh -c "uvicorn app.main:app --host '::' --port ${PORT:-${API_PORT:-8000}} --workers ${UVICORN_WORKERS:-4}"
