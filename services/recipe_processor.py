@@ -234,9 +234,10 @@ class DirectRecipeProcessor:
                                 f"({len(tier3['ingredients'])} ingredients, {len(tier3['instructions'])} steps)")
             return tier3
 
-        # No complete result — return the best partial (something with ingredients) if any
+        # No complete result — return the best partial (something with a plausible
+        # ingredient list) if any
         for candidate in (tier1, tier2, tier3):
-            if candidate and candidate.get('ingredients'):
+            if candidate and len(candidate.get('ingredients') or []) >= 3:
                 self._log_and_print("⚠️  Returning partial website scrape (incomplete recipe data)", 'warning')
                 return candidate
 
@@ -270,6 +271,19 @@ class DirectRecipeProcessor:
             self._log_and_print(f"   JSON-LD/wild_mode miss: {e}", 'debug')
             return None
 
+    @staticmethod
+    def _clean_scraped_text(text):
+        """Clean encoding junk that bad site markup leaks into scraped titles/
+        descriptions: stray JSON unicode escapes ("\\u0026" or mangled "u0026")
+        and (double-)encoded HTML entities ("&amp;amp;")."""
+        if not text:
+            return text
+        import html as html_mod
+        text = re.sub(r'\\u([0-9a-fA-F]{4})', lambda m: chr(int(m.group(1), 16)), text)
+        text = re.sub(r'(?<![A-Za-z0-9])u0026(amp;)?', '&', text)
+        text = html_mod.unescape(html_mod.unescape(text))
+        return text.strip()
+
     def _scraper_to_recipe_data(self, scraper, recipe_url: str) -> Dict[str, Any]:
         """Map a recipe-scrapers AbstractScraper to our recipe_data shape.
         Each field is extracted defensively — wild_mode scrapers often raise on
@@ -281,8 +295,8 @@ class DirectRecipeProcessor:
             except Exception:
                 return default
         return {
-            "title": safe(scraper.title),
-            "description": safe(scraper.description, "") or "",
+            "title": self._clean_scraped_text(safe(scraper.title)),
+            "description": self._clean_scraped_text(safe(scraper.description, "") or ""),
             "ingredients": safe(scraper.ingredients, []) or [],
             "instructions": safe(scraper.instructions_list, []) or [],
             "prep_time": self._extract_time_minutes(safe(scraper.prep_time)),
@@ -360,8 +374,8 @@ class DirectRecipeProcessor:
         if not data.get("title") or not data.get("ingredients"):
             return None
         return {
-            "title": data.get("title"),
-            "description": data.get("description") or "",
+            "title": self._clean_scraped_text(data.get("title")),
+            "description": self._clean_scraped_text(data.get("description") or ""),
             "ingredients": data.get("ingredients") or [],
             "instructions": data.get("instructions") or [],
             "prep_time": self._extract_time_minutes(data.get("prep_time_minutes")),
@@ -375,11 +389,15 @@ class DirectRecipeProcessor:
 
     @staticmethod
     def _website_recipe_complete(recipe_data: Optional[Dict[str, Any]]) -> bool:
-        """A scrape is 'complete' enough to use if it has a title, ingredients, and steps."""
+        """A scrape is 'complete' enough to use if it has a title, steps, and a
+        plausible ingredient list. Fewer than 3 ingredients almost always means
+        broken source markup (e.g. JSON-LD with every ingredient concatenated
+        into one line) — fall through to the next tier instead of ingesting a
+        broken recipe."""
         return bool(
             recipe_data
             and recipe_data.get("title")
-            and recipe_data.get("ingredients")
+            and len(recipe_data.get("ingredients") or []) >= 3
             and recipe_data.get("instructions")
         )
 
@@ -1140,6 +1158,7 @@ REQUIRED JSON RESPONSE FORMAT:
 {{
   "difficulty": "Easy|Medium|Hard",
   "cuisine": "cuisine_type",
+  "dietary_classification": "omnivore|pescatarian|vegetarian|vegan",
   "tags": ["tag1", "tag2", "tag3"],
   "cozy_description": "Recipe description rewritten in eKitchen's approachable brand voice...",
   "cozy_instructions": [
@@ -1165,9 +1184,16 @@ GUIDELINES:
    Only if the recipe genuinely fits none of the canonical values (e.g. Vietnamese,
    Greek, Spanish, Ethiopian), name that cuisine plainly in English.
 
-3. TAGS: Include 5-8 relevant tags like dietary restrictions (gluten-free, dairy-free, vegan), cooking method (baked, fried, grilled), meal type, cuisine, etc.
+3. DIETARY_CLASSIFICATION: Classify this recipe by the highest restriction level it satisfies (vegan ⊆ vegetarian ⊆ pescatarian ⊆ omnivore):
+   - "vegan" = no animal products of any kind (no meat, fish, dairy, eggs, honey)
+   - "vegetarian" = no meat or fish, but allows dairy/eggs/honey
+   - "pescatarian" = no meat (mammals/birds), but allows fish/seafood, dairy, eggs
+   - "omnivore" = contains meat (beef, chicken, pork, lamb, etc.) OR cannot be classified as more restrictive
+   Return exactly one value. Note: broth or stock from animals (e.g., chicken broth) means omnivore.
 
-4. TIME ESTIMATION (only if times are 0 or missing):
+4. TAGS: Include 5-8 relevant tags like dietary restrictions (gluten-free, dairy-free, vegan), cooking method (baked, fried, grilled), meal type, cuisine, etc.
+
+5. TIME ESTIMATION (only if times are 0 or missing):
    - Analyze the ingredients and cooking steps to estimate realistic times
    - PREP_TIME: Chopping, mixing, measuring (usually 5-30 minutes)
    - COOK_TIME: Active cooking time (stovetop, oven, etc.)
@@ -1175,7 +1201,7 @@ GUIDELINES:
    - Be realistic but practical for home cooks
    - Examples: Simple pasta (10 prep, 15 cook, 25 total), Roasted chicken (15 prep, 60 cook, 75 total)
 
-5. COZY_DESCRIPTION: Rewrite the recipe description in eKitchen's approachable, confident brand voice:
+6. COZY_DESCRIPTION: Rewrite the recipe description in eKitchen's approachable, confident brand voice:
    - Keep it concise but appetizing (2-3 sentences max)
    - Focus on what makes this dish special or comforting
    - Use warm but professional language that builds excitement
@@ -1183,7 +1209,7 @@ GUIDELINES:
    - Sound inviting and achievable for home cooks
    - Avoid overly flowery language - stay authentic and helpful
 
-6. COZY_INSTRUCTIONS: Rewrite each instruction step in eKitchen's approachable, confident brand voice:
+7. COZY_INSTRUCTIONS: Rewrite each instruction step in eKitchen's approachable, confident brand voice:
    - Keep instructions clear, precise, and actionable
    - Use warm but professional language ("gently fold", "carefully season")
    - Maintain all original technical details and measurements
@@ -1191,14 +1217,14 @@ GUIDELINES:
    - Preserve the exact cooking method and nuance from the original
    - Sound encouraging but scientifically accurate
 
-7. DALLE_PROMPT: Create a detailed prompt for food photography:
+8. DALLE_PROMPT: Create a detailed prompt for food photography:
    - Focus on homey, cozy kitchen atmosphere (NOT restaurant-style)
    - Mention "warm family kitchen" or "cozy home setting"
    - Include "natural lighting" and "inviting presentation"
    - Describe the dish appearance, garnishes, and mood
    - End with "warm, inviting home cooking photography"
 
-8. CATEGORY: Choose the most appropriate meal category
+9. CATEGORY: Choose the most appropriate meal category
 
 Respond with ONLY the JSON object, no additional text.
 """
@@ -1519,6 +1545,7 @@ Return ONLY the DALL-E prompt, nothing else."""
             "num_servings": recipe_data['yields'],
             "cuisine": ai_decisions['cuisine'],
             "difficulty": ai_decisions['difficulty'],
+            "dietary_classification": ai_decisions.get('dietary_classification'),
             "inspired_by_url": recipe_data['url'],
             "ingredients": formatted_ingredients,
             "tag_names": ai_decisions['tags'],
