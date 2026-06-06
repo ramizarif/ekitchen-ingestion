@@ -207,15 +207,18 @@ class DirectRecipeProcessor:
         """
         self._log_and_print(f"🌐 Scraping recipe from: {recipe_url}")
 
-        # Tier 1: dedicated recipe-scrapers parser
-        tier1 = self._scrape_via_recipe_scrapers(recipe_url)
+        # Fetch the page once (SSRF-checked, browser-grade headers) and reuse for
+        # all tiers. Bot walls (AllRecipes/Dotdash) 403 recipe-scrapers' own fetch
+        # and bare-UA requests, but accept a full browser header set.
+        html = self._fetch_page_html(recipe_url)
+
+        # Tier 1: dedicated recipe-scrapers parser (on our fetched HTML when we
+        # have it, so the dedicated parsers also work behind bot walls)
+        tier1 = self._scrape_via_recipe_scrapers(recipe_url, html)
         if self._website_recipe_complete(tier1):
             self._log_and_print(f"✅ Scraped via recipe-scrapers: {tier1['title']} "
                                 f"({len(tier1['ingredients'])} ingredients, {len(tier1['instructions'])} steps)")
             return tier1
-
-        # Fetch the page once (SSRF-checked) and reuse for tiers 2 & 3
-        html = self._fetch_page_html(recipe_url)
 
         # Tier 2: schema.org / JSON-LD on any site (recipe-scrapers wild_mode)
         tier2 = self._scrape_via_jsonld(html, recipe_url) if html else None
@@ -240,11 +243,19 @@ class DirectRecipeProcessor:
         self._log_and_print(f"❌ All website scraping tiers failed for {recipe_url}", 'error')
         return None
 
-    def _scrape_via_recipe_scrapers(self, recipe_url: str) -> Optional[Dict[str, Any]]:
-        """Tier 1: recipe-scrapers dedicated site parser."""
+    def _scrape_via_recipe_scrapers(self, recipe_url: str, html: Optional[str] = None) -> Optional[Dict[str, Any]]:
+        """Tier 1: recipe-scrapers dedicated site parser.
+
+        Parses our own fetched HTML when available (scrape_me's internal fetch
+        gets 403'd by bot-protected sites); falls back to scrape_me otherwise."""
         try:
-            from recipe_scrapers import scrape_me
-            return self._scraper_to_recipe_data(scrape_me(recipe_url), recipe_url)
+            if html:
+                from recipe_scrapers import scrape_html
+                scraper = scrape_html(html=html, org_url=recipe_url)
+            else:
+                from recipe_scrapers import scrape_me
+                scraper = scrape_me(recipe_url)
+            return self._scraper_to_recipe_data(scraper, recipe_url)
         except Exception as e:
             self._log_and_print(f"   recipe-scrapers (dedicated) miss: {e}", 'debug')
             return None
@@ -291,10 +302,19 @@ class DirectRecipeProcessor:
             if not is_safe:
                 self._log_and_print(f"   ⛔ URL blocked by SSRF check: {reason}", 'warning')
                 return None
+            # Full browser header set: Dotdash Meredith sites (AllRecipes, Serious
+            # Eats, Simply Recipes, EatingWell...) 403 a bare User-Agent but accept
+            # this set even from datacenter IPs (verified from the prod container).
             headers = {
                 "User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
-                              "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0 Safari/537.36",
-                "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+                              "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
+                "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,"
+                          "image/avif,image/webp,*/*;q=0.8",
+                "Accept-Language": "en-US,en;q=0.9",
+                "Sec-Fetch-Mode": "navigate",
+                "Sec-Fetch-Site": "none",
+                "Sec-Fetch-Dest": "document",
+                "Upgrade-Insecure-Requests": "1",
             }
             resp = requests.get(recipe_url, headers=headers, timeout=20)
             resp.raise_for_status()
