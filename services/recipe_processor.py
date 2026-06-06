@@ -284,52 +284,214 @@ class DirectRecipeProcessor:
         self._existing_recipe_names.add(title.strip().lower())
 
     def scrape_recipe_from_url(self, recipe_url: str) -> Optional[Dict[str, Any]]:
-        """Scrape recipe data from URL using recipe-scrapers library"""
+        """Scrape recipe data from a website URL using a tiered strategy.
+
+        Mirrors the cost-tiered approach of the video pipeline — cheapest, highest-
+        quality method first, falling back only when needed:
+          1. recipe-scrapers dedicated parser (~200 supported sites, best quality, free)
+          2. schema.org / JSON-LD via recipe-scrapers wild_mode (most recipe blogs, free)
+          3. page text -> GPT-4o-mini extraction (near-universal, ~$0.002)
+        Tier 4 (Playwright screenshot -> vision) is intentionally not implemented yet.
+        Returns the first COMPLETE result (title + ingredients + steps), else the best
+        partial, else None.
+        """
         self._log_and_print(f"🌐 Scraping recipe from: {recipe_url}")
-        
+
+        # Fetch the page once (SSRF-checked, browser-grade headers) and reuse for
+        # all tiers. Bot walls (AllRecipes/Dotdash) 403 recipe-scrapers' own fetch
+        # and bare-UA requests, but accept a full browser header set.
+        html = self._fetch_page_html(recipe_url)
+
+        # Tier 1: dedicated recipe-scrapers parser (on our fetched HTML when we
+        # have it, so the dedicated parsers also work behind bot walls)
+        tier1 = self._scrape_via_recipe_scrapers(recipe_url, html)
+        if self._website_recipe_complete(tier1):
+            self._log_and_print(f"✅ Scraped via recipe-scrapers: {tier1['title']} "
+                                f"({len(tier1['ingredients'])} ingredients, {len(tier1['instructions'])} steps)")
+            return tier1
+
+        # Tier 2: schema.org / JSON-LD on any site (recipe-scrapers wild_mode)
+        tier2 = self._scrape_via_jsonld(html, recipe_url) if html else None
+        if self._website_recipe_complete(tier2):
+            self._log_and_print(f"✅ Scraped via JSON-LD/schema.org: {tier2['title']} "
+                                f"({len(tier2['ingredients'])} ingredients, {len(tier2['instructions'])} steps)")
+            return tier2
+
+        # Tier 3: rendered page text -> LLM extraction
+        tier3 = self._scrape_via_llm(html, recipe_url) if html else None
+        if self._website_recipe_complete(tier3):
+            self._log_and_print(f"✅ Scraped via LLM text extraction: {tier3['title']} "
+                                f"({len(tier3['ingredients'])} ingredients, {len(tier3['instructions'])} steps)")
+            return tier3
+
+        # No complete result — return the best partial (something with a plausible
+        # ingredient list) if any
+        for candidate in (tier1, tier2, tier3):
+            if candidate and len(candidate.get('ingredients') or []) >= 3:
+                self._log_and_print("⚠️  Returning partial website scrape (incomplete recipe data)", 'warning')
+                return candidate
+
+        self._log_and_print(f"❌ All website scraping tiers failed for {recipe_url}", 'error')
+        return None
+
+    def _scrape_via_recipe_scrapers(self, recipe_url: str, html: Optional[str] = None) -> Optional[Dict[str, Any]]:
+        """Tier 1: recipe-scrapers dedicated site parser.
+
+        Parses our own fetched HTML when available (scrape_me's internal fetch
+        gets 403'd by bot-protected sites); falls back to scrape_me otherwise."""
         try:
-            # Use recipe-scrapers library for reliable scraping
-            from recipe_scrapers import scrape_me
-            
-            scraper = scrape_me(recipe_url)
-
-            # recipe-scrapers raises on missing schema fields. Only title/ingredients/
-            # instructions are essential; optional metadata (times, yields, image,
-            # author, description) must degrade gracefully rather than fail the recipe.
-            def _safe(fn, default):
-                try:
-                    return fn()
-                except Exception:
-                    return default
-
-            # Extract recipe data
-            recipe_data = {
-                "title": clean_recipe_title(scraper.title()),
-                "description": _safe(scraper.description, "") or "",
-                "ingredients": scraper.ingredients(),
-                "instructions": scraper.instructions_list(),
-                "prep_time": self._extract_time_minutes(_safe(scraper.prep_time, 0)),
-                "cook_time": self._extract_time_minutes(_safe(scraper.cook_time, 0)),
-                "total_time": self._extract_time_minutes(_safe(scraper.total_time, 0)),
-                "yields": self._extract_servings(_safe(scraper.yields, "")),
-                "image_url": _safe(scraper.image, "") or "",
-                "author": _safe(scraper.author, "") or "",
-                "url": recipe_url
-            }
-            
-            self._log_and_print(f"✅ Successfully scraped: {recipe_data['title']}")
-            self._log_and_print(f"   Ingredients: {len(recipe_data['ingredients'])}")
-            self._log_and_print(f"   Instructions: {len(recipe_data['instructions'])} steps")
-            
-            return recipe_data
-            
-        except ImportError:
-            self._log_and_print("❌ recipe-scrapers library not installed. Run: pip install recipe-scrapers", 'error')
-            return None
+            if html:
+                from recipe_scrapers import scrape_html
+                scraper = scrape_html(html=html, org_url=recipe_url)
+            else:
+                from recipe_scrapers import scrape_me
+                scraper = scrape_me(recipe_url)
+            return self._scraper_to_recipe_data(scraper, recipe_url)
         except Exception as e:
-            self._log_and_print(f"❌ Failed to scrape recipe: {e}", 'error')
+            self._log_and_print(f"   recipe-scrapers (dedicated) miss: {e}", 'debug')
             return None
-    
+
+    def _scrape_via_jsonld(self, html: str, recipe_url: str) -> Optional[Dict[str, Any]]:
+        """Tier 2: schema.org / JSON-LD extraction on any site via wild_mode."""
+        try:
+            from recipe_scrapers import scrape_html
+            scraper = scrape_html(html=html, org_url=recipe_url, wild_mode=True)
+            return self._scraper_to_recipe_data(scraper, recipe_url)
+        except Exception as e:
+            self._log_and_print(f"   JSON-LD/wild_mode miss: {e}", 'debug')
+            return None
+
+    @staticmethod
+    def _clean_scraped_text(text):
+        """Clean encoding junk that bad site markup leaks into scraped titles/
+        descriptions: stray JSON unicode escapes ("\\u0026" or mangled "u0026")
+        and (double-)encoded HTML entities ("&amp;amp;")."""
+        if not text:
+            return text
+        import html as html_mod
+        text = re.sub(r'\\u([0-9a-fA-F]{4})', lambda m: chr(int(m.group(1), 16)), text)
+        text = re.sub(r'(?<![A-Za-z0-9])u0026(amp;)?', '&', text)
+        text = html_mod.unescape(html_mod.unescape(text))
+        return text.strip()
+
+    def _scraper_to_recipe_data(self, scraper, recipe_url: str) -> Dict[str, Any]:
+        """Map a recipe-scrapers AbstractScraper to our recipe_data shape.
+        Each field is extracted defensively — wild_mode scrapers often raise on
+        missing optional fields."""
+        def safe(fn, default=None):
+            try:
+                v = fn()
+                return v if v not in (None, "") else default
+            except Exception:
+                return default
+        return {
+            "title": self._clean_scraped_text(safe(scraper.title)),
+            "description": self._clean_scraped_text(safe(scraper.description, "") or ""),
+            "ingredients": safe(scraper.ingredients, []) or [],
+            "instructions": safe(scraper.instructions_list, []) or [],
+            "prep_time": self._extract_time_minutes(safe(scraper.prep_time)),
+            "cook_time": self._extract_time_minutes(safe(scraper.cook_time)),
+            "total_time": self._extract_time_minutes(safe(scraper.total_time)),
+            "yields": self._extract_servings(safe(scraper.yields)),
+            "image_url": safe(scraper.image, "") or "",
+            "author": safe(scraper.author, "") or "",
+            "url": recipe_url,
+        }
+
+    def _fetch_page_html(self, recipe_url: str) -> Optional[str]:
+        """Fetch raw HTML for a URL, with an SSRF guard. Returns None on failure."""
+        try:
+            from app.security import is_safe_url
+            is_safe, reason = is_safe_url(recipe_url)
+            if not is_safe:
+                self._log_and_print(f"   ⛔ URL blocked by SSRF check: {reason}", 'warning')
+                return None
+            # Full browser header set: Dotdash Meredith sites (AllRecipes, Serious
+            # Eats, Simply Recipes, EatingWell...) 403 a bare User-Agent but accept
+            # this set even from datacenter IPs (verified from the prod container).
+            headers = {
+                "User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
+                              "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
+                "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,"
+                          "image/avif,image/webp,*/*;q=0.8",
+                "Accept-Language": "en-US,en;q=0.9",
+                "Sec-Fetch-Mode": "navigate",
+                "Sec-Fetch-Site": "none",
+                "Sec-Fetch-Dest": "document",
+                "Upgrade-Insecure-Requests": "1",
+            }
+            resp = requests.get(recipe_url, headers=headers, timeout=20)
+            resp.raise_for_status()
+            return resp.text
+        except Exception as e:
+            self._log_and_print(f"   Page fetch failed: {e}", 'warning')
+            return None
+
+    def _scrape_via_llm(self, html: str, recipe_url: str) -> Optional[Dict[str, Any]]:
+        """Tier 3: extract a recipe from the page's rendered text via GPT-4o-mini."""
+        if not self.openai_client:
+            return None
+        try:
+            import html_text
+            page_text = html_text.extract_text(html)
+        except Exception:
+            page_text = None
+        if not page_text or len(page_text) < 80:
+            return None
+        page_text = page_text[:14000]  # cap input tokens (~$0.002/call)
+
+        prompt = (
+            "Extract the single recipe from this web page's text. Return ONLY JSON with keys: "
+            "title (string), description (short string), ingredients (array of full ingredient "
+            'lines, e.g. "2 cups flour"), instructions (array of step strings), '
+            "prep_time_minutes (int or null), cook_time_minutes (int or null), "
+            "total_time_minutes (int or null), yields (int servings or null). "
+            'If the page is not a recipe, return {"title": null, "ingredients": [], "instructions": []}.\n\n'
+            f"PAGE TEXT:\n{page_text}"
+        )
+        try:
+            response = self.openai_client.chat.completions.create(
+                model="gpt-4o-mini",
+                messages=[{"role": "user", "content": prompt}],
+                response_format={"type": "json_object"},
+                temperature=0,
+            )
+            data = json.loads(response.choices[0].message.content)
+        except Exception as e:
+            self._log_and_print(f"   LLM text extraction failed: {e}", 'warning')
+            return None
+
+        if not data.get("title") or not data.get("ingredients"):
+            return None
+        return {
+            "title": self._clean_scraped_text(data.get("title")),
+            "description": self._clean_scraped_text(data.get("description") or ""),
+            "ingredients": data.get("ingredients") or [],
+            "instructions": data.get("instructions") or [],
+            "prep_time": self._extract_time_minutes(data.get("prep_time_minutes")),
+            "cook_time": self._extract_time_minutes(data.get("cook_time_minutes")),
+            "total_time": self._extract_time_minutes(data.get("total_time_minutes")),
+            "yields": self._extract_servings(data.get("yields")),
+            "image_url": "",
+            "author": "",
+            "url": recipe_url,
+        }
+
+    @staticmethod
+    def _website_recipe_complete(recipe_data: Optional[Dict[str, Any]]) -> bool:
+        """A scrape is 'complete' enough to use if it has a title, steps, and a
+        plausible ingredient list. Fewer than 3 ingredients almost always means
+        broken source markup (e.g. JSON-LD with every ingredient concatenated
+        into one line) — fall through to the next tier instead of ingesting a
+        broken recipe."""
+        return bool(
+            recipe_data
+            and recipe_data.get("title")
+            and len(recipe_data.get("ingredients") or []) >= 3
+            and recipe_data.get("instructions")
+        )
+
+
     def _extract_time_minutes(self, time_value) -> int:
         """Extract time in minutes from various formats"""
         if not time_value:
@@ -596,6 +758,13 @@ Examples:
                 # Parse JSON response with better error handling
                 try:
                     result = json.loads(result_text)
+                    # GPT occasionally returns an array of objects (e.g. for compound
+                    # lines like "salt and pepper") — use the first dict rather than
+                    # crashing the whole recipe on list.get().
+                    if isinstance(result, list):
+                        result = next((x for x in result if isinstance(x, dict)), {})
+                    if not isinstance(result, dict):
+                        raise json.JSONDecodeError("non-object JSON", result_text, 0)
                     standardized_name = result.get("standardized_name", "").lower().strip()
                     reference_as = result.get("reference_as", "").strip()
 
@@ -1129,7 +1298,14 @@ REQUIRED JSON RESPONSE FORMAT:
 GUIDELINES:
 1. DIFFICULTY: Easy (≤5 ingredients, ≤30min, simple techniques), Medium (6-12 ingredients, 30-90min), Hard (>12 ingredients, >90min, complex techniques)
 
-2. CUISINE: Identify the cuisine type (Italian, Mexican, American, Thai, etc.)
+2. CUISINE: Choose the single best match from this canonical list (these are the
+   values users filter by in the app): Italian, Mexican, American, Chinese, Indian,
+   Thai, Japanese, Mediterranean, French, Korean, Middle Eastern, Caribbean.
+   Always prefer the broad canonical bucket over a regional sub-cuisine
+   (e.g. "Caribbean" not "Jamaican"/"Trinidadian", "Middle Eastern" not
+   "Lebanese"/"Turkish"/"Persian", "Chinese" not "Sichuan", "Indian" not "Punjabi").
+   Only if the recipe genuinely fits none of the canonical values (e.g. Vietnamese,
+   Greek, Spanish, Ethiopian), name that cuisine plainly in English.
 
 3. DIETARY_CLASSIFICATION: Classify this recipe by the highest restriction level it satisfies (vegan ⊆ vegetarian ⊆ pescatarian ⊆ omnivore):
    - vegan = no animal products of any kind (no meat, fish, dairy, eggs, honey)
@@ -1407,8 +1583,10 @@ Return ONLY the DALL-E prompt, nothing else."""
             enhanced_prompt = self._enhance_dalle_prompt_for_vibrancy(dalle_prompt)
             self._log_and_print(f"🌟 Enhanced prompt: {enhanced_prompt[:150]}...")
             
-            # Generate image (gpt-image-1 — dall-e-3 is no longer available on this
-            # account; gpt-image-1 uses quality low/medium/high and returns base64).
+            # Generate image. dall-e-3 was removed from this OpenAI account ("model
+            # does not exist"), so use gpt-image-1 — same model the batch orchestrator
+            # (autonomous_ingest), legacy processor, and backfill scripts already use.
+            # gpt-image-1 uses quality low/medium/high and returns base64 (no URL).
             response = self.openai_client.images.generate(
                 model="gpt-image-1",
                 prompt=enhanced_prompt,
@@ -1526,7 +1704,10 @@ Return ONLY the DALL-E prompt, nothing else."""
                         'Content-Type': 'application/json'
                     },
                     json=create_data,
-                    timeout=30
+                    # Heavy recipes (many new ingredients) regularly take >30s to
+                    # create server-side; a short timeout makes the client report
+                    # failure while the backend finishes anyway (phantom failures).
+                    timeout=120
                 )
 
                 response.raise_for_status()
@@ -1548,12 +1729,43 @@ Return ONLY the DALL-E prompt, nothing else."""
                     continue
                 self._log_and_print(f"❌ HTTP Error creating recipe: {e}", 'error')
                 return None
+            except requests.exceptions.Timeout:
+                # The backend may still complete the create after we time out.
+                # Look the recipe up by name before declaring failure (and never
+                # blind-retry the POST — that's how duplicates happen).
+                self._log_and_print("⏳ Create timed out; checking if backend finished it anyway...", 'warning')
+                found = self._find_recipe_id_by_name(create_data['name'])
+                if found:
+                    self._log_and_print(f"✅ Recipe was created despite timeout: ID {found}")
+                    return found
+                self._log_and_print("❌ Create timed out and recipe not found in catalog", 'error')
+                return None
             except requests.exceptions.RequestException as e:
                 self._log_and_print(f"❌ HTTP Error creating recipe: {e}", 'error')
                 return None
             except Exception as e:
                 self._log_and_print(f"❌ Error creating recipe: {e}", 'error')
                 return None
+
+    def _find_recipe_id_by_name(self, name: str) -> Optional[str]:
+        """Find a recipe id by exact name match (newest first). Used to reconcile
+        creates that timed out client-side but finished server-side."""
+        try:
+            import time as _time
+            _time.sleep(10)  # give the backend a moment to finish committing
+            resp = requests.get(
+                f"{self.ingredient_processor.ekitchen_base_url}/global-recipes/",
+                params={"limit": 100, "offset": 0},
+                headers={'Authorization': f'Bearer {self.ekitchen_token}'},
+                timeout=60,
+            )
+            resp.raise_for_status()
+            for r in resp.json() or []:
+                if (r.get('name') or '').strip() == name.strip():
+                    return r.get('id')
+        except Exception as e:
+            self._log_and_print(f"   recipe-by-name lookup failed: {e}", 'warning')
+        return None
     
     def upload_recipe_image(self, recipe_id: str, image_path: str) -> bool:
         """Upload recipe image to eKitchen"""

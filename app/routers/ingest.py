@@ -42,6 +42,13 @@ VIDEO_PATTERNS = {
     'youtube': [
         r'youtube\.com/shorts/[\w-]+',
         r'youtu\.be/[\w-]+',
+    ],
+    'facebook': [
+        r'facebook\.com/[\w.\-]+/videos/[\w\-/]+',  # page/videos/[slug/]id
+        r'facebook\.com/watch/?\?v=\d+',            # watch?v=ID
+        r'facebook\.com/reel/\d+',                  # reels
+        r'facebook\.com/share/[vr]/[\w-]+',         # share/v/ or share/r/ links
+        r'fb\.watch/[\w-]+',                        # short links
     ]
 }
 

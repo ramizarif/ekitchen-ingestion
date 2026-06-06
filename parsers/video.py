@@ -49,6 +49,14 @@ class VideoParser(BaseParser):
         r'(youtube\.com/watch\?v=[\w-]+)',
     ]
 
+    FACEBOOK_PATTERNS = [
+        r'(facebook\.com/[\w.\-]+/videos/[\w\-/]+)',  # page/videos/[slug/]id
+        r'(facebook\.com/watch/?\?v=\d+)',            # watch?v=ID
+        r'(facebook\.com/reel/\d+)',                  # reels
+        r'(facebook\.com/share/[vr]/[\w-]+)',         # share/v/ or share/r/ links
+        r'(fb\.watch/[\w-]+)',                        # short links
+    ]
+
     # Platform-specific optimization configurations
     PLATFORM_CONFIG = {
         'tiktok': {
@@ -75,6 +83,14 @@ class VideoParser(BaseParser):
             'detect_slideshows': False,  # Rare
             'prompt_hints': 'YouTube Shorts typically have professional production and detailed explanations.',
         },
+        'facebook': {
+            'audio_confidence_threshold': 0.75,  # Similar profile to Instagram Reels
+            'hybrid_confidence_threshold': 0.45,
+            'default_frames': 4,
+            'max_frames': 5,
+            'detect_slideshows': False,
+            'prompt_hints': 'Facebook recipe videos often have voiceovers plus on-screen captions/text overlays. Read any visible text for ingredients and steps.',
+        },
         'default': {
             'audio_confidence_threshold': 0.7,
             'hybrid_confidence_threshold': 0.4,
@@ -87,6 +103,7 @@ class VideoParser(BaseParser):
 
     # Path to cookies file for authenticated downloads (bypasses IP blocks)
     COOKIES_FILE = os.path.join(os.path.dirname(os.path.dirname(__file__)), 'config', 'tiktok_cookies.txt')
+
 
     def __init__(self, timeout: int = 120, openai_client=None):
         """
@@ -110,10 +127,28 @@ class VideoParser(BaseParser):
         proxy = os.environ.get('YTDLP_PROXY')
         if proxy:
             args.extend(['--proxy', proxy])
-        # Impersonate a real browser to avoid bot detection
-        args.extend(['--impersonate', 'chrome'])
+        # Impersonate a real browser to avoid bot detection — but ONLY if explicitly
+        # enabled. The standalone yt-dlp release binary ships without curl_cffi and
+        # hard-fails on --impersonate before any download (breaking Instagram/Facebook/
+        # YouTube). It also still *lists* "chrome" via --list-impersonate-targets even
+        # though it can't use it, so we can't probe for support — we require an explicit
+        # opt-in via YTDLP_IMPERSONATE=1 (set only on a curl_cffi-capable yt-dlp).
+        if self._impersonation_available():
+            args.extend(['--impersonate', 'chrome'])
         return args
-        
+
+    @classmethod
+    def _impersonation_available(cls) -> bool:
+        """Whether to pass --impersonate to yt-dlp.
+
+        Opt-in only: the standalone release binary lists impersonate targets but
+        can't actually use them (no curl_cffi), so probing is unreliable. Enable
+        explicitly with YTDLP_IMPERSONATE=1 on an impersonation-capable yt-dlp.
+        Default off → plain (non-impersonated) download, which works for public
+        Instagram/Facebook/YouTube videos instead of crashing the ingestion.
+        """
+        return os.environ.get('YTDLP_IMPERSONATE', '').strip().lower() in ('1', 'true', 'yes')
+
     @property
     def openai_client(self):
         """Lazy load OpenAI client."""
@@ -134,7 +169,7 @@ class VideoParser(BaseParser):
         """
         Detect which platform the URL belongs to.
 
-        Returns: 'tiktok', 'instagram', 'youtube', or None
+        Returns: 'tiktok', 'instagram', 'youtube', 'facebook', or None
         """
         url_lower = url.lower()
 
@@ -149,6 +184,10 @@ class VideoParser(BaseParser):
         for pattern in self.YOUTUBE_PATTERNS:
             if re.search(pattern, url_lower):
                 return 'youtube'
+
+        for pattern in self.FACEBOOK_PATTERNS:
+            if re.search(pattern, url_lower):
+                return 'facebook'
 
         return None
 
@@ -288,7 +327,7 @@ class VideoParser(BaseParser):
                 return ParseResult(
                     success=False,
                     error_code="UNSUPPORTED_PLATFORM",
-                    error_message=f"URL not recognized as TikTok, Instagram, or YouTube: {url}",
+                    error_message=f"URL not recognized as TikTok, Instagram, YouTube, or Facebook: {url}",
                     parser_name=self.parser_name
                 )
 
@@ -361,11 +400,25 @@ class VideoParser(BaseParser):
                 download_info = self._download_audio(resolved_url, audio_path)
 
                 if not download_info.get('success'):
-                    return ParseResult(
-                        success=False,
-                        error_code="DOWNLOAD_FAILED",
-                        error_message=download_info.get('error', 'Failed to download audio'),
-                        parser_name=self.parser_name
+                    # Audio download/extraction failed. Common causes: ffprobe can't
+                    # read the audio codec, the reel has no audio track, or the chosen
+                    # format has no usable audio stream. Rather than hard-failing, fall
+                    # back to vision-only extraction on the full video (frames don't
+                    # need a usable audio stream). Only give up if the *video* can't be
+                    # fetched either.
+                    audio_error = download_info.get('error', 'Failed to download audio')
+                    logger.warning(
+                        f"Audio download failed ({audio_error[:160]}); "
+                        f"falling back to vision-only extraction"
+                    )
+                    return self._vision_only_fallback(
+                        platform=platform,
+                        url=url,
+                        resolved_url=resolved_url,
+                        temp_dir=temp_dir,
+                        tikwm_metadata=tikwm_metadata,
+                        start_time=start_time,
+                        audio_error=audio_error,
                     )
 
             # Add metadata to download_info for downstream methods
@@ -630,6 +683,97 @@ class VideoParser(BaseParser):
                     shutil.rmtree(temp_dir)
                 except Exception as e:
                     logger.warning(f"Failed to cleanup temp dir: {e}")
+
+    def _vision_only_fallback(
+        self,
+        platform: str,
+        url: str,
+        resolved_url: str,
+        temp_dir: str,
+        tikwm_metadata: Optional[Dict[str, Any]],
+        start_time: float,
+        audio_error: str,
+    ) -> ParseResult:
+        """
+        Vision-only extraction used when the audio pipeline can't run.
+
+        Downloads the full video and extracts a recipe from key frames via
+        GPT-4 Vision, with no audio transcript. This recovers reels where audio
+        extraction fails (e.g. ffprobe "unable to obtain file audio codec",
+        no audio track) but the visual content is still a usable recipe.
+
+        Returns a successful ParseResult on success, or a failure ParseResult
+        (DOWNLOAD_FAILED if the video itself can't be fetched, otherwise
+        RECIPE_EXTRACTION_FAILED) so the caller can return it directly.
+        """
+        platform_config = self._get_platform_config(platform)
+        frames_used = platform_config['max_frames']
+
+        # Download the full video (frame extraction doesn't need a usable audio stream).
+        try:
+            video_path = self._download_video_for_platform(
+                platform, resolved_url, temp_dir, tikwm_metadata
+            )
+        except Exception as e:
+            logger.error(f"Vision fallback: video download failed: {e}")
+            return ParseResult(
+                success=False,
+                error_code="DOWNLOAD_FAILED",
+                # Surface the original audio error too; the video download is the
+                # secondary failure that closed off the fallback.
+                error_message=f"Audio extraction failed ({audio_error}); "
+                              f"video fallback also failed: {e}",
+                parser_name=self.parser_name,
+            )
+
+        frames = self._extract_key_frames(video_path, num_frames=frames_used)
+        if not frames:
+            return ParseResult(
+                success=False,
+                error_code="DOWNLOAD_FAILED",
+                error_message=f"Audio extraction failed ({audio_error}); "
+                              f"could not extract frames from video for vision fallback",
+                parser_name=self.parser_name,
+            )
+
+        final_recipe = self._vision_extract_recipe(
+            frames=frames,
+            audio_transcript=None,
+            video_metadata={'platform': platform, 'url': url},
+            platform=platform,
+        )
+
+        if not final_recipe:
+            return ParseResult(
+                success=False,
+                error_code="RECIPE_EXTRACTION_FAILED",
+                error_message="Could not extract recipe from video (vision fallback)",
+                parser_name=self.parser_name,
+                extraction_method="vision_only",
+                frames_used=len(frames),
+            )
+
+        warnings = self._generate_warnings(final_recipe)
+        processing_time_ms = int((time.time() - start_time) * 1000)
+
+        logger.info(
+            f"✓ Recovered recipe via vision-only fallback: "
+            f"{final_recipe.get('name', 'Unknown')} ({len(frames)} frames)"
+        )
+
+        return ParseResult(
+            success=True,
+            data=final_recipe,
+            parser_name=self.parser_name,
+            confidence_score=0.0,  # No audio confidence; recipe came from frames.
+            warnings=warnings,
+            extraction_method="vision_only",
+            frames_used=len(frames),
+            estimated_cost=self._estimate_cost("vision_only", frames_used=len(frames)),
+            fallback_reason="audio_download_failed",
+            processing_time_ms=processing_time_ms,
+            output_tokens=500,
+        )
 
     def _fetch_tiktok_metadata_via_tikwm(self, url: str) -> Dict[str, Any]:
         """
