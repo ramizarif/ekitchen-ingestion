@@ -7,6 +7,7 @@ import re
 import time
 import logging
 from typing import Optional, Dict, Any
+import sentry_sdk
 from fastapi import APIRouter, HTTPException, status
 from pydantic import BaseModel, HttpUrl, Field
 from dotenv import load_dotenv
@@ -330,6 +331,9 @@ async def _ingest_video(url: str, platform: str, request: IngestRequest, start_t
     except Exception as e:
         processing_time = time.time() - start_time
         logger.error(f"Unexpected error during video ingestion: {e}", exc_info=True)
+        # Capture the real cause (e.g. OpenAI insufficient_quota) with its stack
+        # — the HTTPException below would otherwise reach Sentry as a bare 500.
+        sentry_sdk.capture_exception(e)
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
             detail={
@@ -437,6 +441,9 @@ async def _ingest_website(url: str, request: IngestRequest, start_time: float):
     except Exception as e:
         processing_time = time.time() - start_time
         logger.error(f"Unexpected error during website ingestion: {e}", exc_info=True)
+        # Capture the real cause (e.g. OpenAI insufficient_quota, scraper failure)
+        # with its stack — otherwise this reaches Sentry as a bare 500.
+        sentry_sdk.capture_exception(e)
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
             detail={

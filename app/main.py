@@ -8,6 +8,7 @@ import time
 from contextlib import asynccontextmanager
 
 import anyio
+import sentry_sdk
 from fastapi import FastAPI, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
@@ -21,6 +22,20 @@ logging.basicConfig(
     format="%(asctime)s - %(name)s - %(levelname)s - %(message)s"
 )
 logger = logging.getLogger(__name__)
+
+# Error tracking. Initialized before the FastAPI app so the FastAPI/Starlette
+# integrations (auto-enabled by sentry-sdk[fastapi]) wrap the app and capture
+# unhandled exceptions + 5xx responses. Safe no-op when SENTRY_DSN is unset.
+if settings.SENTRY_DSN:
+    sentry_sdk.init(
+        dsn=settings.SENTRY_DSN,
+        environment=settings.ENVIRONMENT,
+        traces_sample_rate=settings.SENTRY_TRACES_SAMPLE_RATE,
+        send_default_pii=False,
+    )
+    logger.info(f"✅ Sentry initialized (env={settings.ENVIRONMENT})")
+else:
+    logger.info("ℹ️  Sentry disabled (SENTRY_DSN not set)")
 
 # Global flag for auth status
 _auth_validated = False
@@ -106,6 +121,13 @@ async def lifespan(app: FastAPI):
         _auth_error = message
         logger.error(f"❌ eKitchen auth FAILED: {message}")
         logger.error("⚠️  Ingest requests will re-attempt validation (30s cooldown) until auth recovers")
+        # Page immediately: the service booted unable to authenticate to the
+        # backend, so every import is rejected until auth recovers. The real
+        # reason lives here, not in the opaque 503 returned to clients.
+        sentry_sdk.capture_message(
+            f"eKitchen ingestion auth FAILED at startup (imports blocked until recovery): {message}",
+            level="fatal",
+        )
 
     yield  # Application runs here
 
@@ -147,9 +169,20 @@ async def auth_gate_middleware(request: Request, call_next):
                 _auth_validated = True
                 _auth_error = None
                 logger.info("✅ eKitchen auth recovered via lazy re-validation")
+                sentry_sdk.capture_message(
+                    "eKitchen ingestion auth RECOVERED via lazy re-validation",
+                    level="info",
+                )
             else:
                 _auth_error = message
                 logger.warning(f"⚠️  eKitchen auth re-validation failed: {message}")
+                # Real reason behind the opaque 503 below. Sentry groups repeats
+                # into one issue, so a sustained outage is one alert with a
+                # rising event count, not a flood.
+                sentry_sdk.capture_message(
+                    f"eKitchen ingestion still rejecting imports — auth re-validation failed: {message}",
+                    level="error",
+                )
         if not _auth_validated:
             logger.warning(f"⛔ Rejecting request to {request.url.path} - auth not validated")
             return JSONResponse(

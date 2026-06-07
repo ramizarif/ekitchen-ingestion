@@ -15,6 +15,9 @@ requests>=2.31.0
 # OpenAI (for video/image parsing and ingredient processing)
 openai>=1.0.0
 
+# Error tracking / alerting (no-op when SENTRY_DSN is unset)
+sentry-sdk[fastapi]>=2.0.0
+
 # Image Processing (for video frame extraction)
 Pillow>=10.0.0
 

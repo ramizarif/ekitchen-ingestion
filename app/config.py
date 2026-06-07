@@ -32,6 +32,10 @@ class Settings(BaseSettings):
     ENVIRONMENT: str = "development"
     DEBUG: bool = True
 
+    # Sentry error tracking (no-op when SENTRY_DSN is unset)
+    SENTRY_DSN: str = ""
+    SENTRY_TRACES_SAMPLE_RATE: float = 0.0
+
     class Config:
         env_file = ".env"
         case_sensitive = True
