@@ -1,9 +1,13 @@
 """
 FastAPI application for parsing recipes from various sources.
 """
+import asyncio
 import logging
 import sys
+import time
 from contextlib import asynccontextmanager
+
+import anyio
 from fastapi import FastAPI, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
@@ -21,6 +25,11 @@ logger = logging.getLogger(__name__)
 # Global flag for auth status
 _auth_validated = False
 _auth_error = None
+
+# Lazy re-validation state: when startup auth failed, gated requests retry
+# validation at most once per cooldown window instead of rejecting forever.
+_last_auth_revalidation = 0.0
+_AUTH_REVALIDATION_COOLDOWN_SECONDS = 30.0
 
 
 def validate_ekitchen_auth() -> tuple[bool, str]:
@@ -72,13 +81,23 @@ def validate_ekitchen_auth() -> tuple[bool, str]:
 async def lifespan(app: FastAPI):
     """Startup and shutdown events."""
     global _auth_validated, _auth_error
-    
+
     logger.info("🚀 Starting eKitchen Ingestion API...")
-    
-    # Validate eKitchen authentication
+
+    # Validate eKitchen authentication. Retry a few times: deploys of this
+    # service and the backend can overlap (incident 2026-06-07: a single 10s
+    # login timeout during backend deploy churn rejected ALL imports for ~29h
+    # because the failed result was cached until restart).
     logger.info("🔐 Validating eKitchen authentication...")
-    success, message = validate_ekitchen_auth()
-    
+    success, message = False, "not attempted"
+    for attempt in range(1, 4):
+        success, message = validate_ekitchen_auth()
+        if success:
+            break
+        logger.warning(f"⚠️  eKitchen auth attempt {attempt}/3 failed: {message}")
+        if attempt < 3:
+            await asyncio.sleep(5 * attempt)
+
     if success:
         _auth_validated = True
         logger.info(f"✅ eKitchen auth validated: {message}")
@@ -86,10 +105,10 @@ async def lifespan(app: FastAPI):
         _auth_validated = False
         _auth_error = message
         logger.error(f"❌ eKitchen auth FAILED: {message}")
-        logger.error("⚠️  API will reject all ingest requests until auth is fixed!")
-    
+        logger.error("⚠️  Ingest requests will re-attempt validation (30s cooldown) until auth recovers")
+
     yield  # Application runs here
-    
+
     logger.info("👋 Shutting down eKitchen Ingestion API...")
 
 
@@ -103,21 +122,43 @@ app = FastAPI(
 
 @app.middleware("http")
 async def auth_gate_middleware(request: Request, call_next):
-    """Reject ingest requests if eKitchen auth failed on startup."""
+    """Reject ingest requests while eKitchen auth is invalid — but self-heal.
+
+    A failed startup validation must NOT brick the service until a manual
+    restart: on each gated request (rate-limited to one attempt per 30s) we
+    re-run the validation, so the service recovers as soon as the backend is
+    reachable again.
+    """
+    global _auth_validated, _auth_error, _last_auth_revalidation
+
     # Always allow health checks
     if request.url.path in ["/", "/health", "/healthz"]:
         return await call_next(request)
-    
+
     # Block protected routes if auth failed
     if not _auth_validated and request.url.path.startswith("/api/v1/ingest"):
-        logger.warning(f"⛔ Rejecting request to {request.url.path} - auth not validated")
-        return JSONResponse(
-            status_code=503,
-            content={
-                "error": "Service temporarily unavailable",
-            }
-        )
-    
+        now = time.monotonic()
+        if now - _last_auth_revalidation >= _AUTH_REVALIDATION_COOLDOWN_SECONDS:
+            _last_auth_revalidation = now
+            # validate_ekitchen_auth blocks (urllib, 10s timeout) — run it off
+            # the event loop so other requests aren't stalled.
+            success, message = await anyio.to_thread.run_sync(validate_ekitchen_auth)
+            if success:
+                _auth_validated = True
+                _auth_error = None
+                logger.info("✅ eKitchen auth recovered via lazy re-validation")
+            else:
+                _auth_error = message
+                logger.warning(f"⚠️  eKitchen auth re-validation failed: {message}")
+        if not _auth_validated:
+            logger.warning(f"⛔ Rejecting request to {request.url.path} - auth not validated")
+            return JSONResponse(
+                status_code=503,
+                content={
+                    "error": "Service temporarily unavailable",
+                }
+            )
+
     return await call_next(request)
 
 
