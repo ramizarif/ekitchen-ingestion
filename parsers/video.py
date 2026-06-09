@@ -973,7 +973,11 @@ class VideoParser(BaseParser):
             
             if result.returncode != 0:
                 error_msg = result.stderr or result.stdout or "Unknown yt-dlp error"
-                logger.error(f"yt-dlp audio download failed: {error_msg}")
+                # WARNING, not ERROR: the caller handles a failed audio download by
+                # falling back to vision-only extraction (which usually succeeds), so
+                # this is a recoverable sub-step, not a real failure. Logging it at
+                # error level made Sentry page on imports that ultimately completed.
+                logger.warning(f"yt-dlp audio download failed: {error_msg}")
                 return {'success': False, 'error': error_msg}
             
             # Check if file was downloaded (handle various extensions)

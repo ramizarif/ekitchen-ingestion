@@ -9,6 +9,7 @@ from contextlib import asynccontextmanager
 
 import anyio
 import sentry_sdk
+from sentry_sdk.integrations.logging import LoggingIntegration
 from fastapi import FastAPI, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
@@ -26,12 +27,23 @@ logger = logging.getLogger(__name__)
 # Error tracking. Initialized before the FastAPI app so the FastAPI/Starlette
 # integrations (auto-enabled by sentry-sdk[fastapi]) wrap the app and capture
 # unhandled exceptions + 5xx responses. Safe no-op when SENTRY_DSN is unset.
+#
+# LoggingIntegration override: by default the SDK turns EVERY logger.error()
+# into a Sentry event, which pages on handled/recoverable failures (e.g. the
+# audio→vision fallback logging "yt-dlp audio download failed" before recovering
+# — the import still succeeds). We keep INFO+ as breadcrumbs but only auto-event
+# on CRITICAL. Real alerts still fire via: explicit capture_message (auth) /
+# capture_exception (failed imports) below, and the FastAPI integration's 5xx
+# capture for genuine end-to-end failures.
 if settings.SENTRY_DSN:
     sentry_sdk.init(
         dsn=settings.SENTRY_DSN,
         environment=settings.ENVIRONMENT,
         traces_sample_rate=settings.SENTRY_TRACES_SAMPLE_RATE,
         send_default_pii=False,
+        integrations=[
+            LoggingIntegration(level=logging.INFO, event_level=logging.CRITICAL),
+        ],
     )
     logger.info(f"✅ Sentry initialized (env={settings.ENVIRONMENT})")
 else:
