@@ -19,6 +19,13 @@ from typing import Dict, List, Any, Optional, Tuple
 from dataclasses import dataclass
 from openai import OpenAI
 
+# Optional: present in the FastAPI service (sentry-sdk[fastapi]); absent in some
+# standalone/legacy import contexts, so guard it.
+try:
+    import sentry_sdk
+except ImportError:
+    sentry_sdk = None
+
 # Import ingredient processor from same package
 from services.ingredient_processor import DirectIngredientProcessor, IngredientData, load_env_file
 from services.ingredient_validator import validate_ingredient_name
@@ -1727,7 +1734,25 @@ Return ONLY the DALL-E prompt, nothing else."""
                 if status_code in (401, 403) and attempt == 0 and self._ensure_ekitchen_auth():
                     self._log_and_print("🔄 eKitchen token rejected creating recipe; re-authenticated, retrying...", 'warning')
                     continue
-                self._log_and_print(f"❌ HTTP Error creating recipe: {e}", 'error')
+                # Surface the backend's ACTUAL status + response body. The generic
+                # "Failed to create recipe in eKitchen" upstream hides the real cause
+                # (e.g. a 500 'Failed to rotate token' / DB error / validation). This
+                # is the detail we were missing when imports failed last night.
+                resp_body = ''
+                try:
+                    resp_body = e.response.text if e.response is not None else ''
+                except Exception:
+                    pass
+                self._log_and_print(f"❌ HTTP Error creating recipe (HTTP {status_code}): {resp_body[:500]}", 'error')
+                if sentry_sdk is not None:
+                    with sentry_sdk.new_scope() as scope:
+                        scope.set_context("ekitchen_create", {
+                            "status_code": status_code,
+                            "response_body": resp_body[:2000],
+                            "recipe_name": create_data.get('name'),
+                            "user_id": user_id,
+                        })
+                        sentry_sdk.capture_exception(e)
                 return None
             except requests.exceptions.Timeout:
                 # The backend may still complete the create after we time out.
@@ -1741,7 +1766,14 @@ Return ONLY the DALL-E prompt, nothing else."""
                 self._log_and_print("❌ Create timed out and recipe not found in catalog", 'error')
                 return None
             except requests.exceptions.RequestException as e:
-                self._log_and_print(f"❌ HTTP Error creating recipe: {e}", 'error')
+                self._log_and_print(f"❌ Network error creating recipe: {e}", 'error')
+                if sentry_sdk is not None:
+                    with sentry_sdk.new_scope() as scope:
+                        scope.set_context("ekitchen_create", {
+                            "recipe_name": create_data.get('name'),
+                            "user_id": user_id,
+                        })
+                        sentry_sdk.capture_exception(e)
                 return None
             except Exception as e:
                 self._log_and_print(f"❌ Error creating recipe: {e}", 'error')
