@@ -1633,7 +1633,7 @@ Return ONLY the DALL-E prompt, nothing else."""
             return True
         return False
 
-    def _ensure_ekitchen_auth(self) -> bool:
+    def _ensure_ekitchen_auth(self, force: bool = False) -> bool:
         """Guarantee a usable eKitchen token, re-authenticating if it has been lost.
 
         The ingredient_processor owns the authoritative session; we delegate to its
@@ -1641,11 +1641,18 @@ Return ONLY the DALL-E prompt, nothing else."""
         local token copy so the two never drift. Without this, our copy — taken once
         at init — goes stale the moment the ingredient processor re-authenticates,
         and every recipe write would fail with a token the backend already rejected.
+
+        Pass force=True after a 401/403 to FORCE a re-login. The default path only
+        re-auths when the token is *absent* — but the common mid-run failure is a
+        token that's *present but expired* (truthy, so the default short-circuits and
+        re-copies the same dead token). On a rejection we must re-login regardless of
+        token presence, mirroring ingredient_processor's own write-path retries.
         Returns True if a valid token is available.
         """
         ip = self.ingredient_processor
-        if not ip.access_token and not ip._reauthenticate():
-            return False
+        if force or not ip.access_token:
+            if not ip._reauthenticate():
+                return False
         self.ekitchen_token = ip.access_token
         self.ekitchen_refresh_token = ip.refresh_token
         return True
@@ -1731,7 +1738,7 @@ Return ONLY the DALL-E prompt, nothing else."""
             except requests.exceptions.HTTPError as e:
                 # Token expired/rejected mid-run — re-authenticate and retry ONCE.
                 status_code = e.response.status_code if e.response is not None else None
-                if status_code in (401, 403) and attempt == 0 and self._ensure_ekitchen_auth():
+                if status_code in (401, 403) and attempt == 0 and self._ensure_ekitchen_auth(force=True):
                     self._log_and_print("🔄 eKitchen token rejected creating recipe; re-authenticated, retrying...", 'warning')
                     continue
                 # Surface the backend's ACTUAL status + response body. The generic
