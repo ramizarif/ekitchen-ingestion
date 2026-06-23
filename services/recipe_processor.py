@@ -124,7 +124,21 @@ class DirectRecipeProcessor:
         
         # Global ingredients cache for deduplication during ingestion
         self.global_ingredients_cache = {}
-    
+
+        # Lazily-built stock-image finder (primary image source; AI is the fallback)
+        self._stock_finder = None
+
+    @property
+    def stock_finder(self):
+        """Stock-image finder, reusing our OpenAI client. Disabled if keys absent."""
+        if self._stock_finder is None:
+            from services.stock_image import StockImageFinder
+            self._stock_finder = StockImageFinder(
+                openai_client=self.openai_client,
+                log=lambda m: self._log_and_print(m),
+            )
+        return self._stock_finder
+
     def _load_configuration(self) -> Dict[str, str]:
         """Load configuration from environment variables first, then fall back to files"""
         env_vars = {}
@@ -1574,6 +1588,51 @@ Return ONLY the DALL-E prompt, nothing else."""
             # Needs major style and crop enhancement
             return f"Close-up, vibrant, colorful {original_prompt} with bright saturated colors, warm even lighting, tight crop, dish fills the frame, minimal background, overhead view, recipe app photography style, home cooking aesthetic, zoomed-in macro food photography, NOT wide shot, NOT lots of background, NOT dark or moody, NOT fine dining style"
 
+    def _acquire_hero_image(self, recipe_data: dict, ai_decisions: Optional[dict],
+                            save_images_dir: Optional[str]):
+        """Acquire a hero image for a recipe: vetted real stock photo first, AI fallback.
+
+        Single shared image-sourcing step for EVERY ingestion path (user website
+        imports via process_recipe_autonomous, user video imports via
+        _process_recipe_data, and the batch orchestrator). Tries a license-free
+        Pexels/Pixabay photo that passes vision vetting; only if none qualifies does
+        it generate a DALL-E image.
+
+        Returns (image_path, image_source) where image_source is 'pexels'|'pixabay'|'ai',
+        or (None, None) if no image could be acquired (e.g. no save dir).
+        """
+        if not save_images_dir:
+            return None, None
+        os.makedirs(save_images_dir, exist_ok=True)
+        safe_filename = re.sub(r'[^\w\s-]', '', recipe_data['title']).strip().replace(' ', '_')[:50]
+        cuisine = (ai_decisions or {}).get('cuisine', '') or recipe_data.get('cuisine', '')
+
+        # 1) Primary source: a vetted, license-free real photo
+        try:
+            stock = self.stock_finder.find(recipe_data['title'], cuisine)
+        except Exception as e:
+            stock = None
+            self._log_and_print(f"⚠️  Stock image lookup error (non-blocking): {e}", 'warning')
+        if stock:
+            image_path = os.path.join(save_images_dir, f"{safe_filename}.jpg")
+            with open(image_path, 'wb') as fh:
+                fh.write(stock.jpeg_bytes)
+            self._log_and_print(
+                f"✅ Using {stock.source} photo ({stock.width}x{stock.height}) by {stock.credit or 'unknown'}")
+            return image_path, stock.source
+
+        # 2) Fallback: AI generation when no stock photo passed vetting
+        dalle_prompt = self.generate_dalle_prompt_from_recipe(recipe_data)
+        if not dalle_prompt and ai_decisions:
+            dalle_prompt = ai_decisions.get('dalle_prompt')  # autonomous path's prebuilt prompt
+        if dalle_prompt:
+            ai_path = os.path.join(save_images_dir, f"{safe_filename}.png")
+            if self.generate_recipe_image_dalle(dalle_prompt, ai_path):
+                self._log_and_print(f"✅ AI image saved: {ai_path}")
+                return ai_path, 'ai'
+            self._log_and_print("⚠️  Image generation failed, continuing without image")
+        return None, None
+
     def generate_recipe_image_dalle(self, dalle_prompt: str, save_path: str) -> bool:
         """Generate recipe image using DALL-E API with enhanced style enforcement"""
         self._log_and_print(f"🎨 Generating DALL-E image with prompt: {dalle_prompt[:100]}...")
@@ -1806,9 +1865,13 @@ Return ONLY the DALL-E prompt, nothing else."""
             self._log_and_print(f"   recipe-by-name lookup failed: {e}", 'warning')
         return None
     
-    def upload_recipe_image(self, recipe_id: str, image_path: str) -> bool:
-        """Upload recipe image to eKitchen"""
-        self._log_and_print(f"📤 Uploading image for recipe {recipe_id}: {image_path}")
+    def upload_recipe_image(self, recipe_id: str, image_path: str, source: str = "ai") -> bool:
+        """Upload recipe image to eKitchen.
+
+        source records image provenance ('ai', 'pexels', 'pixabay') so the backend
+        can distinguish AI placeholders from real licensed photos.
+        """
+        self._log_and_print(f"📤 Uploading image for recipe {recipe_id}: {image_path} (source={source})")
         
         if not self._ensure_ekitchen_auth():
             self._log_and_print("❌ Not authenticated with eKitchen", 'error')
@@ -1829,7 +1892,7 @@ Return ONLY the DALL-E prompt, nothing else."""
             with open(image_path, 'rb') as f:
                 # Use correct content type for the file
                 files = {'image': (os.path.basename(image_path), f, content_type)}
-                data = {'image_type': 'hero'}
+                data = {'image_type': 'hero', 'source': source}
                 
                 response = requests.post(
                     f"{self.ingredient_processor.ekitchen_base_url}/global-recipes/{recipe_id}/images",
@@ -2096,21 +2159,11 @@ Return ONLY the DALL-E prompt, nothing else."""
                     recipe_data['total_time'] = ai_decisions['estimated_total_time_minutes']
                     self._log_and_print(f"   Using AI-estimated total time: {recipe_data['total_time']} minutes")
 
-            # Phase 5: Generate DALL-E image (if save_images_dir provided)
-            image_path = None
+            # Phase 5: Acquire hero image — vetted real photo first, AI as fallback
             if save_images_dir:
-                self._log_and_print("\n🎨 PHASE 5: DALL-E IMAGE GENERATION")
-                dalle_prompt = self.generate_dalle_prompt_from_recipe(recipe_data)
-                if dalle_prompt:
-                    os.makedirs(save_images_dir, exist_ok=True)
-                    safe_filename = re.sub(r'[^\w\s-]', '', recipe_data['title']).strip().replace(' ', '_')[:50]
-                    image_path = os.path.join(save_images_dir, f"{safe_filename}.png")
-                    if self.generate_recipe_image_dalle(dalle_prompt, image_path):
-                        self._log_and_print(f"✅ Image saved: {image_path}")
-                    else:
-                        image_path = None
-                        self._log_and_print("⚠️  Image generation failed, continuing without image")
-            
+                self._log_and_print("\n🎨 PHASE 5: RECIPE IMAGE (stock-first, AI fallback)")
+            image_path, image_source = self._acquire_hero_image(recipe_data, ai_decisions, save_images_dir)
+
             # Phase 6: Create recipe in eKitchen
             self._log_and_print("\n📝 PHASE 6: CREATE EKITCHEN RECIPE")
             recipe_id = self.create_ekitchen_recipe(recipe_data, ai_decisions, formatted_ingredients, nutrition_data, user_id)
@@ -2122,10 +2175,10 @@ Return ONLY the DALL-E prompt, nothing else."""
                     processing_time_seconds=time.time() - start_time
                 )
             
-            # Phase 7: Upload image if generated
+            # Phase 7: Upload image if acquired
             if image_path and os.path.exists(image_path):
                 self._log_and_print("\n📤 PHASE 7: UPLOAD RECIPE IMAGE")
-                if self.upload_recipe_image(recipe_id, image_path):
+                if self.upload_recipe_image(recipe_id, image_path, source=image_source or 'ai'):
                     self._log_and_print("✅ Image uploaded successfully")
                 else:
                     self._log_and_print("⚠️  Image upload failed")
@@ -2284,31 +2337,12 @@ Return ONLY the DALL-E prompt, nothing else."""
                 recipe_data['total_time'] = ai_decisions['estimated_total_time_minutes']
                 self._log_and_print(f"   Using AI-estimated total time: {recipe_data['total_time']} minutes")
 
-            # Phase 6: Generate recipe image
-            image_generated = False
+            # Phase 5: Acquire hero image — vetted real photo first, AI as fallback
             if save_images_dir:
-                self._log_and_print("\n🎨 PHASE 5: IMAGE GENERATION")
-                os.makedirs(save_images_dir, exist_ok=True)
-                
-                # Create safe filename
-                safe_name = re.sub(r'[^\w\s-]', '', recipe_data['title'])
-                safe_name = re.sub(r'[-\s]+', '-', safe_name)
-                image_path = os.path.join(save_images_dir, f"{safe_name}.png")
-                
-                # Generate DALL-E prompt using baseline style and recipe data
-                dalle_prompt = ai_decisions['dalle_prompt']  # fallback
-                baseline_prompt = self.generate_dalle_prompt_from_recipe(recipe_data)
-                if baseline_prompt:
-                    dalle_prompt = baseline_prompt
-                    self._log_and_print(f"🎨 Using baseline-style prompt: {dalle_prompt[:100]}...")
-                else:
-                    self._log_and_print("⚠️ Baseline prompt generation failed, using AI fallback")
-                
-                image_generated = self.generate_recipe_image_dalle(
-                    dalle_prompt,
-                    image_path
-                )
-            
+                self._log_and_print("\n🎨 PHASE 5: RECIPE IMAGE (stock-first, AI fallback)")
+            image_path, image_source = self._acquire_hero_image(recipe_data, ai_decisions, save_images_dir)
+            image_generated = image_path is not None
+
             # Phase 7: Create recipe in database
             self._log_and_print("\n🏗️  PHASE 6: RECIPE CREATION")
             recipe_id = self.create_ekitchen_recipe(
@@ -2330,10 +2364,10 @@ Return ONLY the DALL-E prompt, nothing else."""
 
             self._remember_created_recipe(recipe_data.get('title'))
 
-            # Phase 8: Upload image (if generated)
-            if image_generated and recipe_id:
+            # Phase 7: Upload image (if acquired)
+            if image_path and os.path.exists(image_path) and recipe_id:
                 self._log_and_print("\n📤 PHASE 7: IMAGE UPLOAD")
-                self.upload_recipe_image(recipe_id, image_path)
+                self.upload_recipe_image(recipe_id, image_path, source=image_source or 'ai')
             
             # Success!
             processing_time = time.time() - start_time
