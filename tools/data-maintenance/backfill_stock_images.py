@@ -12,6 +12,11 @@ If nothing passes vetting, the recipe is left untouched (keeps its AI image).
 AI images were always placeholders, so the old photo is deleted (not kept) to keep
 it out of any future multi-image gallery.
 
+Idempotent + resumable: by default it SKIPS any recipe whose current thumbnail is
+already a stock photo (image_source != 'ai'), so re-running only touches recipes
+still on AI. The admin token is re-fetched automatically on 401/403, so long runs
+don't die when the token expires.
+
 SAFETY: dry-run by default. It only mutates the catalog with --execute, and even
 then prompts for confirmation unless --yes is passed.
 
@@ -22,7 +27,7 @@ Usage:
     # real run on 25 recipes (smoke test), with confirmation:
     ./venv/bin/python tools/data-maintenance/backfill_stock_images.py --limit 25 --execute
 
-    # full catalog:
+    # full catalog (resumable — skips recipes already on stock):
     ./venv/bin/python tools/data-maintenance/backfill_stock_images.py --execute --yes
 
 Env (auto-loaded from local.env if present):
@@ -66,30 +71,55 @@ from services.stock_image import StockImageFinder  # noqa: E402
 class Stats:
     scanned: int = 0
     eligible: int = 0
-    matched: int = 0          # stock photo passed vetting
-    replaced: int = 0         # uploaded + thumbnail set
+    skipped_user: int = 0          # user-created, left alone
+    skipped_existing: int = 0      # already on a stock photo, left alone
+    matched: int = 0               # stock photo passed vetting
+    replaced: int = 0              # uploaded + thumbnail set
     old_deleted: int = 0
-    skipped_user: int = 0     # user-created, left alone
-    no_match: int = 0         # no vetted stock -> kept AI
+    no_match: int = 0              # no vetted stock -> kept AI
     errors: List[str] = field(default_factory=list)
 
 
+# ── auth that self-heals on 401/403 ──────────────────────────────────────────
+class Auth:
+    """Holds the admin bearer token and transparently re-logs-in on 401/403."""
+
+    def __init__(self, base: str, email: str, password: str):
+        self.base, self.email, self.password = base, email, password
+        self.token = None
+        self.login()
+
+    def login(self):
+        r = requests.post(f"{self.base}/auth/login",
+                          json={"email": self.email, "password": self.password}, timeout=30)
+        r.raise_for_status()
+        tok = r.json().get("access_token")
+        if not tok:
+            raise RuntimeError("login ok but no access_token")
+        self.token = tok
+
+    def request(self, method: str, url: str, **kw) -> requests.Response:
+        """Issue an authed request, re-logging-in once on 401/403 and retrying.
+
+        Bodies passed as `files`/`json`/`data` are plain bytes/dicts, so they are
+        safely re-sent on the retry.
+        """
+        for attempt in range(2):
+            headers = {"Authorization": f"Bearer {self.token}"}
+            r = requests.request(method, url, headers=headers, **kw)
+            if r.status_code in (401, 403) and attempt == 0:
+                self.login()
+                continue
+            return r
+        return r
+
+
 # ── backend helpers ──────────────────────────────────────────────────────────
-def login(base: str, email: str, password: str) -> str:
-    r = requests.post(f"{base}/auth/login", json={"email": email, "password": password}, timeout=30)
-    r.raise_for_status()
-    tok = r.json().get("access_token")
-    if not tok:
-        raise RuntimeError("login ok but no access_token")
-    return tok
-
-
-def fetch_all(base: str, token: str, hard_cap: int = 5000) -> List[Dict[str, Any]]:
-    headers = {"Authorization": f"Bearer {token}"}
+def fetch_all(auth: Auth, hard_cap: int = 5000) -> List[Dict[str, Any]]:
     out, offset, size = [], 0, 200
     while len(out) < hard_cap:
-        r = requests.get(f"{base}/global-recipes/", params={"limit": size, "offset": offset},
-                         headers=headers, timeout=60)
+        r = auth.request("GET", f"{auth.base}/global-recipes/",
+                         params={"limit": size, "offset": offset}, timeout=60)
         r.raise_for_status()
         batch = r.json()
         if not batch:
@@ -101,26 +131,42 @@ def fetch_all(base: str, token: str, hard_cap: int = 5000) -> List[Dict[str, Any
     return out
 
 
-def upload_image(base: str, token: str, recipe_id: str, jpeg: bytes, source: str) -> Optional[str]:
+def current_thumbnail_source(auth: Auth, recipe_row: Dict[str, Any]) -> Optional[str]:
+    """Return the image_source of the recipe's current thumbnail ('ai'/'pexels'/'pixabay'),
+    or None on error. A recipe with no thumbnail is treated as 'ai' (replaceable)."""
+    thumb_id = recipe_row.get("thumbnail_photo_id")
+    if not thumb_id:
+        return "ai"
+    r = auth.request("GET", f"{auth.base}/global-recipes/{recipe_row['id']}/images", timeout=30)
+    if r.status_code >= 400:
+        return None
+    payload = r.json()
+    imgs = payload.get("images", []) if isinstance(payload, dict) else payload
+    for im in imgs:
+        if not isinstance(im, dict):
+            continue
+        if im.get("id") == thumb_id or im.get("is_thumbnail"):
+            return im.get("image_source") or "ai"
+    return "ai"
+
+
+def upload_image(auth: Auth, recipe_id: str, jpeg: bytes, source: str) -> Optional[str]:
     files = {"image": (f"{source}_hero.jpg", jpeg, "image/jpeg")}
     data = {"image_type": "hero", "source": source}
-    r = requests.post(f"{base}/global-recipes/{recipe_id}/images",
-                      headers={"Authorization": f"Bearer {token}"},
-                      files=files, data=data, timeout=60)
+    r = auth.request("POST", f"{auth.base}/global-recipes/{recipe_id}/images",
+                     files=files, data=data, timeout=60)
     r.raise_for_status()
     return r.json().get("id")
 
 
-def set_thumbnail(base: str, token: str, photo_id: str, recipe_id: str) -> None:
-    r = requests.post(f"{base}/photos/{photo_id}/set-thumbnail",
-                      headers={"Authorization": f"Bearer {token}"},
-                      json={"recipe_id": recipe_id}, timeout=30)
+def set_thumbnail(auth: Auth, photo_id: str, recipe_id: str) -> None:
+    r = auth.request("POST", f"{auth.base}/photos/{photo_id}/set-thumbnail",
+                     json={"recipe_id": recipe_id}, timeout=30)
     r.raise_for_status()
 
 
-def delete_image(base: str, token: str, image_id: str) -> None:
-    r = requests.delete(f"{base}/images/{image_id}",
-                        headers={"Authorization": f"Bearer {token}"}, timeout=30)
+def delete_image(auth: Auth, image_id: str) -> None:
+    r = auth.request("DELETE", f"{auth.base}/images/{image_id}", timeout=30)
     r.raise_for_status()
 
 
@@ -134,6 +180,8 @@ def main():
     ap.add_argument("--keep-old", action="store_true", help="do not delete the old AI image")
     ap.add_argument("--max-replacements", type=int, default=0,
                     help="stop after N actual replacements (0 = unlimited); useful for a single-recipe smoke test")
+    ap.add_argument("--reprocess-stock", action="store_true",
+                    help="also process recipes already on a stock photo (default: skip them)")
     ap.add_argument("--pace", type=float, default=0.4, help="seconds between recipes")
     args = ap.parse_args()
 
@@ -141,6 +189,7 @@ def main():
     mode = "EXECUTE (live writes)" if args.execute else "DRY RUN (no writes)"
     print(f"Backend: {base}")
     print(f"Mode:    {mode}")
+    print(f"Skip recipes already on stock: {not args.reprocess_stock}")
 
     if args.execute and not args.yes:
         ans = input(f"\n⚠️  This will REPLACE AI images and DELETE the old ones on {base}.\n"
@@ -154,8 +203,8 @@ def main():
         print("❌ Stock finder not enabled (missing PEXELS/PIXABAY/OPENAI keys).")
         sys.exit(1)
 
-    token = login(base, os.environ["EKITCHEN_ADMIN_EMAIL"], os.environ["EKITCHEN_ADMIN_PASSWORD"])
-    recipes = fetch_all(base, token)
+    auth = Auth(base, os.environ["EKITCHEN_ADMIN_EMAIL"], os.environ["EKITCHEN_ADMIN_PASSWORD"])
+    recipes = fetch_all(auth)
     print(f"Fetched {len(recipes)} recipes\n")
 
     st = Stats()
@@ -178,11 +227,19 @@ def main():
         cuisine = row.get("cuisine") or ""
         old_thumb = row.get("thumbnail_photo_id")
 
+        # Idempotency: skip recipes already on a real photo (resumable re-runs).
+        if not args.reprocess_stock:
+            src = current_thumbnail_source(auth, row)
+            if src in ("pexels", "pixabay"):
+                st.skipped_existing += 1
+                print(f"  ⤵  {name[:40]:40} already {src} → skip")
+                continue
+
         try:
             stock = finder.find(name, cuisine)
         except Exception as e:
             st.errors.append(f"{name}: find error: {e}")
-            print(f"  �— {name[:40]:40} ERROR finding: {e}")
+            print(f"  ✗  {name[:40]:40} ERROR finding: {e}")
             continue
 
         if not stock:
@@ -199,15 +256,15 @@ def main():
 
         # live writes
         try:
-            new_id = upload_image(base, token, rid, stock.jpeg_bytes, stock.source)
+            new_id = upload_image(auth, rid, stock.jpeg_bytes, stock.source)
             if not new_id:
                 raise RuntimeError("upload returned no id")
-            set_thumbnail(base, token, new_id, rid)
+            set_thumbnail(auth, new_id, rid)
             st.replaced += 1
             deleted = ""
             if old_thumb and old_thumb != new_id and not args.keep_old:
                 try:
-                    delete_image(base, token, old_thumb)
+                    delete_image(auth, old_thumb)
                     st.old_deleted += 1
                     deleted = " (old deleted)"
                 except Exception as e:
@@ -225,14 +282,15 @@ def main():
 
     # summary
     print("\n" + "=" * 60)
-    print(f"Scanned:           {st.scanned}")
-    print(f"Skipped (user):    {st.skipped_user}")
-    print(f"Eligible processed:{st.eligible}")
-    print(f"Stock matched:     {st.matched}  ({100*st.matched/max(st.eligible,1):.0f}% of eligible)")
-    print(f"Kept AI (no match):{st.no_match}")
+    print(f"Scanned:            {st.scanned}")
+    print(f"Skipped (user):     {st.skipped_user}")
+    print(f"Skipped (on stock): {st.skipped_existing}")
+    print(f"Eligible processed: {st.eligible}")
+    print(f"Stock matched:      {st.matched}")
+    print(f"Kept AI (no match): {st.no_match}")
     if args.execute:
-        print(f"Replaced:          {st.replaced}")
-        print(f"Old AI deleted:    {st.old_deleted}")
+        print(f"Replaced:           {st.replaced}")
+        print(f"Old AI deleted:     {st.old_deleted}")
     if st.errors:
         print(f"\nErrors ({len(st.errors)}):")
         for e in st.errors[:20]:
