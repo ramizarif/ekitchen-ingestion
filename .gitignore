@@ -63,3 +63,4 @@ config/tiktok_cookies.txt
 # Generated ingestion artifacts
 tools/recipe-ingestion/*-images/
 tools/recipe-ingestion/debug_*.png
+config/instagram_cookies.txt
