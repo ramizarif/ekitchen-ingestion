@@ -35,6 +35,7 @@ sys.path.append(os.path.join(_REPO_ROOT, 'legacy', 'src', 'processing'))
 from ingredient_processor_direct import DirectIngredientProcessor
 from direct_recipe_processor import DirectRecipeProcessor
 from services.ingredient_validator import validate_ingredient_name
+from services.quantity_parser import parse_quantity_and_unit
 
 
 class ComprehensiveIngredientRebuilder:
@@ -209,103 +210,13 @@ class ComprehensiveIngredientRebuilder:
             return []
     
     def parse_ingredient_quantity_and_unit(self, ingredient_text: str) -> Dict[str, str]:
-        """Parse quantity and unit from ingredient text using regex patterns"""
-        
-        # Common unit patterns
-        unit_patterns = {
-            # Volume
-            r'\b(cups?|cup)\b': 'cup',
-            r'\b(tablespoons?|tablespoon|tbsp|tbs)\b': 'tablespoon', 
-            r'\b(teaspoons?|teaspoon|tsp)\b': 'teaspoon',
-            r'\b(quarts?|quart|qt)\b': 'quart',
-            r'\b(pints?|pint|pt)\b': 'pint',
-            r'\b(gallons?|gallon|gal)\b': 'gallon',
-            r'\b(fluid ounces?|fluid ounce|fl oz|floz)\b': 'fluid ounce',
-            r'\b(liters?|liter|litres?|litre|l)\b': 'liter',
-            r'\b(milliliters?|milliliter|ml)\b': 'milliliter',
-            
-            # Weight
-            r'\b(pounds?|pound|lbs?|lb)\b': 'pound',
-            r'\b(ounces?|ounce|oz)\b': 'ounce', 
-            r'\b(grams?|gram|g)\b': 'gram',
-            r'\b(kilograms?|kilogram|kg)\b': 'kilogram',
-            
-            # Count/pieces
-            r'\b(pieces?|piece)\b': 'piece',
-            r'\b(slices?|slice)\b': 'slice',
-            r'\b(cloves?|clove)\b': 'clove',
-            r'\b(stalks?|stalk)\b': 'stalk',
-            r'\b(heads?|head)\b': 'head',
-            r'\b(bunches?|bunch)\b': 'bunch',
-            r'\b(strips?|strip)\b': 'strip',
-            
-            # Special
-            r'\b(cans?|can)\b': 'can',
-            r'\b(packages?|package|pkg)\b': 'package',
-            r'\b(jars?|jar)\b': 'jar',
-            r'\b(bottles?|bottle)\b': 'bottle',
-            r'\b(pinch|pinches)\b': 'pinch',
-            r'\b(dash|dashes)\b': 'dash',
-        }
-        
-        # Quantity patterns (including fractions and decimals)
-        quantity_patterns = [
-            r'^(\d+(?:\.\d+)?)\s*',  # Decimal numbers
-            r'^(\d+/\d+)\s*',        # Fractions like 1/2
-            r'^(\d+\s+\d+/\d+)\s*',  # Mixed numbers like 1 1/2
-            r'^(one|two|three|four|five|six|seven|eight|nine|ten)\s*',  # Written numbers
-        ]
-        
-        # Try to extract quantity
-        quantity = "1.0"
-        remaining_text = ingredient_text.lower().strip()
-        
-        for pattern in quantity_patterns:
-            match = re.match(pattern, remaining_text, re.IGNORECASE)
-            if match:
-                quantity_str = match.group(1)
-                
-                # Convert fractions to decimals
-                if '/' in quantity_str:
-                    if ' ' in quantity_str:  # Mixed number like "1 1/2"
-                        parts = quantity_str.split()
-                        whole = float(parts[0])
-                        frac_parts = parts[1].split('/')
-                        fraction = float(frac_parts[0]) / float(frac_parts[1])
-                        quantity = str(whole + fraction)
-                    else:  # Simple fraction like "1/2"
-                        frac_parts = quantity_str.split('/')
-                        quantity = str(float(frac_parts[0]) / float(frac_parts[1]))
-                else:
-                    # Handle written numbers
-                    written_numbers = {
-                        'one': '1', 'two': '2', 'three': '3', 'four': '4', 'five': '5',
-                        'six': '6', 'seven': '7', 'eight': '8', 'nine': '9', 'ten': '10'
-                    }
-                    if quantity_str.lower() in written_numbers:
-                        quantity = written_numbers[quantity_str.lower()]
-                    else:
-                        quantity = quantity_str
-                
-                # Remove the quantity from the text for unit parsing
-                remaining_text = remaining_text[match.end():].strip()
-                break
-        
-        # Try to extract unit (prioritize more specific units first)
-        unit = "serving"  # Default
-        
-        # Sort patterns by specificity (longer patterns first)
-        sorted_patterns = sorted(unit_patterns.items(), key=lambda x: len(x[1]), reverse=True)
-        
-        for pattern, unit_name in sorted_patterns:
-            if re.search(pattern, remaining_text, re.IGNORECASE):
-                unit = unit_name
-                break
-        
-        return {
-            'quantity': quantity,
-            'unit': unit
-        }
+        """Parse quantity and unit from ingredient text.
+
+        Delegates to services.quantity_parser, the single shared implementation.
+        Do NOT re-inline this logic here — it lived in three copies and the
+        fraction-ordering bug ("1/2 cup" parsing as 1) survived in all of them.
+        """
+        return parse_quantity_and_unit(ingredient_text)
     
     def pluralize_to_singular(self, ingredient_name: str) -> str:
         """Convert plural ingredient names to singular form"""
