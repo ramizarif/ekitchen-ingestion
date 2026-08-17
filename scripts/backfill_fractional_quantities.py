@@ -263,8 +263,12 @@ def match_row(line: str, old_qty: str, old_unit: str, new_parse: Dict[str, str],
         name = (row.get('name') or '').strip().lower()
         if not name:
             continue
-        # ingredient name (or its head noun) must actually appear in the line
-        if name in line_l or all(tok in line_l for tok in name.split() if len(tok) > 3):
+        # The ingredient name (or every substantial word of it) must actually
+        # appear in the line. Guard the all()-over-empty case: a short name like
+        # "msg" or "oil" has no tokens longer than 3 chars, and an unguarded
+        # all([]) is vacuously True — which matches the name against ANY line.
+        long_tokens = [tok for tok in name.split() if len(tok) > 3]
+        if name in line_l or (long_tokens and all(tok in line_l for tok in long_tokens)):
             candidates.append(idx)
     return candidates[0] if len(candidates) == 1 else None
 
