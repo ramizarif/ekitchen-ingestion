@@ -134,6 +134,63 @@ class TestUnits:
     def test_unknown_unit_falls_back_to_serving(self):
         assert parse_quantity_and_unit("2 large eggs")["unit"] == DEFAULT_UNIT
 
+    @pytest.mark.parametrize("text,unit", [
+        ("1 heaping tablespoon sugar", "tablespoon"),
+        ("1 large head cabbage", "head"),
+        ("2 fl oz vanilla", "fluid ounce"),
+    ])
+    def test_unit_need_not_be_adjacent_to_quantity(self, text, unit):
+        """Adjectives between quantity and unit are common; don't require anchoring."""
+        assert parse_quantity_and_unit(text)["unit"] == unit
+
+
+class TestUnitIsTheFirstOneNotTheLongestNamed:
+    """The old rule took whichever unit had the longest NAME, anywhere in the
+    line, so trailing asides hijacked the unit. Real rows from the prod audit."""
+
+    @pytest.mark.parametrize("text,unit", [
+        ("1/2 cup fresh lemon juice, plus 2 tbsp, divided", "cup"),
+        ("3 1/2 cups vegetable broth, plus 2 tablespoons, divided", "cup"),
+        ("2 1/2 cups all-purpose flour, plus 1 tablespoon, divided", "cup"),
+        ("1/4 cup extra virgin olive oil, plus 1 tablespoon, divided", "cup"),
+        ("1/2 cup sesame brittle pieces, divided", "cup"),
+        ("1/2 cup sugar, plus 1 tablespoon", "cup"),
+    ])
+    def test_trailing_aside_does_not_hijack_unit(self, text, unit):
+        assert parse_quantity_and_unit(text)["unit"] == unit
+
+    @pytest.mark.parametrize("text,unit", [
+        ("1 1/2 cups cooked basmati rice (or 1/2 cup / 100 g uncooked rice)", "cup"),
+        ("2 (8 ounce) packages cream cheese", "package"),
+        ("2 (14.5 ounce) cans diced tomatoes", "can"),
+        ("1 package (10 oz) frozen spinach", "package"),
+    ])
+    def test_parenthetical_units_are_ignored(self, text, unit):
+        assert parse_quantity_and_unit(text)["unit"] == unit
+
+    def test_earlier_smaller_unit_beats_later_bigger_one(self):
+        assert parse_quantity_and_unit("1 teaspoon plus 1 tablespoon oil")["unit"] == "teaspoon"
+        assert parse_quantity_and_unit("2 tablespoons plus 1 teaspoon oil")["unit"] == "tablespoon"
+
+    @pytest.mark.parametrize("text", [
+        "1 (14 to 16 ounce) block extra-firm tofu, patted dry and cut into pieces",
+        "2 boneless skinless chicken breasts, trimmed and cut into strips",
+        "1 whole rotisserie chicken, meat removed and torn into pieces",
+    ])
+    def test_trailing_prep_phrase_is_not_the_unit(self, text):
+        """No unit near the quantity means no unit — not one borrowed from
+        'cut into pieces' half a line away."""
+        assert parse_quantity_and_unit(text)["unit"] == DEFAULT_UNIT
+
+    def test_unit_still_found_past_a_long_parenthetical(self):
+        assert parse_quantity_and_unit("2 (14.5 ounce) cans diced tomatoes")["unit"] == "can"
+
+    def test_quantity_and_unit_fixed_together(self):
+        """Both halves of the steak-pasta-era damage, on one line."""
+        assert parse_quantity_and_unit("1/2 cup fresh lemon juice, plus 2 tbsp") == {
+            "quantity": "0.5", "unit": "cup"
+        }
+
 
 class TestEdgeCases:
     @pytest.mark.parametrize("text", ["salt, to taste", "freshly cracked black pepper", "", "   "])

@@ -84,11 +84,18 @@ UNIT_PATTERNS = {
 DEFAULT_QUANTITY = "1.0"
 DEFAULT_UNIT = "serving"
 
-# Sorted once at import: longer unit names first, so "fluid ounce" wins over
-# "ounce" and "milliliter" over "liter".
-_SORTED_UNIT_PATTERNS = sorted(
-    UNIT_PATTERNS.items(), key=lambda item: len(item[1]), reverse=True
-)
+# How far past the quantity a unit may sit and still be THE unit. Wide enough
+# for adjectives and a masked parenthetical ("2 (14.5 ounce) cans ..."), narrow
+# enough to exclude trailing prep phrases ("... cut into pieces").
+UNIT_SEARCH_WINDOW = 40
+
+_COMPILED_UNIT_PATTERNS = [
+    (re.compile(pattern, re.IGNORECASE), name) for pattern, name in UNIT_PATTERNS.items()
+]
+
+# Parenthetical asides carry units that are NOT the ingredient's unit —
+# "2 (8 ounce) packages cream cheese" is packages, not ounces.
+_PARENTHETICAL = re.compile(r'\([^)]*\)')
 
 
 def _match_quantity(text: str):
@@ -118,6 +125,33 @@ def _match_quantity(text: str):
             continue
         return value, match.end()
     return None, 0
+
+
+def _match_unit(text: str) -> str:
+    """The unit belonging to the quantity: the FIRST one in the line.
+
+    The old rule scanned the whole line and took whichever unit had the longest
+    NAME, wherever it appeared. That picked up trailing asides — "1/2 cup fresh
+    lemon juice, plus 2 tbsp, divided" became tablespoon, and "1 1/2 cups rice
+    (or 100 g uncooked)" became gram. Position is what identifies the unit, not
+    name length; ties at the same position go to the longer match so "fl oz"
+    beats the "oz" inside it.
+    """
+    masked = _PARENTHETICAL.sub(lambda m: ' ' * len(m.group()), text)
+
+    best_key = None
+    best_unit = DEFAULT_UNIT
+    for pattern, unit_name in _COMPILED_UNIT_PATTERNS:
+        match = pattern.search(masked)
+        # A unit only counts if it sits near the quantity. Past that it belongs
+        # to a preparation phrase, not the measurement: "1 (14 oz) block
+        # extra-firm tofu, cut into pieces" is not measured in pieces.
+        if not match or match.start() > UNIT_SEARCH_WINDOW:
+            continue
+        key = (match.start(), -(match.end() - match.start()))
+        if best_key is None or key < best_key:
+            best_key, best_unit = key, unit_name
+    return best_unit
 
 
 def format_quantity(value: float) -> str:
@@ -152,10 +186,4 @@ def parse_quantity_and_unit(ingredient_text: str) -> Dict[str, str]:
         quantity = format_quantity(value)
         remaining_text = remaining_text[end:].strip()
 
-    unit = DEFAULT_UNIT
-    for pattern, unit_name in _SORTED_UNIT_PATTERNS:
-        if re.search(pattern, remaining_text, re.IGNORECASE):
-            unit = unit_name
-            break
-
-    return {'quantity': quantity, 'unit': unit}
+    return {'quantity': quantity, 'unit': _match_unit(remaining_text)}
