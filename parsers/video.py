@@ -6,6 +6,8 @@ import os
 import re
 import time
 import json
+import base64
+import html as html_lib
 import tempfile
 import subprocess
 import logging
@@ -103,6 +105,21 @@ class VideoParser(BaseParser):
 
     # Path to cookies file for authenticated downloads (bypasses IP blocks)
     COOKIES_FILE = os.path.join(os.path.dirname(os.path.dirname(__file__)), 'config', 'tiktok_cookies.txt')
+    # Instagram now gates reel media behind login — unauthenticated yt-dlp gets an
+    # "empty media response". An Instagram session cookie (from a burner account) is
+    # needed to download reels. Provisioned EITHER via the INSTAGRAM_COOKIES_B64 env var
+    # (base64 of a Netscape cookies.txt — self-seeded to a temp file at first use; the
+    # secret stays out of git and works with Railway env vars) OR a local file for dev.
+    INSTAGRAM_COOKIES_FILE = os.path.join(os.path.dirname(os.path.dirname(__file__)), 'config', 'instagram_cookies.txt')
+    # Cache for the env-seeded Instagram cookie temp-file path (class-level; seed once).
+    _instagram_cookies_seeded_path = None
+
+    # Browser User-Agent for fetching public Instagram pages (caption-first path).
+    # Instagram fingerprints yt-dlp and serves it an empty media response even for
+    # public reels, but a normal browser-headers request to the public page still
+    # returns the caption — usually the full recipe for recipe reels.
+    BROWSER_UA = ('Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 '
+                  '(KHTML, like Gecko) Version/17.0 Safari/605.1.15')
 
 
     def __init__(self, timeout: int = 120, openai_client=None):
@@ -117,12 +134,61 @@ class VideoParser(BaseParser):
         self.parser_name = "video-audio-parser"
         self._openai_client = openai_client
 
-    def _ytdlp_base_args(self) -> list:
-        """Build common yt-dlp args with cookies, impersonation, and proxy for TikTok."""
-        args = ['yt-dlp']
-        # Use cookies file if it exists (needed to bypass TikTok IP blocks)
+    @classmethod
+    def _instagram_cookies_path(cls) -> Optional[str]:
+        """Return a path to an Instagram cookies file, or None if not configured.
+
+        Prefers INSTAGRAM_COOKIES_B64 (base64 Netscape cookies.txt), seeded once to a
+        temp file so the session secret never lives in git. Falls back to a committed/
+        mounted local file for development.
+        """
+        if cls._instagram_cookies_seeded_path and os.path.exists(cls._instagram_cookies_seeded_path):
+            return cls._instagram_cookies_seeded_path
+
+        b64 = os.environ.get('INSTAGRAM_COOKIES_B64', '').strip()
+        if b64:
+            try:
+                data = base64.b64decode(b64)
+                fd, path = tempfile.mkstemp(prefix='ig_cookies_', suffix='.txt')
+                with os.fdopen(fd, 'wb') as f:
+                    f.write(data)
+                os.chmod(path, 0o600)
+                cls._instagram_cookies_seeded_path = path
+                logger.info("Seeded Instagram cookies from INSTAGRAM_COOKIES_B64")
+                return path
+            except Exception as e:
+                logger.warning(f"Failed to seed Instagram cookies from env: {e}")
+
+        if os.path.exists(cls.INSTAGRAM_COOKIES_FILE):
+            return cls.INSTAGRAM_COOKIES_FILE
+        return None
+
+    def _cookies_file_for(self, url: Optional[str]) -> Optional[str]:
+        """Pick the platform-appropriate cookies file, if available.
+
+        Instagram URLs use the Instagram session cookie (login wall); everything else
+        falls back to the existing TikTok cookie file (IP-block bypass).
+        """
+        if url and self._detect_platform(url) == 'instagram':
+            ig = self._instagram_cookies_path()
+            if ig:
+                return ig
         if os.path.exists(self.COOKIES_FILE):
-            args.extend(['--cookies', self.COOKIES_FILE])
+            return self.COOKIES_FILE
+        return None
+
+    def _ytdlp_base_args(self, url: Optional[str] = None) -> list:
+        """Build common yt-dlp args with cookies, impersonation, and proxy.
+
+        Pass the target URL so the platform-appropriate cookie file is selected
+        (Instagram session vs TikTok IP-bypass).
+        """
+        args = ['yt-dlp']
+        # Use the platform-appropriate cookies file if available (TikTok IP blocks,
+        # Instagram login wall).
+        cookies_file = self._cookies_file_for(url)
+        if cookies_file:
+            args.extend(['--cookies', cookies_file])
         # Use proxy if configured (needed for datacenter IPs blocked by TikTok)
         proxy = os.environ.get('YTDLP_PROXY')
         if proxy:
@@ -148,6 +214,111 @@ class VideoParser(BaseParser):
         Instagram/Facebook/YouTube videos instead of crashing the ingestion.
         """
         return os.environ.get('YTDLP_IMPERSONATE', '').strip().lower() in ('1', 'true', 'yes')
+
+    def _fetch_instagram_caption(self, url: str) -> tuple[str, str]:
+        """Fetch a public Instagram reel's caption via the public web page.
+
+        Instagram serves yt-dlp an "empty media response" (it fingerprints yt-dlp)
+        even for fully public reels, but a normal browser-headers request to the
+        public page still returns the post's Open Graph metadata — including the
+        caption, which for recipe reels usually holds the full recipe. No login and
+        no yt-dlp, so it dodges the media block entirely.
+
+        Returns (title, caption); ('', '') on any failure (caller falls back to the
+        download path).
+        """
+        try:
+            resp = requests.get(
+                url,
+                headers={'User-Agent': self.BROWSER_UA, 'Accept-Language': 'en-US,en;q=0.9'},
+                timeout=20,
+            )
+            if resp.status_code != 200:
+                logger.warning(f"Instagram public-page caption fetch returned {resp.status_code}")
+                return '', ''
+            page = resp.text
+        except Exception as e:
+            logger.warning(f"Instagram public-page caption fetch failed: {e}")
+            return '', ''
+
+        def _og(prop: str) -> str:
+            m = re.search(rf'<meta property="og:{prop}" content="([^"]*)"', page)
+            return html_lib.unescape(m.group(1)) if m else ''
+
+        title = _og('title')
+        description = _og('description')
+
+        # og:description looks like:  '465 likes, 11 comments - user on June 28, 2026: "<caption>".'
+        # Strip the engagement/author/date prefix and the wrapping quotes to recover
+        # just the caption text.
+        caption = description
+        m = re.search(r':\s*"(.*)"\s*\.?\s*$', description, re.S)
+        if m:
+            caption = m.group(1).strip()
+
+        if caption:
+            logger.info(f"Fetched Instagram caption from public page ({len(caption)} chars)")
+        return title, caption
+
+    def _try_description_first(self, video_title: str, video_description: str,
+                               platform: Optional[str], start_time: float):
+        """Run description-first analysis on a caption/title.
+
+        Returns a ParseResult when the description alone is decisive — a full recipe
+        (skip audio/vision) or a confident non-recipe rejection — otherwise None, in
+        which case the caller continues with the audio/vision pipeline.
+        """
+        if not (video_title or video_description):
+            return None
+
+        logger.info("Analyzing video description for recipe content...")
+        desc_analysis = self._analyze_description(video_title, video_description, platform)
+
+        # Early reject: confidently not a recipe video
+        if not desc_analysis.get('is_recipe', True) and desc_analysis.get('confidence', 0) >= 0.8:
+            logger.info(f"❌ Video rejected as non-recipe from description (confidence: {desc_analysis.get('confidence', 0):.2f}): {desc_analysis.get('rejection_reason', 'unknown')}")
+            return ParseResult(
+                success=False,
+                error_code="NOT_A_RECIPE",
+                error_message=f"This video doesn't appear to be a recipe: {desc_analysis.get('rejection_reason', 'No recipe content detected')}",
+                parser_name=self.parser_name,
+                extraction_method="description_rejected"
+            )
+
+        # Full recipe found in description — skip audio/vision entirely
+        if desc_analysis.get('has_full_recipe', False) and desc_analysis.get('confidence', 0) >= 0.8 and desc_analysis.get('recipe'):
+            logger.info(f"✅ Full recipe found in description! Skipping audio/vision pipeline (saved ~${self._estimate_cost('audio_only'):.3f}+)")
+
+            recipe_data = desc_analysis['recipe']
+            # Ensure recipe has a name
+            if not recipe_data.get('name'):
+                recipe_data['name'] = video_title.split('\n')[0][:100] if video_title else 'Untitled Recipe'
+
+            # Convert structured ingredients to strings for downstream processor
+            if recipe_data.get('ingredients'):
+                string_ingredients = []
+                for ing in recipe_data['ingredients']:
+                    if isinstance(ing, dict):
+                        parts = [ing.get('quantity', ''), ing.get('unit', ''), ing.get('name', '')]
+                        string_ingredients.append(' '.join(p for p in parts if p).strip())
+                    else:
+                        string_ingredients.append(str(ing))
+                recipe_data['ingredients'] = string_ingredients
+
+            return ParseResult(
+                success=True,
+                data=recipe_data,
+                parser_name=self.parser_name,
+                confidence_score=desc_analysis.get('confidence', 0.8),
+                extraction_method="description_only",
+                frames_used=0,
+                estimated_cost=0.001,
+            )
+
+        # Partial recipe or low confidence — continue with audio/vision pipeline
+        if desc_analysis.get('is_recipe', True):
+            logger.info(f"Description suggests recipe but incomplete (confidence: {desc_analysis.get('confidence', 0):.2f}). Continuing with audio/vision pipeline.")
+        return None
 
     @property
     def openai_client(self):
@@ -347,6 +518,23 @@ class VideoParser(BaseParser):
             if resolved_url != url:
                 logger.info(f"Using resolved URL: {resolved_url}")
 
+            # Caption we may prefetch from the public page (Instagram) and reuse below.
+            prefetched_caption = ('', '')
+
+            # Step 1.5: Instagram caption-first via the PUBLIC page (no yt-dlp, no login).
+            # Instagram fingerprints yt-dlp and returns an "empty media response" even for
+            # public reels, but a browser-headers fetch of the public page still returns the
+            # caption — which for recipe reels usually contains the full recipe. Try that
+            # first: if the caption alone yields a recipe we skip the (often blocked) video
+            # download entirely. Caption-less reels fall through to the normal download path.
+            if platform == 'instagram':
+                ig_title, ig_caption = self._fetch_instagram_caption(resolved_url)
+                if ig_title or ig_caption:
+                    prefetched_caption = (ig_title, ig_caption)
+                    early = self._try_description_first(ig_title, ig_caption, platform, start_time)
+                    if early is not None:
+                        return early
+
             # Create temp directory
             temp_dir = tempfile.mkdtemp(prefix="video_recipe_")
             audio_path = os.path.join(temp_dir, "audio.mp3")
@@ -425,61 +613,18 @@ class VideoParser(BaseParser):
             download_info['platform'] = platform
             download_info['url'] = url
 
-            # Step 2.5: Description-first analysis
-            # Check if the video description already contains a full recipe
-            video_title = download_info.get('title', '')
-            video_description = download_info.get('description', video_title)
+            # Step 2.5: Description-first analysis.
+            # Prefer a caption already fetched from the public page (Instagram — avoids
+            # depending on yt-dlp metadata); fall back to the downloaded metadata's
+            # title/description. For Instagram a full-recipe caption already returned in
+            # Step 1.5; this still catches non-Instagram platforms and the case where the
+            # public-page caption was thin but yt-dlp's metadata is richer.
+            video_title = download_info.get('title', '') or prefetched_caption[0]
+            video_description = download_info.get('description', '') or prefetched_caption[1] or video_title
 
-            if video_title or video_description:
-                logger.info("Analyzing video description for recipe content...")
-                desc_analysis = self._analyze_description(video_title, video_description, platform)
-
-                # Early reject: not a recipe video
-                if not desc_analysis.get('is_recipe', True) and desc_analysis.get('confidence', 0) >= 0.8:
-                    processing_time = time.time() - start_time
-                    logger.info(f"❌ Video rejected as non-recipe from description (confidence: {desc_analysis.get('confidence', 0):.2f}): {desc_analysis.get('rejection_reason', 'unknown')}")
-                    return ParseResult(
-                        success=False,
-                        error_code="NOT_A_RECIPE",
-                        error_message=f"This video doesn't appear to be a recipe: {desc_analysis.get('rejection_reason', 'No recipe content detected')}",
-                        parser_name=self.parser_name,
-                        extraction_method="description_rejected"
-                    )
-
-                # Full recipe found in description — skip audio/vision entirely
-                if desc_analysis.get('has_full_recipe', False) and desc_analysis.get('confidence', 0) >= 0.8 and desc_analysis.get('recipe'):
-                    processing_time = time.time() - start_time
-                    logger.info(f"✅ Full recipe found in description! Skipping audio/vision pipeline (saved ~${self._estimate_cost('audio_only'):.3f}+)")
-
-                    recipe_data = desc_analysis['recipe']
-                    # Ensure recipe has a name
-                    if not recipe_data.get('name'):
-                        recipe_data['name'] = video_title.split('\n')[0][:100] if video_title else 'Untitled Recipe'
-
-                    # Convert structured ingredients to strings for downstream processor
-                    if recipe_data.get('ingredients'):
-                        string_ingredients = []
-                        for ing in recipe_data['ingredients']:
-                            if isinstance(ing, dict):
-                                parts = [ing.get('quantity', ''), ing.get('unit', ''), ing.get('name', '')]
-                                string_ingredients.append(' '.join(p for p in parts if p).strip())
-                            else:
-                                string_ingredients.append(str(ing))
-                        recipe_data['ingredients'] = string_ingredients
-
-                    return ParseResult(
-                        success=True,
-                        data=recipe_data,
-                        parser_name=self.parser_name,
-                        confidence_score=desc_analysis.get('confidence', 0.8),
-                        extraction_method="description_only",
-                        frames_used=0,
-                        estimated_cost=0.001,
-                    )
-
-                # Partial recipe or low confidence — continue with audio/vision pipeline
-                if desc_analysis.get('is_recipe', True):
-                    logger.info(f"Description suggests recipe but incomplete (confidence: {desc_analysis.get('confidence', 0):.2f}). Continuing with audio/vision pipeline.")
+            early = self._try_description_first(video_title, video_description, platform, start_time)
+            if early is not None:
+                return early
 
             # Step 3: Try audio extraction
             logger.info("Attempting audio-only extraction...")
@@ -923,7 +1068,7 @@ class VideoParser(BaseParser):
         """
         try:
             # First, get video info (title, description) - this is a lightweight metadata fetch
-            info_cmd = self._ytdlp_base_args() + [
+            info_cmd = self._ytdlp_base_args(url) + [
                 '--dump-json',
                 '--no-warnings',
                 '--no-download',
@@ -952,7 +1097,7 @@ class VideoParser(BaseParser):
             # Remove .mp3 extension as yt-dlp will add it
             output_template = output_path.replace('.mp3', '')
 
-            download_cmd = self._ytdlp_base_args() + [
+            download_cmd = self._ytdlp_base_args(url) + [
                 '-f', 'bestaudio/best',
                 '--extract-audio',
                 '--audio-format', 'mp3',
@@ -1018,7 +1163,7 @@ class VideoParser(BaseParser):
         """
         try:
             # Get video info
-            info_cmd = self._ytdlp_base_args() + [
+            info_cmd = self._ytdlp_base_args(url) + [
                 '--dump-json',
                 '--no-warnings',
                 '--no-download',
@@ -1044,7 +1189,7 @@ class VideoParser(BaseParser):
                     logger.warning("Could not parse video info JSON")
 
             # Download full video
-            download_cmd = self._ytdlp_base_args() + [
+            download_cmd = self._ytdlp_base_args(url) + [
                 '-f', 'best[ext=mp4]/best',
                 '-o', video_path,
                 '--no-warnings',
@@ -2291,7 +2436,7 @@ Return ONLY valid JSON, no other text or explanation."""
         video_path = os.path.join(temp_dir, "video.mp4")
 
         try:
-            cmd = self._ytdlp_base_args() + [
+            cmd = self._ytdlp_base_args(url) + [
                 '-f', 'best',  # Best quality video
                 '-o', video_path,
                 '--no-warnings',
