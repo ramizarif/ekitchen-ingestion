@@ -213,6 +213,16 @@ class TestAbsentAmounts:
         """The unit is real even when the amount is missing — don't drop it too."""
         assert parse_quantity_and_unit("cup of sugar") == {"quantity": None, "unit": "cup"}
 
+    @pytest.mark.parametrize("text,quantity", [
+        (".25 cup mayonnaise", "0.25"),
+        (".5 teaspoon salt", "0.5"),
+        (".75 cup flour", "0.75"),
+    ])
+    def test_leading_decimal_is_an_amount(self, text, quantity):
+        """EatingWell writes ".25 cup". A pattern needing a leading digit read
+        that as no amount, and the row then took the 1.0 placeholder."""
+        assert parse_quantity_and_unit(text)["quantity"] == quantity
+
     def test_defaults_are_absent_not_fabricated(self):
         assert DEFAULT_QUANTITY is None
         assert DEFAULT_UNIT is None

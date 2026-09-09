@@ -38,7 +38,9 @@ _QUANTITY_PATTERNS = (
     ('mixed_vulgar', re.compile(r'^(\d+)\s*(' + _VULGAR_CLASS + ')')),    # 1½ / 1 ½
     ('fraction', re.compile(r'^(\d+)\s*/\s*(\d+)')),                      # 1/2
     ('vulgar', re.compile(r'^(' + _VULGAR_CLASS + ')')),                  # ½
-    ('decimal', re.compile(r'^(\d+(?:\.\d+)?)')),                         # 2 / 0.5
+    # \d* before the point: EatingWell and others write ".25 cup", and a
+    # pattern demanding a leading digit reads that as no amount at all.
+    ('decimal', re.compile(r'^(\d*\.\d+|\d+)')),                            # 2 / 0.5 / .25
     # \b matters: without it "tenderloin" matches "ten" and parses as 10.
     ('written', re.compile(r'^(one|two|three|four|five|six|seven|eight|nine|ten)\b',
                            re.IGNORECASE)),
