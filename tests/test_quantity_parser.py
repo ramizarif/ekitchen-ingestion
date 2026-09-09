@@ -192,6 +192,32 @@ class TestUnitIsTheFirstOneNotTheLongestNamed:
         }
 
 
+class TestAbsentAmounts:
+    """A line with no amount must report no amount.
+
+    The parser used to substitute "1.0 serving", which is indistinguishable
+    downstream from a number the recipe actually gave. That produced "1.0 cup
+    sugar" on 659 catalog rows and "1.0 serving salt" on 1,504 more — see
+    docs/UNIT_REVIEW_LIST.md in the backend repo, which is the cleanup.
+    """
+
+    @pytest.mark.parametrize("text", [
+        "salt, to taste",
+        "freshly cracked black pepper",
+        "water to cover",
+    ])
+    def test_unmeasured_line_reports_neither(self, text):
+        assert parse_quantity_and_unit(text) == {"quantity": None, "unit": None}
+
+    def test_unit_without_quantity_keeps_the_unit(self):
+        """The unit is real even when the amount is missing — don't drop it too."""
+        assert parse_quantity_and_unit("cup of sugar") == {"quantity": None, "unit": "cup"}
+
+    def test_defaults_are_absent_not_fabricated(self):
+        assert DEFAULT_QUANTITY is None
+        assert DEFAULT_UNIT is None
+
+
 class TestEdgeCases:
     @pytest.mark.parametrize("text", ["salt, to taste", "freshly cracked black pepper", "", "   "])
     def test_no_quantity_uses_default(self, text):

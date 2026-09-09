@@ -81,8 +81,13 @@ UNIT_PATTERNS = {
     r'\b(dash|dashes)\b': 'dash',
 }
 
-DEFAULT_QUANTITY = "1.0"
-DEFAULT_UNIT = "serving"
+# An amount that was never in the source is not an amount. Inventing one put
+# "1.0 cup sugar" on 659 recipe rows and "1.0 serving salt" on 1,504 more, and
+# neither is distinguishable afterwards from a number the recipe really gave —
+# they simply read as fact. Absent is the honest answer, and the columns are
+# nullable precisely so it can be said.
+DEFAULT_QUANTITY = None
+DEFAULT_UNIT = None
 
 # How far past the quantity a unit may sit and still be THE unit. Wide enough
 # for adjectives and a masked parenthetical ("2 (14.5 ounce) cans ..."), narrow
@@ -127,7 +132,7 @@ def _match_quantity(text: str):
     return None, 0
 
 
-def _match_unit(text: str) -> str:
+def _match_unit(text: str) -> Optional[str]:
     """The unit belonging to the quantity: the FIRST one in the line.
 
     The old rule scanned the whole line and took whichever unit had the longest
@@ -162,7 +167,7 @@ def format_quantity(value: float) -> str:
     return '{0:g}'.format(round(value, 4))
 
 
-def parse_quantity_and_unit(ingredient_text: str) -> Dict[str, str]:
+def parse_quantity_and_unit(ingredient_text: str) -> Dict[str, Optional[str]]:
     """
     Parse a leading quantity and a unit out of a raw ingredient string.
 
@@ -171,7 +176,7 @@ def parse_quantity_and_unit(ingredient_text: str) -> Dict[str, str]:
         "½ cup heavy cream"    -> {'quantity': '0.5', 'unit': 'cup'}
         "1 1/2 cups flour"     -> {'quantity': '1.5', 'unit': 'cup'}
         "12 oz ribeye steak"   -> {'quantity': '12',  'unit': 'ounce'}
-        "salt to taste"        -> {'quantity': '1.0', 'unit': 'serving'}
+        "salt to taste"        -> {'quantity': None,  'unit': None}
 
     Ranges ("10-12 oz steak") resolve to the low end, which is what the
     original implementation did by accident and is the safer default for

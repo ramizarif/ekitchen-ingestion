@@ -547,8 +547,10 @@ Examples:
                     unit = parsed['unit']
                 else:
                     ingredient_text = scraped_ingredient.get('name', '')
-                    quantity = scraped_ingredient.get('quantity', '1.0')
-                    unit = scraped_ingredient.get('unit', 'serving')
+                    # Same rule as the parser: a scraper that reported no
+                    # amount reports none onward, rather than a fabricated 1.0.
+                    quantity = scraped_ingredient.get('quantity') or None
+                    unit = scraped_ingredient.get('unit') or None
                 
                 print(f"\n   🔍 Processing ingredient {i}: '{ingredient_text}'")
                 print(f"   📏 Parsed: {quantity} {unit}")
