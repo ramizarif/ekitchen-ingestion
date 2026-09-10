@@ -358,7 +358,10 @@ class VideoParser(BaseParser):
                 return ParseResult(
                     success=False,
                     error_code="UNSUPPORTED_PLATFORM",
-                    error_message=f"URL not recognized as TikTok, Instagram, YouTube, or Facebook: {url}",
+                    error_message=(
+                        "That link isn't one we can import from. Recipe videos work from "
+                        "TikTok, Instagram, YouTube and Facebook."
+                    ),
                     parser_name=self.parser_name
                 )
 
@@ -393,7 +396,12 @@ class VideoParser(BaseParser):
                     return ParseResult(
                         success=False,
                         error_code="TIKWM_FAILED",
-                        error_message=tikwm_metadata.get('error', 'TikWM metadata fetch failed'),
+                        # tikwm_metadata['error'] is the vendor's wording; it goes to the log,
+                        # not to the person waiting on their import.
+                        error_message=(
+                            "TikTok wouldn't give us this video. It may be private, deleted, "
+                            "or restricted in your region \u2014 try opening it in TikTok to check."
+                        ),
                         parser_name=self.parser_name
                     )
 
@@ -403,7 +411,11 @@ class VideoParser(BaseParser):
                     return ParseResult(
                         success=False,
                         error_code="TIKWM_NO_AUDIO",
-                        error_message="TikWM did not return an audio URL",
+                        error_message=(
+                            "We couldn't get this video's audio, so there's no narration to "
+                            "read a recipe from. This usually means the video is private or "
+                            "has been taken down."
+                        ),
                         parser_name=self.parser_name
                     )
 
@@ -414,7 +426,10 @@ class VideoParser(BaseParser):
                     return ParseResult(
                         success=False,
                         error_code="DOWNLOAD_FAILED",
-                        error_message=audio_download.get('error', 'Failed to download TikTok audio'),
+                        error_message=(
+                            "We couldn't download this video's audio. TikTok may be rate-limiting "
+                            "us right now \u2014 worth trying again in a few minutes."
+                        ),
                         parser_name=self.parser_name
                     )
 
@@ -472,7 +487,11 @@ class VideoParser(BaseParser):
                     return ParseResult(
                         success=False,
                         error_code="NOT_A_RECIPE",
-                        error_message=f"This video doesn't appear to be a recipe: {desc_analysis.get('rejection_reason', 'No recipe content detected')}",
+                        error_message=(
+                            "This doesn't look like a recipe video, so there's nothing to import. "
+                            "If you think that's wrong, a video that names its ingredients out "
+                            "loud or in the caption will import."
+                        ),
                         parser_name=self.parser_name,
                         extraction_method="description_rejected"
                     )
@@ -527,6 +546,39 @@ class VideoParser(BaseParser):
             else:
                 logger.info(f"Audio extraction failed: {audio_result.get('reason')}")
                 confidence = audio_result.get('confidence', 0.0)
+
+            # Step 4.5: No signal, no recipe. Stop here.
+            #
+            # If the narration gave us nothing usable AND the caption says nothing about a
+            # recipe, there is nothing left to read one FROM. What used to happen was that we
+            # downloaded the video anyway and asked GPT-4 Vision to guess from a handful of
+            # frames, which returns something recipe-shaped for almost any cooking clip: on the
+            # video that prompted this, nine ingredients with no quantities at all ("Cream",
+            # "Paprika") and steps like "Step 1: Heat olive oil in a pan." That was reported as
+            # a successful import, for about a hundred times the cost of the caption path.
+            #
+            # A confidently wrong recipe is worse than no recipe. Someone who gets one cannot
+            # tell it is wrong until they are standing in a kitchen with the wrong ingredients,
+            # and the failure they eventually attribute is to the whole feature.
+            #
+            # So fail, quickly (before the video download and the vision call) and specifically,
+            # naming which signal was missing so the person can tell this video apart from a
+            # broken importer.
+            if self._no_usable_signal(audio_result):
+                logger.info("No usable narration and no recipe in the caption — failing fast")
+                return ParseResult(
+                    success=False,
+                    error_code="NO_RECIPE_SIGNAL",
+                    error_message=(
+                        "This video doesn't say its recipe out loud, and its caption doesn't "
+                        "list one either, so there's nothing to read the ingredients from. "
+                        "Videos where the cook talks through the steps, or that write the "
+                        "recipe in the caption, import well."
+                    ),
+                    parser_name=self.parser_name,
+                    extraction_method="no_signal",
+                    frames_used=0,
+                )
 
             # Get platform-specific configuration
             platform_config = self._get_platform_config(platform)
@@ -631,10 +683,39 @@ class VideoParser(BaseParser):
                 return ParseResult(
                     success=False,
                     error_code="RECIPE_EXTRACTION_FAILED",
-                    error_message="Could not extract recipe from video",
+                    error_message=(
+                        "We could hear this video but couldn't pull a recipe out of it \u2014 the "
+                        "ingredients and steps never came through clearly enough to cook from."
+                    ),
                     parser_name=self.parser_name,
                     extraction_method=extraction_method,
                     frames_used=frames_used
+                )
+
+            # Last gate: did we end up with something anyone could cook?
+            #
+            # The gate before the routing catches videos with no signal to read. This catches
+            # the ones where the pipeline ran, produced a recipe object, and that object turns
+            # out to be a guess — every ingredient with no amount on it. See _is_cookable for
+            # why the check is quantities and why it is made here on the output rather than
+            # earlier on the inputs.
+            if not self._is_cookable(final_recipe):
+                logger.info(
+                    f"Extraction produced no usable quantities via {extraction_method}; "
+                    f"refusing to return a recipe nobody can shop from"
+                )
+                return ParseResult(
+                    success=False,
+                    error_code="NO_RECIPE_SIGNAL",
+                    error_message=(
+                        "We could see what this video was cooking, but it never says how much "
+                        "of anything to use \u2014 so the recipe would be missing every amount. "
+                        "Videos that say the quantities out loud, or write them in the caption, "
+                        "import well."
+                    ),
+                    parser_name=self.parser_name,
+                    extraction_method=extraction_method,
+                    frames_used=frames_used,
                 )
 
             # Everything from here on is bookkeeping about an extraction that has already
@@ -689,7 +770,12 @@ class VideoParser(BaseParser):
             return ParseResult(
                 success=False,
                 error_code="PARSE_ERROR",
-                error_message=str(e),
+                # str(e) is an internal exception; it belongs in the log line above and in
+                # Sentry, never in front of the person who pasted a link.
+                error_message=(
+                    "Something went wrong importing this video on our side. It's worth trying "
+                    "again \u2014 if it keeps failing, the video probably can't be imported."
+                ),
                 parser_name=self.parser_name
             )
         finally:
@@ -736,10 +822,12 @@ class VideoParser(BaseParser):
             return ParseResult(
                 success=False,
                 error_code="DOWNLOAD_FAILED",
-                # Surface the original audio error too; the video download is the
-                # secondary failure that closed off the fallback.
-                error_message=f"Audio extraction failed ({audio_error}); "
-                              f"video fallback also failed: {e}",
+                # The underlying audio and download errors are logged above; the person
+                # waiting on the import gets the consequence, not the stack of causes.
+                error_message=(
+                    "We couldn't download this video. It may be private, region-locked, or "
+                    "removed \u2014 try opening the link yourself to check it still plays."
+                ),
                 parser_name=self.parser_name,
             )
 
@@ -748,10 +836,31 @@ class VideoParser(BaseParser):
             return ParseResult(
                 success=False,
                 error_code="DOWNLOAD_FAILED",
-                error_message=f"Audio extraction failed ({audio_error}); "
-                              f"could not extract frames from video for vision fallback",
+                error_message=(
+                    "This video downloaded but we couldn't read any frames from it, so there "
+                    "was nothing to look at. The file may be corrupt on the platform's side."
+                ),
                 parser_name=self.parser_name,
             )
+
+        # Reaching here means the audio could not be fetched at all, so there is no narration
+        # and — since a caption holding a full recipe returns from parse() much earlier — no
+        # written recipe either. Guessing from frames is what this function used to do, and it
+        # is the behaviour that produced quantity-free recipes reported as successes. Same
+        # judgement as the gate in parse(): say so plainly instead.
+        return ParseResult(
+            success=False,
+            error_code="NO_RECIPE_SIGNAL",
+            error_message=(
+                "We couldn't get this video's sound, and its caption doesn't list a recipe, "
+                "so there was nothing to read the ingredients from. Videos where the cook "
+                "talks through the steps, or that write the recipe out in the caption, "
+                "import well."
+            ),
+            parser_name=self.parser_name,
+            extraction_method="no_signal",
+            frames_used=0,
+        )
 
         final_recipe = self._vision_extract_recipe(
             frames=frames,
@@ -764,7 +873,11 @@ class VideoParser(BaseParser):
             return ParseResult(
                 success=False,
                 error_code="RECIPE_EXTRACTION_FAILED",
-                error_message="Could not extract recipe from video (vision fallback)",
+                error_message=(
+                    "We watched this video but couldn't make out a recipe \u2014 no clear list of "
+                    "ingredients or steps. Videos that say the recipe out loud, or write it in "
+                    "the caption, import best."
+                ),
                 parser_name=self.parser_name,
                 extraction_method="vision_only",
                 frames_used=len(frames),
@@ -1459,6 +1572,37 @@ RULES:
         except Exception as e:
             logger.error(f"Description analysis failed: {e}")
             return error_result
+
+    @staticmethod
+    def _is_cookable(recipe_data: Dict[str, Any]) -> bool:
+        """
+        Whether this recipe could actually be shopped for and cooked.
+
+        The test is quantities. A recipe read from narration or a caption carries them —
+        "2 large chicken breasts", "3/4 cup freshly grated Parmesan". A recipe inferred from
+        video frames cannot, because a quantity is not a thing you can see, so every line comes
+        back bare: "Cream", "Paprika", "Ground beef patties (amount not specified)".
+
+        That difference is the honest signature of a guess, and it is the one signal here that
+        does not move. The input-side signals do: the same TikTok, run three times, produced
+        "insufficient audio", then "not a recipe", then a confident 0.5 and a hybrid route,
+        because the model will happily read a recipe out of song lyrics. Every one of those
+        runs produced a recipe with no quantities on any ingredient.
+
+        A recipe nobody can shop from is not a smaller success than a real one. It is a failure
+        that has learned to look like a success, and it is worse than an error message, because
+        the person only discovers it in a supermarket.
+        """
+        ingredients = recipe_data.get('ingredients') or []
+        if not ingredients:
+            return False
+        unquantified = sum(
+            1 for i in ingredients
+            if 'not specified' in str(i).lower() or 'to taste' in str(i).lower()
+        )
+        # Every line missing an amount means nothing was read; it was inferred. A few missing
+        # is normal and fine — real recipes say "salt to taste".
+        return unquantified < len(ingredients)
 
     def _generate_warnings(self, recipe_data: Dict[str, Any]) -> List[str]:
         """Generate warnings for missing or incomplete data."""
@@ -2415,6 +2559,34 @@ Return ONLY valid JSON, no other text or explanation."""
             # With 5 frames: ~$0.05
 
         return 0.0
+
+    @staticmethod
+    def _no_usable_signal(audio_result: Dict[str, Any]) -> bool:
+        """
+        Whether this video offers nothing a recipe can be read FROM.
+
+        Only two things in a video ever carry a recipe: the cook saying it, or the caption
+        writing it. By the time this is asked, the caption has already had its turn — a caption
+        holding a complete recipe returns from parse() long before here — so the question left
+        is only whether the narration gave us anything.
+
+        `success` is exactly that answer, and it is stricter than "Whisper returned text".
+        _try_audio_extraction reports failure both when there is too little audio to work with
+        and when there was speech but no recipe in it. The video that prompted all this
+        transcribes to "We never forget. Long has gone by." — real text, real Whisper success,
+        and not a recipe. Reading the transcript directly would have called that narration;
+        reading `success` does not.
+
+        What used to happen when both signals were absent was that we downloaded the video and
+        asked GPT-4 Vision to infer a recipe from a few frames. It always answers. On this video
+        it answered with nine ingredients carrying no quantities at all — "Cream", "Paprika" —
+        and steps like "Step 1: Heat olive oil in a pan." That was saved as a successful import.
+
+        A confidently wrong recipe is worse than an honest failure. Nobody can tell it is wrong
+        until they are in a kitchen holding the wrong groceries, and what they blame afterwards
+        is the feature, not the video.
+        """
+        return not audio_result.get('success')
 
     def _safe(self, produce, fallback, what: str):
         """

@@ -945,7 +945,7 @@ class TestHybridAudioVisionRouting:
 
     @pytest.mark.asyncio
     async def test_low_confidence_routes_to_vision_only(self, video_parser, mock_audio_extraction):
-        """Test that low confidence (<0.4) routes to vision-only mode."""
+        """Low-confidence audio with no recipe in the caption fails fast rather than guessing."""
         with patch.object(video_parser, '_try_audio_extraction') as mock_audio, \
              patch.object(video_parser, '_calculate_audio_confidence') as mock_confidence, \
              patch.object(video_parser, '_download_audio') as mock_download_audio, \
@@ -989,25 +989,23 @@ class TestHybridAudioVisionRouting:
 
                     result = await video_parser.parse('https://instagram.com/reel/abc123')
 
-                # Verify routing to vision-only mode
-                assert result.success
-                assert result.extraction_method == 'vision_only'
-                assert result.frames_used == 5  # Vision-only uses 5 frames
-                assert result.confidence_score == 0.2
-                assert result.fallback_reason == 'insufficient_audio'  # From audio_result['reason']
+                # Audio gave us nothing and the caption held no recipe, so there is nothing
+                # to read one FROM. This used to route to vision-only and guess from frames;
+                # it now fails instead, because a guessed recipe carries no quantities and is
+                # worse than an error — nobody can tell it is wrong until they are shopping.
+                assert result.success is False
+                assert result.error_code == 'NO_RECIPE_SIGNAL'
+                assert result.extraction_method == 'no_signal'
 
-                # Verify vision methods were called with correct params
-                mock_video.assert_called_once()
-                mock_frames.assert_called_once_with('/tmp/test/video.mp4', num_frames=5)
-                mock_vision.assert_called_once()
-
-                # Verify NO audio transcript passed to vision (vision-only)
-                vision_call_kwargs = mock_vision.call_args[1]
-                assert vision_call_kwargs.get('audio_transcript') is None
+                # And it fails BEFORE spending anything: no video download, no frames, no
+                # vision call. That is the "fast" half of a fast, clear failure.
+                mock_video.assert_not_called()
+                mock_frames.assert_not_called()
+                mock_vision.assert_not_called()
 
     @pytest.mark.asyncio
     async def test_audio_extraction_failure_routes_to_vision(self, video_parser):
-        """Test that audio extraction failure routes to vision-only mode."""
+        """Audio extraction failure now fails the import instead of guessing from frames."""
         with patch.object(video_parser, '_try_audio_extraction') as mock_audio, \
              patch.object(video_parser, '_download_audio') as mock_download_audio, \
              patch.object(video_parser, '_detect_platform') as mock_platform, \
@@ -1049,11 +1047,13 @@ class TestHybridAudioVisionRouting:
 
                     result = await video_parser.parse('https://youtube.com/shorts/xyz')
 
-                # Should fallback to vision-only
-                assert result.success
-                assert result.extraction_method == 'vision_only'
-                assert result.frames_used == 5
-                assert result.fallback_reason == 'transcription_error'  # From audio_result['reason']
+                # A transcription error leaves no narration, and this video's caption holds
+                # no recipe, so there is nothing to read one from. Vision could still produce
+                # something recipe-shaped — that is the problem, not the solution.
+                assert result.success is False
+                assert result.error_code == 'NO_RECIPE_SIGNAL'
+                assert result.extraction_method == 'no_signal'
+                assert result.error_message  # a person has to be told what happened
 
     def test_cost_estimation_audio_only(self, video_parser):
         """Test cost estimation for audio-only extraction."""
@@ -1172,10 +1172,15 @@ class TestHybridAudioVisionRouting:
 
                     result = await video_parser.parse('https://tiktok.com/@user/video/123')
 
-                # Should succeed via vision fallback
-                assert result.success
-                assert result.extraction_method == 'vision_only'
-                assert result.fallback_reason == 'not_a_recipe'  # From audio_result['reason']
+                # There is no cascade to vision any more. Audio that produced no recipe, on a
+                # video whose caption holds none either, means nothing was read — and the
+                # frames can only be guessed from. It fails, and it fails before paying for
+                # the guess.
+                assert result.success is False
+                assert result.error_code == 'NO_RECIPE_SIGNAL'
+                assert result.extraction_method == 'no_signal'
+                mock_video.assert_not_called()
+                mock_vision.assert_not_called()
 
     @pytest.mark.asyncio
     async def test_try_audio_extraction_success(self, video_parser):
@@ -1228,7 +1233,7 @@ class TestHybridAudioVisionRouting:
             mock_parse.return_value = {
                 'is_recipe': False,
                 'name': None,
-                'ingredients': [],
+                'ingredients': ['2 cups flour', '1 tsp salt', '3 tbsp butter'],
                 'steps': []
             }
 
@@ -1390,7 +1395,7 @@ class TestPlatformSpecificOptimizations:
             # Audio extraction succeeded
             mock_try_audio.return_value = {
                 'success': True,
-                'recipe_data': {'name': 'Test Recipe', 'ingredients': [], 'steps': []},
+                'recipe_data': {'name': 'Test Recipe', 'ingredients': ['2 cups flour', '1 tsp salt', '3 tbsp butter'], 'steps': []},
                 'transcript': 'Test transcript'
             }
 
@@ -1428,7 +1433,7 @@ class TestPlatformSpecificOptimizations:
             # Audio extraction succeeded
             mock_try_audio.return_value = {
                 'success': True,
-                'recipe_data': {'name': 'Test Recipe', 'ingredients': [], 'steps': []},
+                'recipe_data': {'name': 'Test Recipe', 'ingredients': ['2 cups flour', '1 tsp salt', '3 tbsp butter'], 'steps': []},
                 'transcript': 'Test transcript'
             }
 
@@ -1437,7 +1442,7 @@ class TestPlatformSpecificOptimizations:
 
             mock_video.return_value = '/tmp/video.mp4'
             mock_frames.return_value = ['frame1', 'frame2', 'frame3', 'frame4']
-            mock_vision.return_value = {'name': 'Vision Recipe', 'ingredients': [], 'steps': []}
+            mock_vision.return_value = {'name': 'Vision Recipe', 'ingredients': ['2 cups flour', '1 tsp salt', '3 tbsp butter'], 'steps': []}
 
             result = await video_parser.parse('https://instagram.com/reel/ABC123')
 
@@ -1471,7 +1476,7 @@ class TestPlatformSpecificOptimizations:
             # Audio extraction succeeded
             mock_try_audio.return_value = {
                 'success': True,
-                'recipe_data': {'name': 'Test Recipe', 'ingredients': [], 'steps': []},
+                'recipe_data': {'name': 'Test Recipe', 'ingredients': ['2 cups flour', '1 tsp salt', '3 tbsp butter'], 'steps': []},
                 'transcript': 'Test transcript'
             }
 
@@ -1480,7 +1485,7 @@ class TestPlatformSpecificOptimizations:
 
             mock_video.return_value = '/tmp/video.mp4'
             mock_frames.return_value = ['frame1', 'frame2', 'frame3']
-            mock_vision.return_value = {'name': 'Vision Recipe', 'ingredients': [], 'steps': []}
+            mock_vision.return_value = {'name': 'Vision Recipe', 'ingredients': ['2 cups flour', '1 tsp salt', '3 tbsp butter'], 'steps': []}
 
             result = await video_parser.parse('https://youtube.com/shorts/xyz')
 
@@ -1515,7 +1520,7 @@ class TestPlatformSpecificOptimizations:
             # Audio extraction succeeded
             mock_try_audio.return_value = {
                 'success': True,
-                'recipe_data': {'name': 'Test Recipe', 'ingredients': [], 'steps': []},
+                'recipe_data': {'name': 'Test Recipe', 'ingredients': ['2 cups flour', '1 tsp salt', '3 tbsp butter'], 'steps': []},
                 'transcript': 'Background music'
             }
 
@@ -1529,7 +1534,7 @@ class TestPlatformSpecificOptimizations:
                 ['frame1', 'frame2', 'frame3', 'frame4']
             ]
             mock_slideshow.return_value = True  # Detected as slideshow
-            mock_vision.return_value = {'name': 'Vision Recipe', 'ingredients': [], 'steps': []}
+            mock_vision.return_value = {'name': 'Vision Recipe', 'ingredients': ['2 cups flour', '1 tsp salt', '3 tbsp butter'], 'steps': []}
 
             result = await video_parser.parse('https://tiktok.com/@user/video/123')
 
@@ -1579,7 +1584,7 @@ class TestPlatformSpecificOptimizations:
                 mock_video.return_value = '/tmp/video.mp4'
                 mock_frames.return_value = ['frame'] * expected_vision
                 mock_slideshow.return_value = False
-                mock_vision.return_value = {'name': 'Recipe', 'ingredients': [], 'steps': []}
+                mock_vision.return_value = {'name': 'Recipe', 'ingredients': ['2 cups flour', '1 tsp salt', '3 tbsp butter'], 'steps': []}
 
                 result = await video_parser.parse(f'https://{platform}.com/video/123')
 
