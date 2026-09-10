@@ -19,6 +19,37 @@ from app.security import is_safe_url
 logger = logging.getLogger(__name__)
 
 
+# The shape _calculate_extraction_cost returns, all zeroed. Used as the fallback when cost
+# accounting fails, so downstream code that reads cost_breakdown['total'] keeps working.
+ZERO_COST_BREAKDOWN = {
+    "whisper_transcription": 0.0,
+    "gpt4_text": 0.0,
+    "gpt4_vision": 0.0,
+    "video_download": 0.0,
+    "total": 0.0,
+}
+
+
+# Container signatures for the audio formats Whisper accepts, as (offset, magic, extension).
+#
+# Whisper infers a file's format from the FILENAME it is given, not from the bytes, so handing it
+# a correctly named file is the whole job. TikTok is why this exists: TikWM's CDN serves M4A, the
+# downloader wrote it to a hardcoded "audio.mp3", and Whisper rejected every one of them with
+# "Invalid file format" — even though m4a is on its supported list. The audio was then reported as
+# "insufficient" and every TikTok fell through to vision-only.
+AUDIO_SIGNATURES = (
+    (4, b'ftyp', 'm4a'),      # ISO base media (M4A/MP4 audio)
+    (0, b'ID3', 'mp3'),       # MP3 with an ID3 tag
+    (0, b'OggS', 'ogg'),
+    (0, b'fLaC', 'flac'),
+    (0, b'RIFF', 'wav'),
+    (0, b'\x1a\x45\xdf\xa3', 'webm'),
+)
+
+# Bare MP3 frame sync, for files with no ID3 header.
+MP3_FRAME_SYNC = (b'\xff\xfb', b'\xff\xf3', b'\xff\xf2', b'\xff\xfa')
+
+
 class VideoParser(BaseParser):
     """
     Parse recipes from video URLs (TikTok, Instagram Reels, YouTube Shorts).
@@ -606,44 +637,30 @@ class VideoParser(BaseParser):
                     frames_used=frames_used
                 )
 
-            # Calculate warnings
-            warnings = self._generate_warnings(final_recipe)
-
-            # Estimate cost (legacy simple estimate)
-            estimated_cost = self._estimate_cost(
-                extraction_method,
-                frames_used=frames_used,
-                transcript_length=len(audio_result.get('transcript', ''))
+            # Everything from here on is bookkeeping about an extraction that has already
+            # succeeded, so none of it is allowed to fail the parse. See _telemetry.
+            warnings = self._safe(lambda: self._generate_warnings(final_recipe), [], "warnings")
+            estimated_cost = self._safe(
+                lambda: self._estimate_cost(
+                    extraction_method,
+                    frames_used=frames_used,
+                    transcript_length=len(audio_result.get('transcript', '')),
+                ),
+                0.0,
+                "estimated_cost",
             )
-
-            # Calculate detailed cost breakdown (Issue #39)
-            transcript = audio_result.get('transcript', '')
-            transcript_tokens = len(transcript) // 4 if transcript else 0  # Rough estimate: 4 chars/token
-
-            # Get audio duration from download_info or estimate
-            audio_duration = download_info.get('duration', 60.0)  # Default 60s if not available
-
-            # Get video file size if we downloaded it
-            video_size_mb = 0.0
-            if temp_dir and os.path.exists(temp_dir):
-                # Check if video was downloaded
-                video_files = [f for f in os.listdir(temp_dir) if f.endswith(('.mp4', '.webm', '.mkv'))]
-                if video_files:
-                    video_path = os.path.join(temp_dir, video_files[0])
-                    video_size_mb = os.path.getsize(video_path) / (1024 * 1024)  # Convert to MB
-
-            # Calculate processing time
-            processing_time_ms = int((time.time() - start_time) * 1000)
-
-            # Calculate detailed cost breakdown
-            extraction_data = {
-                'audio_duration_seconds': audio_duration,
-                'transcript_tokens': transcript_tokens,
-                'output_tokens': 500,  # Estimate GPT-4 output tokens
-                'frames_used': frames_used,
-                'video_size_mb': video_size_mb
-            }
-            cost_breakdown = self._calculate_extraction_cost(extraction_data)
+            tel = self._telemetry(
+                temp_dir=temp_dir,
+                audio_result=audio_result,
+                download_info=download_info,
+                frames_used=frames_used,
+                start_time=start_time,
+            )
+            transcript_tokens = tel['transcript_tokens']
+            audio_duration = tel['audio_duration_seconds']
+            video_size_mb = tel['video_size_mb']
+            processing_time_ms = tel['processing_time_ms']
+            cost_breakdown = tel['cost_breakdown']
 
             logger.info(f"✓ Successfully extracted recipe: {final_recipe.get('name', 'Unknown')} via {extraction_method}")
             logger.info(f"💰 Cost breakdown: ${cost_breakdown['total']:.4f} (whisper: ${cost_breakdown['whisper_transcription']:.4f}, gpt4_text: ${cost_breakdown['gpt4_text']:.4f}, gpt4_vision: ${cost_breakdown['gpt4_vision']:.4f})")
@@ -1105,20 +1122,52 @@ class VideoParser(BaseParser):
         except Exception as e:
             return {'success': False, 'error': str(e)}
 
+    @staticmethod
+    def _sniff_audio_format(data: bytes) -> Optional[str]:
+        """
+        Identify an audio container from its leading bytes.
+
+        Returns a Whisper-supported extension, or None when the bytes match nothing known —
+        in which case the caller should keep whatever name the file already has rather than
+        guess, so a genuinely odd file fails loudly instead of being mislabelled.
+        """
+        for offset, magic, ext in AUDIO_SIGNATURES:
+            if data[offset:offset + len(magic)] == magic:
+                return ext
+        if data[:2] in MP3_FRAME_SYNC:
+            return 'mp3'
+        return None
+
     def _transcribe_audio(self, audio_path: str) -> Optional[str]:
         """
         Transcribe audio using OpenAI Whisper API.
-        
+
+        The file is presented to Whisper under a name matching its ACTUAL container, because
+        Whisper reads the format off the filename and not the bytes. The name on disk is not
+        trustworthy: the TikTok path writes TikWM's M4A stream to "audio.mp3", which Whisper
+        refused outright, silently costing every TikTok import its narration.
+
         Returns transcript text or None on failure.
         """
         try:
             with open(audio_path, 'rb') as audio_file:
-                response = self.openai_client.audio.transcriptions.create(
-                    model="whisper-1",
-                    file=audio_file,
-                    language="en",  # Optimize for English
-                    response_format="text"
+                data = audio_file.read()
+
+            actual = self._sniff_audio_format(data)
+            name = os.path.basename(audio_path)
+            if actual and not name.lower().endswith('.' + actual):
+                corrected = os.path.splitext(name)[0] + '.' + actual
+                logger.info(
+                    f"Audio is {actual} but named {name}; presenting it to Whisper as {corrected}"
                 )
+                name = corrected
+
+            response = self.openai_client.audio.transcriptions.create(
+                model="whisper-1",
+                file=(name, data),
+                language="en",  # Optimize for English
+                response_format="text"
+            )
             
             transcript = response.strip() if isinstance(response, str) else str(response).strip()
             
@@ -2366,6 +2415,85 @@ Return ONLY valid JSON, no other text or explanation."""
             # With 5 frames: ~$0.05
 
         return 0.0
+
+    def _safe(self, produce, fallback, what: str):
+        """
+        Run a piece of post-extraction bookkeeping, returning `fallback` if it raises.
+
+        Everything this guards runs AFTER a recipe has already been extracted. Before this
+        existed those calls sat bare inside parse()'s try, so any exception in them was caught
+        by the outer handler and returned as PARSE_ERROR with no recipe at all — the import
+        thrown away by its own accounting, and from the caller's side indistinguishable from a
+        video that could not be parsed. Cost figures and warnings are worth having; they are
+        not worth a recipe.
+        """
+        try:
+            return produce()
+        except Exception as e:
+            logger.warning(f"Telemetry step '{what}' failed ({e}); continuing with fallback")
+            return fallback
+
+    def _measure_video_size_mb(self, temp_dir: Optional[str]) -> float:
+        """
+        Size of the downloaded video, in MB, or 0.0 if there isn't one to measure.
+
+        Deliberately tolerant: temp_dir may not exist, may have been cleaned up underneath us,
+        or may hold a file that disappears between listdir and getsize. None of those say
+        anything about whether the recipe was extracted.
+        """
+        if not temp_dir or not os.path.isdir(temp_dir):
+            return 0.0
+        for name in os.listdir(temp_dir):
+            if not name.endswith(('.mp4', '.webm', '.mkv')):
+                continue
+            try:
+                return os.path.getsize(os.path.join(temp_dir, name)) / (1024 * 1024)
+            except OSError:
+                continue
+        return 0.0
+
+    def _telemetry(
+        self,
+        *,
+        temp_dir: Optional[str],
+        audio_result: Dict[str, Any],
+        download_info: Dict[str, Any],
+        frames_used: int,
+        start_time: float,
+    ) -> Dict[str, Any]:
+        """
+        Cost and timing figures for a successful extraction. Never raises: every field has a
+        defined value even when the measurement it came from could not be taken.
+        """
+        transcript = self._safe(lambda: audio_result.get('transcript', '') or '', '', 'transcript')
+        transcript_tokens = len(transcript) // 4  # rough: ~4 chars per token
+        audio_duration = self._safe(
+            lambda: download_info.get('duration', 60.0) or 60.0, 60.0, 'audio_duration'
+        )
+        video_size_mb = self._safe(
+            lambda: self._measure_video_size_mb(temp_dir), 0.0, 'video_size_mb'
+        )
+        processing_time_ms = self._safe(
+            lambda: int((time.time() - start_time) * 1000), 0, 'processing_time_ms'
+        )
+        cost_breakdown = self._safe(
+            lambda: self._calculate_extraction_cost({
+                'audio_duration_seconds': audio_duration,
+                'transcript_tokens': transcript_tokens,
+                'output_tokens': 500,  # estimate of GPT-4 output tokens
+                'frames_used': frames_used,
+                'video_size_mb': video_size_mb,
+            }),
+            ZERO_COST_BREAKDOWN.copy(),
+            'cost_breakdown',
+        )
+        return {
+            'transcript_tokens': transcript_tokens,
+            'audio_duration_seconds': audio_duration,
+            'video_size_mb': video_size_mb,
+            'processing_time_ms': processing_time_ms,
+            'cost_breakdown': cost_breakdown,
+        }
 
     def _calculate_extraction_cost(
         self,
