@@ -2043,8 +2043,16 @@ RULES:
                     "video_url": metadata.get('url'),
                     "source_metadata": {
                         "author": None,
-                        "site_name": platform.title(),
-                        "host": platform,
+                        # detected_platform, not platform: the argument is documented as
+                        # optional and falls back to video_metadata['platform'] at the top of
+                        # this function. Reading the raw argument here threw away that fallback
+                        # and raised AttributeError on None — which the broad handler below
+                        # then logged as "GPT-4 Vision API call failed" and retried twice,
+                        # spending six seconds of backoff on a crash in our own code that no
+                        # retry could ever fix. Every call site happens to pass platform today,
+                        # so this only ever surfaced as six silently failing tests.
+                        "site_name": detected_platform.title(),
+                        "host": detected_platform,
                         "url": metadata.get('url'),
                         "video_title": title,
                         "extraction_method": "vision",
@@ -2066,6 +2074,14 @@ RULES:
                     time.sleep(retry_delay * (attempt + 1))  # Exponential backoff
                 else:
                     return None
+
+            except (AttributeError, TypeError, KeyError) as e:
+                # A bug on our side of the call, not a bad response. Retrying runs the same
+                # broken code against the same data and cannot succeed, so it only adds
+                # backoff — and lumping it in with API failures made a crash here read as a
+                # flaky provider for as long as it existed.
+                logger.error(f"Vision extraction failed while building the recipe: {e}", exc_info=True)
+                return None
 
             except Exception as e:
                 logger.error(f"GPT-4 Vision API call failed: {e}")

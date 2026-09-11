@@ -2,11 +2,66 @@
 Unit tests for VideoParser frame extraction functionality.
 """
 import os
+import socket
+
 import pytest
 import tempfile
 import subprocess
 from unittest.mock import Mock, patch, MagicMock
 from parsers.video import VideoParser
+
+
+@pytest.fixture(autouse=True)
+def no_outbound_network(monkeypatch):
+    """
+    Fail loudly if anything in this file tries to reach the internet.
+
+    Everything here is meant to be a unit test, and they were not: a full pass opened 57
+    sockets and made a real GPT-4o-mini call per parse() test. That is a bill per run, a
+    suite that goes red when a provider has a bad afternoon, and — worse — results nobody can
+    read, because a failure could always be somebody else's outage.
+
+    DNS is the seam to close rather than sockets in general: asyncio builds a local socketpair
+    for its event loop and needs no name resolution, while every real outbound request does.
+    Blocking sockets outright takes pytest-asyncio down with it.
+
+    If this fires, the fix is to mock the call, not to delete the guard.
+    """
+    def deny(*_args, **_kwargs):
+        raise AssertionError(
+            "This test tried to resolve a hostname, which means a real network call. "
+            "Mock the seam that reaches out — see no_live_description_analysis for the pattern."
+        )
+    monkeypatch.setattr(socket, "getaddrinfo", deny)
+
+
+@pytest.fixture(autouse=True)
+def no_live_description_analysis(monkeypatch):
+    """
+    Keep the suite off the network and off the bill.
+
+    parse() runs _analyze_description before anything else, and no test in this file mocked
+    it — so every run made a real GPT-4o-mini call against the key in local.env. Fifty-seven
+    sockets for one pass of a unit-test file. That is money per run, a suite that fails when a
+    provider is down, and a set of results that cannot be trusted either way.
+
+    Autouse, so a test added later cannot reintroduce it by forgetting. The default answer is
+    "recipe-ish, but no complete recipe in the caption", which is the case that lets the
+    audio/vision pipeline run and is what these routing tests are actually about. A test that
+    wants a different verdict patches _analyze_description itself and wins, since an explicit
+    patch applied inside the test body takes effect after this one.
+    """
+    monkeypatch.setattr(
+        VideoParser,
+        "_analyze_description",
+        lambda self, title, description, platform: {
+            "is_recipe": True,
+            "has_full_recipe": False,
+            "confidence": 0.4,
+            "recipe": None,
+            "rejection_reason": None,
+        },
+    )
 
 
 class TestFrameExtraction:
@@ -822,6 +877,23 @@ class TestHybridAudioVisionRouting:
     """Test suite for smart audio+vision routing logic."""
 
     @pytest.fixture
+    def workdir(self, tmp_path):
+        """
+        A real working directory, laid out the way the pipeline expects to find it.
+
+        These tests used to mock tempfile.mkdtemp to '/tmp/test' and then patch
+        os.path.exists to True across the board. That combination describes a directory that
+        exists, contains nothing, and cannot be listed or stat'd — a state no filesystem
+        produces — and parse() does all three. It is why the routing tests were red: not a
+        routing bug, a directory that only half existed.
+        """
+        d = tmp_path / "video_recipe"
+        d.mkdir()
+        (d / "audio.mp3").write_bytes(b"ID3\x04\x00\x00\x00\x00" + b"\x00" * 2048)
+        return str(d)
+
+
+    @pytest.fixture
     def video_parser(self):
         """Create VideoParser instance for testing."""
         return VideoParser(timeout=120)
@@ -843,7 +915,7 @@ class TestHybridAudioVisionRouting:
         return _mock
 
     @pytest.mark.asyncio
-    async def test_high_confidence_routes_to_audio_only(self, video_parser, mock_audio_extraction):
+    async def test_high_confidence_routes_to_audio_only(self, video_parser, mock_audio_extraction, workdir):
         """Test that high confidence (≥0.7) routes to audio-only mode."""
         with patch.object(video_parser, '_try_audio_extraction') as mock_audio, \
              patch.object(video_parser, '_calculate_audio_confidence') as mock_confidence, \
@@ -852,8 +924,14 @@ class TestHybridAudioVisionRouting:
              patch('tempfile.mkdtemp') as mock_tempdir:
 
             # Setup mocks
-            mock_tempdir.return_value = '/tmp/test'
-            mock_platform.return_value = ('youtube.com', 'https://youtube.com/watch?v=123')
+            mock_tempdir.return_value = workdir
+            # _detect_platform returns a bare platform name. It was mocked here as a
+            # (platform, url) tuple — the shape _resolve_short_url returns — and a tuple never
+            # equals 'tiktok', so _get_platform_config fell through to the unknown-platform
+            # defaults. Every test in this class was therefore exercising the same generic
+            # config, and the TikTok ones ran with detect_slideshows switched off: the branch
+            # they exist to cover was unreachable.
+            mock_platform.return_value = 'youtube'
             mock_download_audio.return_value = {
                 'success': True,
                 'title': 'Test Recipe',
@@ -870,8 +948,7 @@ class TestHybridAudioVisionRouting:
                  patch.object(video_parser, '_vision_extract_recipe') as mock_vision:
 
                 # Mock cleanup
-                with patch('os.path.exists', return_value=True), \
-                     patch('shutil.rmtree'):
+                with patch('shutil.rmtree'):
 
                     result = await video_parser.parse('https://youtube.com/watch?v=123')
 
@@ -887,17 +964,34 @@ class TestHybridAudioVisionRouting:
                 mock_vision.assert_not_called()
 
     @pytest.mark.asyncio
-    async def test_medium_confidence_routes_to_hybrid(self, video_parser, mock_audio_extraction):
+    async def test_medium_confidence_routes_to_hybrid(self, video_parser, mock_audio_extraction, workdir):
         """Test that medium confidence (0.4-0.7) routes to hybrid mode."""
         with patch.object(video_parser, '_try_audio_extraction') as mock_audio, \
              patch.object(video_parser, '_calculate_audio_confidence') as mock_confidence, \
              patch.object(video_parser, '_download_audio') as mock_download_audio, \
              patch.object(video_parser, '_detect_platform') as mock_platform, \
+             patch.object(video_parser, '_fetch_tiktok_metadata_via_tikwm') as mock_tikwm, \
+             patch.object(video_parser, '_download_from_url') as mock_dl, \
              patch('tempfile.mkdtemp') as mock_tempdir:
 
             # Setup mocks
-            mock_tempdir.return_value = '/tmp/test'
-            mock_platform.return_value = ('tiktok.com', 'https://tiktok.com/@user/video/123')
+            mock_tempdir.return_value = workdir
+            # TikTok does not go through yt-dlp: it fetches metadata and an audio URL from
+            # TikWM. Mocked because a real call here would put this suite on the network, and
+            # because it is exactly what was silently happening before the platform mock was
+            # corrected.
+            mock_tikwm.return_value = {
+                'success': True,
+                'title': 'Quick Recipe',
+                'description': 'Fast recipe',
+                'duration': 45,
+                'audio_url': 'https://tikwm.example/audio.m4a',
+                # Hybrid mode downloads the video too, and TikTok takes its video URL from
+                # this same metadata rather than from yt-dlp.
+                'video_url': 'https://tikwm.example/video.mp4',
+            }
+            mock_dl.return_value = {'success': True}
+            mock_platform.return_value = 'tiktok'
             mock_download_audio.return_value = {
                 'success': True,
                 'title': 'Quick Recipe',
@@ -913,7 +1007,7 @@ class TestHybridAudioVisionRouting:
                  patch.object(video_parser, '_extract_key_frames') as mock_frames, \
                  patch.object(video_parser, '_vision_extract_recipe') as mock_vision:
 
-                mock_video.return_value = '/tmp/test/video.mp4'
+                mock_video.return_value = workdir + '/video.mp4'
                 mock_frames.return_value = ['frame1', 'frame2', 'frame3']
                 mock_vision.return_value = {
                     'name': 'Enhanced Recipe',
@@ -922,8 +1016,7 @@ class TestHybridAudioVisionRouting:
                 }
 
                 # Mock cleanup
-                with patch('os.path.exists', return_value=True), \
-                     patch('shutil.rmtree'):
+                with patch('shutil.rmtree'):
 
                     result = await video_parser.parse('https://tiktok.com/@user/video/123')
 
@@ -934,8 +1027,13 @@ class TestHybridAudioVisionRouting:
                 assert result.confidence_score == 0.55
 
                 # Verify vision methods were called
-                mock_video.assert_called_once()
-                mock_frames.assert_called_once_with('/tmp/test/video.mp4', num_frames=3)
+                # TikTok does not fetch its video through _download_video (that is the yt-dlp
+                # path for Instagram and YouTube); it pulls the URL out of the TikWM metadata
+                # and downloads it directly. Asserting on _download_video here only passed
+                # while the platform mock was a tuple and no platform branch ever ran.
+                mock_video.assert_not_called()
+                mock_dl.assert_called()
+                mock_frames.assert_called_once()
                 mock_vision.assert_called_once()
 
                 # Verify audio transcript was passed to vision
@@ -944,7 +1042,7 @@ class TestHybridAudioVisionRouting:
                 assert vision_call_kwargs['audio_transcript'] is not None
 
     @pytest.mark.asyncio
-    async def test_low_confidence_routes_to_vision_only(self, video_parser, mock_audio_extraction):
+    async def test_low_confidence_routes_to_vision_only(self, video_parser, mock_audio_extraction, workdir):
         """Low-confidence audio with no recipe in the caption fails fast rather than guessing."""
         with patch.object(video_parser, '_try_audio_extraction') as mock_audio, \
              patch.object(video_parser, '_calculate_audio_confidence') as mock_confidence, \
@@ -953,8 +1051,8 @@ class TestHybridAudioVisionRouting:
              patch('tempfile.mkdtemp') as mock_tempdir:
 
             # Setup mocks
-            mock_tempdir.return_value = '/tmp/test'
-            mock_platform.return_value = ('instagram.com', 'https://instagram.com/reel/abc123')
+            mock_tempdir.return_value = workdir
+            mock_platform.return_value = 'instagram'
             mock_download_audio.return_value = {
                 'success': True,
                 'title': 'Recipe Reel',
@@ -975,7 +1073,7 @@ class TestHybridAudioVisionRouting:
                  patch.object(video_parser, '_extract_key_frames') as mock_frames, \
                  patch.object(video_parser, '_vision_extract_recipe') as mock_vision:
 
-                mock_video.return_value = '/tmp/test/video.mp4'
+                mock_video.return_value = workdir + '/video.mp4'
                 mock_frames.return_value = ['f1', 'f2', 'f3', 'f4', 'f5']
                 mock_vision.return_value = {
                     'name': 'Visual Recipe',
@@ -984,8 +1082,7 @@ class TestHybridAudioVisionRouting:
                 }
 
                 # Mock cleanup
-                with patch('os.path.exists', return_value=True), \
-                     patch('shutil.rmtree'):
+                with patch('shutil.rmtree'):
 
                     result = await video_parser.parse('https://instagram.com/reel/abc123')
 
@@ -1004,7 +1101,7 @@ class TestHybridAudioVisionRouting:
                 mock_vision.assert_not_called()
 
     @pytest.mark.asyncio
-    async def test_audio_extraction_failure_routes_to_vision(self, video_parser):
+    async def test_audio_extraction_failure_routes_to_vision(self, video_parser, workdir):
         """Audio extraction failure now fails the import instead of guessing from frames."""
         with patch.object(video_parser, '_try_audio_extraction') as mock_audio, \
              patch.object(video_parser, '_download_audio') as mock_download_audio, \
@@ -1012,8 +1109,8 @@ class TestHybridAudioVisionRouting:
              patch('tempfile.mkdtemp') as mock_tempdir:
 
             # Setup mocks
-            mock_tempdir.return_value = '/tmp/test'
-            mock_platform.return_value = ('youtube.com', 'https://youtube.com/shorts/xyz')
+            mock_tempdir.return_value = workdir
+            mock_platform.return_value = 'youtube'
             mock_download_audio.return_value = {
                 'success': True,
                 'title': 'Recipe Short',
@@ -1033,7 +1130,7 @@ class TestHybridAudioVisionRouting:
                  patch.object(video_parser, '_extract_key_frames') as mock_frames, \
                  patch.object(video_parser, '_vision_extract_recipe') as mock_vision:
 
-                mock_video.return_value = '/tmp/test/video.mp4'
+                mock_video.return_value = workdir + '/video.mp4'
                 mock_frames.return_value = ['f1', 'f2', 'f3', 'f4', 'f5']
                 mock_vision.return_value = {
                     'name': 'Fallback Recipe',
@@ -1042,8 +1139,7 @@ class TestHybridAudioVisionRouting:
                 }
 
                 # Mock cleanup
-                with patch('os.path.exists', return_value=True), \
-                     patch('shutil.rmtree'):
+                with patch('shutil.rmtree'):
 
                     result = await video_parser.parse('https://youtube.com/shorts/xyz')
 
@@ -1095,7 +1191,7 @@ class TestHybridAudioVisionRouting:
         assert count == 5, "Long video should use 5 frames in vision-only"
 
     @pytest.mark.asyncio
-    async def test_extraction_metadata_populated(self, video_parser, mock_audio_extraction):
+    async def test_extraction_metadata_populated(self, video_parser, mock_audio_extraction, workdir):
         """Test that extraction metadata is properly populated in ParseResult."""
         with patch.object(video_parser, '_try_audio_extraction') as mock_audio, \
              patch.object(video_parser, '_calculate_audio_confidence') as mock_confidence, \
@@ -1104,8 +1200,8 @@ class TestHybridAudioVisionRouting:
              patch('tempfile.mkdtemp') as mock_tempdir:
 
             # Setup mocks for high confidence audio-only
-            mock_tempdir.return_value = '/tmp/test'
-            mock_platform.return_value = ('youtube.com', 'https://youtube.com/watch?v=123')
+            mock_tempdir.return_value = workdir
+            mock_platform.return_value = 'youtube'
             mock_download_audio.return_value = {
                 'success': True,
                 'title': 'Test Recipe',
@@ -1115,8 +1211,7 @@ class TestHybridAudioVisionRouting:
             mock_confidence.return_value = 0.9
 
             # Mock cleanup
-            with patch('os.path.exists', return_value=True), \
-                 patch('shutil.rmtree'):
+            with patch('shutil.rmtree'):
 
                 result = await video_parser.parse('https://youtube.com/watch?v=123')
 
@@ -1129,16 +1224,33 @@ class TestHybridAudioVisionRouting:
             assert result.fallback_reason is None
 
     @pytest.mark.asyncio
-    async def test_fallback_cascading(self, video_parser):
+    async def test_fallback_cascading(self, video_parser, workdir):
         """Test graceful fallback when audio fails and vision succeeds."""
         with patch.object(video_parser, '_try_audio_extraction') as mock_audio, \
              patch.object(video_parser, '_download_audio') as mock_download_audio, \
              patch.object(video_parser, '_detect_platform') as mock_platform, \
+             patch.object(video_parser, '_fetch_tiktok_metadata_via_tikwm') as mock_tikwm, \
+             patch.object(video_parser, '_download_from_url') as mock_dl, \
              patch('tempfile.mkdtemp') as mock_tempdir:
 
             # Setup mocks
-            mock_tempdir.return_value = '/tmp/test'
-            mock_platform.return_value = ('tiktok.com', 'https://tiktok.com/@user/video/123')
+            mock_tempdir.return_value = workdir
+            # TikTok does not go through yt-dlp: it fetches metadata and an audio URL from
+            # TikWM. Mocked because a real call here would put this suite on the network, and
+            # because it is exactly what was silently happening before the platform mock was
+            # corrected.
+            mock_tikwm.return_value = {
+                'success': True,
+                'title': 'Quick Recipe',
+                'description': 'Fast recipe',
+                'duration': 45,
+                'audio_url': 'https://tikwm.example/audio.m4a',
+                # Hybrid mode downloads the video too, and TikTok takes its video URL from
+                # this same metadata rather than from yt-dlp.
+                'video_url': 'https://tikwm.example/video.mp4',
+            }
+            mock_dl.return_value = {'success': True}
+            mock_platform.return_value = 'tiktok'
             mock_download_audio.return_value = {
                 'success': True,
                 'title': 'Recipe',
@@ -1158,7 +1270,7 @@ class TestHybridAudioVisionRouting:
                  patch.object(video_parser, '_extract_key_frames') as mock_frames, \
                  patch.object(video_parser, '_vision_extract_recipe') as mock_vision:
 
-                mock_video.return_value = '/tmp/test/video.mp4'
+                mock_video.return_value = workdir + '/video.mp4'
                 mock_frames.return_value = ['f1', 'f2', 'f3', 'f4', 'f5']
                 mock_vision.return_value = {
                     'name': 'Visual Recipe',
@@ -1167,8 +1279,7 @@ class TestHybridAudioVisionRouting:
                 }
 
                 # Mock cleanup
-                with patch('os.path.exists', return_value=True), \
-                     patch('shutil.rmtree'):
+                with patch('shutil.rmtree'):
 
                     result = await video_parser.parse('https://tiktok.com/@user/video/123')
 
@@ -1266,6 +1377,23 @@ class TestHybridAudioVisionRouting:
 
 class TestPlatformSpecificOptimizations:
     """Test suite for platform-specific optimizations (Issue #38)."""
+
+    @pytest.fixture
+    def workdir(self, tmp_path):
+        """
+        A real working directory, laid out the way the pipeline expects to find it.
+
+        These tests used to mock tempfile.mkdtemp to '/tmp/test' and then patch
+        os.path.exists to True across the board. That combination describes a directory that
+        exists, contains nothing, and cannot be listed or stat'd — a state no filesystem
+        produces — and parse() does all three. It is why the routing tests were red: not a
+        routing bug, a directory that only half existed.
+        """
+        d = tmp_path / "video_recipe"
+        d.mkdir()
+        (d / "audio.mp3").write_bytes(b"ID3\x04\x00\x00\x00\x00" + b"\x00" * 2048)
+        return str(d)
+
 
     @pytest.fixture
     def video_parser(self):
@@ -1377,12 +1505,25 @@ class TestPlatformSpecificOptimizations:
     async def test_tiktok_routing_medium_confidence(self, video_parser):
         """Test TikTok routes to audio-only with confidence 0.70 (above 0.65 threshold)."""
         with patch.object(video_parser, '_detect_platform') as mock_detect, \
+             patch.object(video_parser, '_fetch_tiktok_metadata_via_tikwm') as mock_tikwm, \
+             patch.object(video_parser, '_download_from_url') as mock_dl, \
              patch.object(video_parser, '_resolve_short_url') as mock_resolve, \
              patch.object(video_parser, '_download_audio') as mock_audio, \
              patch.object(video_parser, '_try_audio_extraction') as mock_try_audio, \
              patch.object(video_parser, '_calculate_audio_confidence') as mock_confidence:
 
             mock_detect.return_value = 'tiktok'
+            # TikTok fetches metadata and its media URLs from TikWM, not yt-dlp. Unmocked,
+            # this test made a real network call on every run and failed whenever TikWM was
+            # rate-limiting — a platform test that could only pass when a third party felt
+            # like answering.
+            mock_tikwm.return_value = {
+                'success': True, 'title': 'TikTok Recipe', 'description': 'Fast recipe',
+                'duration': 30,
+                'audio_url': 'https://tikwm.example/audio.m4a',
+                'video_url': 'https://tikwm.example/video.mp4',
+            }
+            mock_dl.return_value = {'success': True}
             mock_resolve.return_value = ('https://tiktok.com/@user/video/123', None)
             mock_audio.return_value = {
                 'success': True,
@@ -1498,6 +1639,8 @@ class TestPlatformSpecificOptimizations:
     async def test_tiktok_slideshow_detection(self, video_parser):
         """Test TikTok slideshow detection switches to vision-only mode."""
         with patch.object(video_parser, '_detect_platform') as mock_detect, \
+             patch.object(video_parser, '_fetch_tiktok_metadata_via_tikwm') as mock_tikwm, \
+             patch.object(video_parser, '_download_from_url') as mock_dl, \
              patch.object(video_parser, '_resolve_short_url') as mock_resolve, \
              patch.object(video_parser, '_download_audio') as mock_audio, \
              patch.object(video_parser, '_try_audio_extraction') as mock_try_audio, \
@@ -1508,6 +1651,17 @@ class TestPlatformSpecificOptimizations:
              patch.object(video_parser, '_vision_extract_recipe') as mock_vision:
 
             mock_detect.return_value = 'tiktok'
+            # TikTok fetches metadata and its media URLs from TikWM, not yt-dlp. Unmocked,
+            # this test made a real network call on every run and failed whenever TikWM was
+            # rate-limiting — a platform test that could only pass when a third party felt
+            # like answering.
+            mock_tikwm.return_value = {
+                'success': True, 'title': 'TikTok Recipe', 'description': 'Fast recipe',
+                'duration': 30,
+                'audio_url': 'https://tikwm.example/audio.m4a',
+                'video_url': 'https://tikwm.example/video.mp4',
+            }
+            mock_dl.return_value = {'success': True}
             mock_resolve.return_value = ('https://tiktok.com/@user/video/123', None)
             mock_audio.return_value = {
                 'success': True,
@@ -1545,48 +1699,114 @@ class TestPlatformSpecificOptimizations:
             assert result.frames_used == 4  # TikTok max_frames for slideshows
 
     @pytest.mark.asyncio
-    async def test_platform_specific_frame_counts(self, video_parser):
-        """Test platform-specific frame counts are used correctly."""
-        test_cases = [
-            ('tiktok', 3, 4),      # default_frames=3, max_frames=4
-            ('instagram', 4, 5),   # default_frames=4, max_frames=5
-            ('youtube', 3, 4),     # default_frames=3, max_frames=4
-        ]
+    async def test_platform_specific_frame_counts(self, video_parser, workdir):
+        """Each platform pulls its own number of frames in hybrid mode."""
+        cases = [('tiktok', 3), ('instagram', 4), ('youtube', 3)]
 
-        for platform, expected_hybrid, expected_vision in test_cases:
+        for platform, expected_frames in cases:
             with patch.object(video_parser, '_detect_platform') as mock_detect, \
+                 patch.object(video_parser, '_fetch_tiktok_metadata_via_tikwm') as mock_tikwm, \
+                 patch.object(video_parser, '_download_from_url') as mock_dl, \
+                 patch.object(video_parser, '_resolve_short_url') as mock_resolve, \
+                 patch.object(video_parser, '_download_audio') as mock_audio, \
+                 patch.object(video_parser, '_try_audio_extraction') as mock_try_audio, \
+                 patch.object(video_parser, '_calculate_audio_confidence') as mock_conf, \
+                 patch.object(video_parser, '_download_video') as mock_video, \
+                 patch.object(video_parser, '_download_video_for_platform') as mock_dvp, \
+                 patch.object(video_parser, '_extract_key_frames') as mock_frames, \
+                 patch.object(video_parser, '_is_slideshow_video') as mock_slideshow, \
+                 patch.object(video_parser, '_vision_extract_recipe') as mock_vision, \
+                 patch('tempfile.mkdtemp') as mock_tempdir, \
+                 patch('shutil.rmtree'):
+
+                mock_tempdir.return_value = workdir
+                mock_detect.return_value = platform
+                mock_tikwm.return_value = {
+                    'success': True, 'title': 'Test Recipe', 'description': 'Test description',
+                    'duration': 30,
+                    'audio_url': 'https://tikwm.example/audio.m4a',
+                    'video_url': 'https://tikwm.example/video.mp4',
+                }
+                mock_dl.return_value = {'success': True}
+                mock_resolve.return_value = (f'https://{platform}.com/video/123', None)
+                mock_audio.return_value = {
+                    'success': True, 'title': 'Test Recipe', 'description': 'Test description',
+                    'platform': platform, 'url': f'https://{platform}.com/video/123',
+                }
+                # Audio worked, but not well enough to stand alone — which is exactly what
+                # hybrid mode is for: a real transcript, topped up with frames.
+                mock_try_audio.return_value = {
+                    'success': True,
+                    'transcript': 'Brown the butter, then whisk in the flour.',
+                    'recipe_data': {'name': 'Test Recipe',
+                                    'ingredients': ['2 cups flour'], 'steps': ['Mix']},
+                }
+                mock_conf.return_value = 0.55
+                mock_video.return_value = workdir + '/video.mp4'
+                mock_dvp.return_value = workdir + '/video.mp4'
+                mock_frames.return_value = ['frame'] * expected_frames
+                mock_slideshow.return_value = False
+                mock_vision.return_value = {
+                    'name': 'Recipe',
+                    'ingredients': ['2 cups flour', '1 tsp salt', '3 tbsp butter'],
+                    'steps': ['Mix', 'Bake'],
+                }
+
+                result = await video_parser.parse(f'https://{platform}.com/video/123')
+
+                assert result.success, f"{platform} hybrid extraction should succeed"
+                assert result.extraction_method == 'hybrid'
+                assert result.frames_used == expected_frames, (
+                    f"{platform} hybrid should request {expected_frames} frames, "
+                    f"got {result.frames_used}"
+                )
+
+    @pytest.mark.asyncio
+    async def test_no_signal_fails_on_every_platform(self, video_parser, workdir):
+        """
+        There is no vision-only route any more, on any platform.
+
+        This replaces the vision-only half of the frame-count test above. Guessing a recipe
+        from frames, with no narration and no recipe in the caption, is the behaviour that
+        produced quantity-free recipes reported as successes — so the frame counts it used to
+        assert no longer describe anything. What matters now is that the refusal is uniform.
+        """
+        for platform in ('tiktok', 'instagram', 'youtube'):
+            with patch.object(video_parser, '_detect_platform') as mock_detect, \
+                 patch.object(video_parser, '_fetch_tiktok_metadata_via_tikwm') as mock_tikwm, \
+                 patch.object(video_parser, '_download_from_url') as mock_dl, \
                  patch.object(video_parser, '_resolve_short_url') as mock_resolve, \
                  patch.object(video_parser, '_download_audio') as mock_audio, \
                  patch.object(video_parser, '_try_audio_extraction') as mock_try_audio, \
                  patch.object(video_parser, '_download_video') as mock_video, \
                  patch.object(video_parser, '_extract_key_frames') as mock_frames, \
-                 patch.object(video_parser, '_is_slideshow_video') as mock_slideshow, \
-                 patch.object(video_parser, '_vision_extract_recipe') as mock_vision:
+                 patch.object(video_parser, '_vision_extract_recipe') as mock_vision, \
+                 patch('tempfile.mkdtemp') as mock_tempdir, \
+                 patch('shutil.rmtree'):
 
+                mock_tempdir.return_value = workdir
                 mock_detect.return_value = platform
+                mock_tikwm.return_value = {
+                    'success': True, 'title': '', 'description': '', 'duration': 30,
+                    'audio_url': 'https://tikwm.example/audio.m4a',
+                    'video_url': 'https://tikwm.example/video.mp4',
+                }
+                mock_dl.return_value = {'success': True}
                 mock_resolve.return_value = (f'https://{platform}.com/video/123', None)
                 mock_audio.return_value = {
-                    'success': True,
-                    'title': 'Test Recipe',
-                    'description': 'Test description',
-                    'platform': platform,
-                    'url': f'https://{platform}.com/video/123'
+                    'success': True, 'title': '', 'description': '',
+                    'platform': platform, 'url': f'https://{platform}.com/video/123',
                 }
-
-                # Low confidence for vision-only mode
                 mock_try_audio.return_value = {
-                    'success': False,
-                    'confidence': 0.1,
-                    'recipe_data': None,
-                    'reason': 'low_confidence'
+                    'success': False, 'confidence': 0.1, 'recipe_data': None,
+                    'reason': 'insufficient_audio', 'transcript': '',
                 }
-
-                mock_video.return_value = '/tmp/video.mp4'
-                mock_frames.return_value = ['frame'] * expected_vision
-                mock_slideshow.return_value = False
-                mock_vision.return_value = {'name': 'Recipe', 'ingredients': ['2 cups flour', '1 tsp salt', '3 tbsp butter'], 'steps': []}
 
                 result = await video_parser.parse(f'https://{platform}.com/video/123')
 
-                # Should use platform-specific max_frames for vision-only
-                assert result.frames_used == expected_vision, f"{platform} should use {expected_vision} frames for vision-only"
+                assert result.success is False, f"{platform} should refuse to guess"
+                assert result.error_code == 'NO_RECIPE_SIGNAL'
+                assert result.error_message, "a person has to be told what happened"
+                mock_video.assert_not_called()
+                mock_frames.assert_not_called()
+                mock_vision.assert_not_called()
