@@ -20,7 +20,11 @@ _SITE_RECIPE_PATTERNS = {
     "tasty.co": re.compile(r"^/recipe/[a-z0-9][a-z0-9-]+/?$", re.I),
     "simplyrecipes.com": re.compile(r"^/recipes/[a-z0-9][a-z0-9_-]+/?$", re.I),
     "eatingwell.com": re.compile(r"^/recipe/\d+/", re.I),
-    "allrecipes.com": re.compile(r"^/recipe/\d+/", re.I),
+    # Allrecipes runs two URL schemes side by side: the legacy /recipe/<id>/<slug>/ and a
+    # newer flat /<slug>-recipe-<id>. Both are in our own catalog, so both are live. Matching
+    # only the legacy one made every modern article invisible to the harvester — which is our
+    # single biggest source by volume (264 recipes), so listing pages were coming back empty.
+    "allrecipes.com": re.compile(r"^/recipe/\d+/|^/[a-z0-9][a-z0-9-]*-recipe-\d+/?$", re.I),
     "foodnetwork.com": re.compile(r"^/recipes/.+-\d{3,}/?$", re.I),
     "bbcgoodfood.com": re.compile(r"^/recipes/[a-z0-9][a-z0-9-]+/?$", re.I),
     "epicurious.com": re.compile(r"^/recipes/food/views/[a-z0-9][a-z0-9-]+/?$", re.I),

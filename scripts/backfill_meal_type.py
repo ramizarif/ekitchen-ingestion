@@ -187,10 +187,11 @@ Return ONLY the meal type word, nothing else."""
         self._log(f"   ❌ apply failed: {resp.status_code} - {resp.text[:160]}", "error")
         return False
 
-    def run(self, dry_run: bool, limit: Optional[int] = None):
+    def run(self, dry_run: bool, limit: Optional[int] = None, only_missing: bool = False):
         self._log("🚀 Meal-Type Backfill (F2)")
         self._log("=" * 70)
-        self._log(f"Mode: {'DRY RUN (no writes)' if dry_run else 'APPLY'}")
+        self._log(f"Mode: {'DRY RUN (no writes)' if dry_run else 'APPLY'}"
+                  + (" · only recipes with no meal_type" if only_missing else ""))
         self._log("=" * 70)
         if not self.authenticate():
             self._log("❌ Authentication failed", "error")
@@ -208,7 +209,10 @@ Return ONLY the meal type word, nothing else."""
                 rid = rec.get("id")
                 name = rec.get("name", "")
                 # Resume: skip recipes already classified (idempotent re-runs are cheap).
-                if not dry_run and rec.get("meal_type"):
+                # --only-missing extends that skip to dry runs, which otherwise re-classify
+                # the whole catalog: on a re-run that is ~10x the AI spend, and it buries
+                # the handful of genuinely unclassified recipes in 800 lines of noise.
+                if (not dry_run or only_missing) and rec.get("meal_type"):
                     self.stats["already_classified"] += 1
                     continue
                 meal_type = seed_from_tags(rec.get("tag_names", []))
@@ -260,11 +264,13 @@ def main():
     parser.add_argument("--apply", action="store_true", help="Classify + persist")
     parser.add_argument("--limit", type=int, help="Max recipes to process")
     parser.add_argument("--no-logs", action="store_true", help="Disable file logging")
+    parser.add_argument("--only-missing", action="store_true",
+                        help="Only touch recipes with no meal_type (applies the resume skip to dry runs too)")
     args = parser.parse_args()
     if args.dry_run == args.apply:
         print("❌ Specify exactly one of --dry-run or --apply")
         return
-    MealTypeBackfiller(log_to_file=not args.no_logs).run(dry_run=args.dry_run, limit=args.limit)
+    MealTypeBackfiller(log_to_file=not args.no_logs).run(dry_run=args.dry_run, limit=args.limit, only_missing=args.only_missing)
 
 
 if __name__ == "__main__":
