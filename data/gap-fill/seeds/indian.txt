@@ -1,0 +1,21 @@
+# Indian seeds (quota +18) — catalog already has 15 curries (mostly veg/chickpea),
+# butter chicken, tikka masala, biryani, palak paneer, aloo gobi, dals, rajma
+# missing: quick chicken mains, keema, egg curry, street-style, non-curry mains
+chicken keema ground chicken curry quick
+beef keema matar
+egg curry masala quick
+chicken 65
+quick chicken curry weeknight 30 minutes
+tandoori chicken oven quick no marinade
+chicken jalfrezi
+masala scrambled eggs anda bhurji
+jeera rice cumin rice
+aloo matar quick
+bhindi masala okra
+tawa chicken skillet
+kati roll chicken wrap
+chana chaat chickpea salad
+garlic butter chicken naan bowls
+saag chicken spinach curry quick
+masoor dal tadka quick
+pav bhaji quick

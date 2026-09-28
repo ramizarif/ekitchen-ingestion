@@ -1,0 +1,70 @@
+# Breakfast seeds (P-12, quota +30)
+#
+# The catalog has 55 breakfast recipes against dinner's 512. But the count is not the
+# interesting number — the SHAPE is:
+#
+#   41 of 55 are American (75%)
+#   9 pancake variants, 6 waffles, 4 overnight oats, 2 french toast
+#   two of them are both literally "Buttermilk Pancakes" (allrecipes + tasty, different
+#   sources, same dish)
+#
+# That matters twice over. The plan feed penalises cuisine repeats when it reranks, so a
+# 75%-American pool partly suppresses itself; and the listing pages we were blocked from
+# (allrecipes/eatingwell breakfast categories) are exactly where MORE American pancakes
+# come from. Cloudflare was stopping us from making the problem worse.
+#
+# So these seeds are chosen against the shape, not the count: non-American where possible,
+# and no archetype the catalog already has nine of.
+#
+# ALREADY IN THE CATALOG — do not seed these again:
+#   pancakes (x9), waffles (x6), overnight oats (x4), french toast (x2), scrambled eggs,
+#   fried eggs, omelette (x3), shakshuka, menemen, egg bhurji, gyeran bap, migas, huevos
+#   rancheros, cilbir, eggs benedict, quiche lorraine, idli, breakfast burritos, breakfast
+#   sandwich, berry parfait, smoothies (x2), brunch bakes (x4), sausage gravy and biscuits,
+#   blueberry muffins, croque madame, breakfast cookies
+#
+# --- East + Southeast Asia (catalog has 1 Korean, 0 Japanese, 0 Chinese breakfast) ---
+japanese tamagoyaki rolled omelette
+japanese breakfast set rice miso grilled salmon
+onigiri rice ball breakfast
+chinese congee jook savory rice porridge
+youtiao chinese fried dough breakfast
+chinese steamed bao breakfast buns
+filipino tapsilog garlic rice breakfast
+filipino tocilog breakfast
+vietnamese banh mi op la fried egg baguette
+korean juk rice porridge breakfast
+# --- South Asia (catalog has idli + egg bhurji only) ---
+masala dosa breakfast
+aloo paratha indian breakfast
+poha indian flattened rice breakfast
+upma south indian breakfast
+uttapam savory indian breakfast
+# --- Middle East + North Africa (catalog has cilbir, menemen) ---
+ful medames egyptian breakfast
+manakish zaatar lebanese breakfast
+labneh breakfast bowl olive oil
+shakshuka green zhoug variation
+msemen moroccan flatbread breakfast
+# --- Latin America + Caribbean (catalog has migas, huevos rancheros, burritos) ---
+chilaquiles verdes breakfast
+arepas con queso breakfast
+molletes mexican breakfast
+ackee and saltfish jamaican breakfast
+pan con tomate spanish breakfast
+# --- Europe beyond France (catalog has croque madame, quiche) ---
+full english breakfast fry up
+bircher muesli swiss breakfast
+smorrebrod danish breakfast open sandwich
+syrniki russian cheese breakfast
+# --- American, but archetypes the catalog does NOT have ---
+# Included deliberately: these are missing SHAPES (toast, hash, grits, tacos, bowls), not
+# a tenth pancake. Kept to a handful so the pool does not tilt American again.
+avocado toast breakfast
+sweet potato breakfast hash skillet
+shrimp and grits breakfast
+breakfast tacos
+savory breakfast grain bowl
+chia seed pudding breakfast
+homemade granola breakfast
+bagel with lox and cream cheese

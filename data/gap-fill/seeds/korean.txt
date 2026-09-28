@@ -1,0 +1,19 @@
+# Korean seeds (quota +15) — catalog already has: bulgogi (75min), bibimbap x2,
+# kimchi fried rice, japchae, tteokbokki, galbi, fried chicken, jajangmyeon,
+# pajeon, budae jjigae — missing: quick stews, gochujang mains, ground beef bowls
+kimchi jjigae quick
+sundubu jjigae soft tofu stew
+doenjang jjigae
+korean ground beef bowl quick
+chicken bulgogi quick
+dak galbi spicy chicken
+gochujang glazed salmon
+gochujang chicken thighs
+korean cucumber salad oi muchim
+kimchi udon stir fry
+korean spicy pork bulgogi jeyuk bokkeum
+gyeran bap egg rice
+korean corn cheese
+gamja jorim braised potatoes
+spicy gochujang noodles bibim guksu
+kimchi grilled cheese

@@ -1,0 +1,19 @@
+# Thai seeds (quota +15) — catalog already has: pad thai x2, pad see ew,
+# pad krapow, peanut noodles, 8 curries, tom kha, tom yum cod, beef salad
+# missing: larb, fried rice, cashew chicken, satay, drunken noodles, som tum
+thai larb chicken
+thai basil fried rice
+thai cashew chicken
+chicken satay peanut sauce
+drunken noodles pad kee mao
+som tum green papaya salad
+thai garlic pepper chicken
+tom yum soup shrimp quick
+thai glass noodle salad yum woon sen
+thai red curry shrimp quick
+thai ground pork stir fry
+khao pad pineapple fried rice
+thai sweet chili salmon
+pad prik king green beans chicken
+thai coconut chicken soup quick
+crying tiger beef

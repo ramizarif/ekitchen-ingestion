@@ -47,12 +47,54 @@ SEEDS_DIR = DATA_DIR / "seeds"
 
 # Gap cuisines and ingestion quotas, from INGESTION_CUISINE_GAPS.md.
 GAP_CUISINES = {
-    "caribbean": {"label": "Caribbean", "quota": 24},
-    "middle-eastern": {"label": "Middle Eastern", "quota": 15},
-    "thai": {"label": "Thai", "quota": 15},
-    "korean": {"label": "Korean", "quota": 15},
-    "indian": {"label": "Indian", "quota": 18},
+    "caribbean": {"label": "Caribbean", "quota": 24, "kind": "cuisine"},
+    "middle-eastern": {"label": "Middle Eastern", "quota": 15, "kind": "cuisine"},
+    "thai": {"label": "Thai", "quota": 15, "kind": "cuisine"},
+    "korean": {"label": "Korean", "quota": 15, "kind": "cuisine"},
+    "indian": {"label": "Indian", "quota": 18, "kind": "cuisine"},
 }
+
+# Meal-type gaps (P-12). Same machinery, different axis: a gap is "a slice of the catalog we
+# are short of", and breakfast is short in exactly the way Caribbean was — 55 recipes against
+# dinner's 512. The axis matters for the dedupe and the inventory, not for search or scoring,
+# so the only thing that changes is how members_of_gap() picks the slice.
+GAP_MEAL_TYPES = {
+    "breakfast": {"label": "Breakfast", "quota": 30, "kind": "meal_type", "meal_type": "breakfast"},
+}
+
+# Dish-list gaps (P-04b). A third axis: not a slice of the catalog at all, but a named list of
+# dishes we want to exist. `members_of_gap` has nothing to report for these — the gap IS the seed
+# file — so inventory says so rather than printing a misleading "0 recipes".
+GAP_DISH_LISTS = {
+    # `rail` is the super-easy rail's own query, applied as a selection filter — see
+    # cmd_select_dish_list. Keep these three numbers in sync with the backend query.
+    "easy-essentials": {
+        "label": "Easy Essentials", "quota": 9, "kind": "dish_list",
+        # No step limit, deliberately. A <=6 step cut excluded exactly three recipes in prod —
+        # 3-Ingredient Peanut Butter Cookies, Grilled Cheese and Waffle Breakfast Sandwich — all
+        # false negatives, and two of them the most iconic super-easy dishes we have. Step count
+        # measures how granularly a source wrote its instructions, not how hard the dish is.
+        "rail": {"max_minutes": 20, "max_ingredients": 8, "max_steps": 99},
+        "seeded_dishes": (
+            "bacon and egg sandwich", "grilled cheese sandwich", "blt sandwich",
+            "mashed potatoes", "roast chicken breast", "pan fried pork chops",
+            "cheese pizza", "buttered egg noodles", "no bake energy bites",
+        ),
+    },
+}
+
+GAPS = {**GAP_CUISINES, **GAP_MEAL_TYPES, **GAP_DISH_LISTS}
+
+
+def members_of_gap(catalog, key):
+    """The catalog rows already inside a gap — by cuisine alias, or by meal_type."""
+    cfg = GAPS[key]
+    if cfg["kind"] == "dish_list":
+        return []  # defined by its seed file, not by a catalog slice
+    if cfg["kind"] == "meal_type":
+        want = cfg["meal_type"]
+        return [r for r in catalog if (r.get("meal_type") or "").strip().lower() == want]
+    return [r for r in catalog if gap_bucket(r.get("cuisine") or "") == key]
 # Sub-cuisine labels that count toward a gap bucket when reading the catalog.
 CUISINE_ALIASES = {
     "middle-eastern": ["middle eastern", "turkish", "persian", "lebanese", "israeli",
@@ -92,8 +134,23 @@ ARCHETYPES = [
     ("fried", r"fried|fritter|katsu|pakora|65\b|karaage|tostones"),
     ("salad", r"salad|larb|som tum|tabbouleh|fattoush|slaw"),
     ("street-wrap", r"shawarma|taco|doubles|roti|arayes|patty|wrap|gyro|pita"),
-    ("egg-dish", r"shakshuka|egg|omelet|frittata"),
+    ("egg-dish", r"shakshuka|egg|omelet|frittata|tamagoyaki|menemen|cilbir|\u00e7\u0131lb\u0131r"),
     ("veg-side", r"plantain|callaloo|cabbage|aloo|bhindi|saag|dal|chana|beans|lentil"),
+    # Breakfast archetypes (P-12). Appended, not inserted, so first-match-wins leaves every
+    # existing cuisine bucket exactly as it was — none of the rules above can match these words.
+    # They exist because the selection penalty is -1.2 per repeat of an archetype, and without
+    # them every pancake scores as "other": the catalog already holds NINE pancake variants and
+    # six waffles out of 55 breakfast recipes, which is the shape of the gap, not a fix for it.
+    ("pancake", r"pancake|hotcake|dutch baby|blini|crepe|cr\u00eape|pajeon|okonomiyaki"),
+    ("waffle", r"waffle|gaufre"),
+    ("french-toast", r"french toast|torrija|pain perdu"),
+    ("porridge-oats", r"oatmeal|overnight oats|porridge|congee|jook|juk|grits|muesli|granola|chia pudding"),
+    ("breakfast-sandwich", r"breakfast sandwich|bagel|biscuit sandwich|croissant sandwich|mcmuffin|toastie"),
+    ("toast-tartine", r"toast|tartine|manakish|manaqish|smorrebrod|sm\u00f8rrebr\u00f8d|molletes"),
+    ("pastry-bake", r"muffin|scone|croissant|danish|babka|cinnamon roll|coffee cake|strata|quiche|frittata"),
+    ("smoothie-drink", r"smoothie|juice|lassi|shake|latte|chai"),
+    ("yogurt-bowl", r"parfait|yogurt|yoghurt|skyr|labneh|acai|a\u00e7a\u00ed"),
+    ("hash-skillet", r"hash|skillet|scramble|silog|tocilog|tapsilog|longsilog|fry-up|full english"),
 ]
 JUNK_DOMAINS = {
     "youtube.com", "youtu.be", "pinterest.com", "reddit.com", "facebook.com",
@@ -101,6 +158,16 @@ JUNK_DOMAINS = {
     "wikihow.com", "twitter.com", "x.com", "yelp.com", "tripadvisor.com",
     "doordash.com", "ubereats.com", "etsy.com", "walmart.com", "target.com",
 }
+def is_junk_domain(dom: str) -> bool:
+    """True for a junk source, INCLUDING its regional and language subdomains.
+
+    An exact-match check let en.wikipedia.org and au.pinterest.com straight through — both
+    showed up in a real breakfast pool. Matching the registrable suffix catches every
+    fr./de./au./en. variant of the same non-recipe site.
+    """
+    return any(dom == j or dom.endswith("." + j) for j in JUNK_DOMAINS)
+
+
 BROWSER_HEADERS = {
     "User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
                   "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
@@ -215,6 +282,7 @@ def cmd_inventory(args):
                                  headers=headers, timeout=60).json()
                 return {"id": r["id"], "name": r.get("name"),
                         "cuisine": r.get("cuisine"),
+                        "meal_type": r.get("meal_type"),
                         "total_time_minutes": r.get("total_time_minutes"),
                         "dietary_classification": r.get("dietary_classification"),
                         "inspired_by_url": r.get("inspired_by_url"),
@@ -242,16 +310,30 @@ def cmd_inventory(args):
     for c, n in by_cuisine.most_common(15):
         print(f"  {c:<22} {n}")
 
-    print("\n## Gap cuisines — what we HAVE (dish + archetype)")
-    for key, cfg in GAP_CUISINES.items():
-        have = [r for r in catalog if gap_bucket(r.get("cuisine") or "") == key]
+    by_meal = collections.Counter((r.get("meal_type") or "Unknown").strip() for r in catalog)
+    print("\n## Catalog by meal type")
+    for m, n in by_meal.most_common():
+        print(f"  {m:<22} {n}")
+
+    print("\n## Gaps — what we HAVE (dish + archetype)")
+    for key, cfg in GAPS.items():
+        have = members_of_gap(catalog, key)
         arch = collections.Counter(archetype_of(r["name"]) for r in have)
         print(f"\n### {cfg['label']}: {len(have)} recipes "
               f"(quota: +{cfg['quota']})  archetypes: {dict(arch)}")
+        if cfg["kind"] == "dish_list":
+            print("    (a named dish list — see the seeds file; nothing to inventory)")
+            continue
+        if cfg["kind"] == "meal_type":
+            # For a meal-type gap the cuisine spread is the story. Breakfast is 75% American,
+            # and the feed's cuisine-diversity rerank penalises repeats — so a lopsided pool
+            # partly suppresses itself. Seeds should be read against this line, not the count.
+            cs = collections.Counter((r.get("cuisine") or "Unknown").strip() for r in have)
+            print(f"    cuisines: {dict(cs.most_common(8))}")
         for r in sorted(have, key=lambda x: x["name"] or ""):
             t = r.get("total_time_minutes") or 0
             print(f"    - {r['name']}  [{r.get('cuisine')}, {t}min]")
-    print("\nNext: review/edit seeds in data/gap-fill/seeds/<cuisine>.txt, then run `search`.")
+    print("\nNext: review/edit seeds in data/gap-fill/seeds/<gap>.txt, then run `search`.")
 
 
 # --------------------------------------------------------------------------
@@ -292,7 +374,7 @@ def cmd_search(args):
             for res in results:
                 url = res.get("href") or ""
                 dom = urlparse(url).netloc.lower().removeprefix("www.")
-                if not dom or dom in JUNK_DOMAINS:
+                if not dom or is_junk_domain(dom):
                     continue
                 if any(seg in url.lower() for seg in ("/category/", "/tag/", "/collection",
                                                       "/recipes/", "/search", "/best-")):
@@ -397,10 +479,95 @@ def fresh_key(ing: str) -> str:
     return " ".join(toks[-2:]) if toks else n
 
 
+# Appliance-specific and variant recipes are fine in a cuisine gap and wrong in a dish list: the
+# point of "Easy Essentials" is the dish everyone means, cookable with a pan. An Instant Pot mash
+# is a different recipe wearing the same name.
+APPLIANCE_RE = re.compile(r"\b(instant pot|air.?fry|slow.?cook|crock.?pot|sous vide|pressure cook|"
+                          r"bread machine|microwave)\w*", re.I)
+
+
+def cmd_select_dish_list(args, cfg, scored):
+    """Selection for a named dish list (P-04b), which wants the opposite of the cuisine heuristic.
+
+    A cuisine gap is a shape problem — spread the archetypes, share a shopping basket, avoid a
+    tenth pancake. A dish list has already decided what it wants; the dishes ARE the diversity,
+    and `dish_seen` alone enforces it. Reusing the cuisine scorer here actively hurts, because its
+    -1.2 archetype penalty demotes the second recipe of any archetype regardless of quality: it
+    picked a 6-ingredient Instant Pot mash over allrecipes' 5-ingredient "Best Mashed Potatoes"
+    purely because "other" had been used once.
+
+    So rank on what "easy essential" actually means — pantry-heavy, few ingredients, few steps,
+    quick, no special appliance — and keep only the source diversity that matters (one domain).
+    """
+    # The rail rule is a HARD filter, not a preference. These recipes exist to populate the
+    # super-easy rail, whose query is difficulty='Easy' AND <=20min AND <=8 ingredients AND
+    # <=6 steps. A candidate that misses it would be scraped, paid for, and then never appear on
+    # the rail it was ingested for — so it is worth nothing here however good a recipe it is.
+    # A dish with no passing candidate is reported and DROPPED, not downgraded into the run.
+    rail = cfg.get("rail")
+    best, used_domains = [], collections.Counter()
+    by_dish, rejected = collections.defaultdict(list), collections.defaultdict(list)
+    for r in scored:
+        if rail:
+            why = []
+            # An appliance recipe is not an "easy essential" — it is a different recipe wearing the
+            # same name, and it needs equipment the rail cannot assume. Rejecting it is what makes
+            # a dish drop out honestly instead of being filled by the only thing that could pass:
+            # mashed potatoes cannot be done in 20 minutes without a pressure cooker, so the rule
+            # correctly says mashed potatoes is not a super-easy recipe.
+            if APPLIANCE_RE.search(r["title"]):
+                why.append("appliance")
+            if not r["total_time"] or r["total_time"] > rail["max_minutes"]:
+                why.append(f"{r['total_time'] or '?'}min")
+            if r["n_ingredients"] > rail["max_ingredients"]:
+                why.append(f"{r['n_ingredients']}ing")
+            if r["n_steps"] > rail["max_steps"]:
+                why.append(f"{r['n_steps']}st")
+            if why:
+                rejected[r["dish"]].append((r["title"], ",".join(why), r["domain"]))
+                continue
+        by_dish[r["dish"]].append(r)
+
+    for dish in sorted(by_dish):
+        def score(r):
+            s = 2.0 * r["pantry_frac"]
+            s -= 0.15 * r["n_ingredients"]
+            s -= 0.10 * r["n_steps"]
+            if r["total_time"] and r["total_time"] <= 30:
+                s += 1.0
+            if APPLIANCE_RE.search(r["title"]):
+                s -= 2.0
+            s -= 0.6 * used_domains[r["domain"]]
+            return s
+
+        pick = max(by_dish[dish], key=score)
+        used_domains[pick["domain"]] += 1
+        best.append(pick)
+
+    out = DATA_DIR / f"selected_{args.cuisine}.json"
+    out.write_text(json.dumps(best, indent=1))
+    print(f"## Selected {len(best)}/{cfg['quota']} for {cfg['label']}\n")
+    for r in best:
+        print(f"  {r['dish'][:26]:<26} {r['title'][:44]:<44} {r['total_time'] or '?':>3}min  "
+              f"pantry {int(r['pantry_frac']*100):>3}%  {r['n_ingredients']:>2}ing {r['n_steps']:>2}st  "
+              f"{r['domain']}")
+    seeded = {r["dish"] for r in scored}
+    for dish in sorted(d for d in cfg.get("seeded_dishes", ()) if d not in seeded):
+        print(f"\n  NOTHING SCRAPEABLE AT ALL for {dish!r} — every search result failed to scrape")
+    for dish in sorted(set(rejected) - set(by_dish)):
+        print(f"\n  NO CANDIDATE PASSES THE RAIL RULE for {dish!r} — dropping it:")
+        for title, why, dom in sorted(rejected[dish], key=lambda x: x[0])[:6]:
+            print(f"      {title[:44]:46s} {why:16s} {dom}")
+    print(f"\n  distinct domains: {len({r['domain'] for r in best})}")
+    print(f"\n-> {out}")
+
+
 def cmd_select(args):
     cuisine = args.cuisine
-    cfg = GAP_CUISINES[cuisine]
+    cfg = GAPS[cuisine]
     scored = json.loads((DATA_DIR / f"scored_{cuisine}.json").read_text())
+    if cfg["kind"] == "dish_list":
+        return cmd_select_dish_list(args, cfg, scored)
 
     # hard filters
     pool = []
@@ -470,7 +637,8 @@ def main():
     p = sub.add_parser("inventory"); p.add_argument("--refresh", action="store_true")
     for name in ("search", "score", "select"):
         p = sub.add_parser(name)
-        p.add_argument("--cuisine", required=True, choices=list(GAP_CUISINES))
+        p.add_argument("--gap", "--cuisine", dest="cuisine", required=True,
+                       choices=list(GAPS), metavar="GAP")
         if name == "search":
             p.add_argument("--per-dish", type=int, default=8)
             p.add_argument("--domain-cap", type=int, default=4)

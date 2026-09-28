@@ -1,0 +1,35 @@
+# Easy Essentials (P-04b, quota +9)
+#
+# From data/easy-essentials/dish-names.txt — 50 hand-picked simple dishes, seeded long ago and
+# never ingested. Re-checked against prod on 2026-09-25: only these are genuinely absent. The
+# other 40 already exist, several added by P-12 round 1 earlier the same day.
+#
+# Dropped from the absent list deliberately:
+#   Yogurt Berry Parfait — the catalog's "Nut & Berry Parfait" is greek yogurt + blueberry +
+#   raspberry + honey + almond. Same dish; seeding it would create a duplicate.
+#   Bacon and Egg Sandwich is KEPT: the existing "Breakfast Sandwich" is chicken-based.
+#
+# SEEDS ARE BARE DISH NAMES ON PURPOSE. The catalog dedupe in `search` runs on the seed string and
+# needs the overlap with an existing title to be >= len(tokens)-1, so padding a seed with cuisine
+# or meal words pushes it under the threshold and defeats the check. That is exactly how the P-12
+# breakfast run created a duplicate Ackee and Saltfish. Do not add "easy", "classic" or "recipe".
+bacon and egg sandwich
+blt sandwich
+roast chicken breast
+pan fried pork chops
+buttered egg noodles
+no bake energy bites
+
+# --- SEEDED AND THEN DROPPED, with the reason, so nobody re-adds them ---
+#
+# grilled cheese sandwich — ALREADY IN THE CATALOG. "Grilled Cheese", Easy, 12 min, 4 ingredients.
+#   The search-step dedupe caught this and my own absence check had it wrong; the dedupe was right.
+#   It was missing the rail only on step count, which is why the rail rule no longer counts steps.
+#
+# cheese pizza — no honest version is super-easy. The only scrapeable candidate was Serious Eats'
+#   New York-Style Pizza at 1615 minutes (a 24h cold ferment). The catalog's "Pizza Toastie"
+#   (Easy, 15 min, 5 ingredients) already covers the pizza shape on the rail.
+#
+# mashed potatoes — cannot be done in 20 minutes without a pressure cooker; boiling the potatoes
+#   alone takes that long. Every candidate was 30-75 min or an Instant Pot recipe. The rail rule
+#   is right and mashed potatoes is simply not a super-easy recipe.
