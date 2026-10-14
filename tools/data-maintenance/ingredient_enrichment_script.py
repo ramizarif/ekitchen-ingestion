@@ -28,6 +28,10 @@ from typing import Dict, List, Any, Optional
 from dataclasses import dataclass
 from openai import OpenAI
 
+# Repo root on the path so the shared Spoonacular parsing is the one this script uses.
+sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), '..', '..')))
+from services.nutrition_parsing import extract_macros  # noqa: E402
+
 # Add the processing directory to path for reusing existing classes
 sys.path.append(os.path.join(os.path.dirname(__file__), '..', 'src', 'processing'))
 from ingredient_processor_direct import DirectIngredientProcessor
@@ -237,22 +241,8 @@ class IngredientEnrichmentScript:
                 nutrition = data.get('nutrition', {})
                 nutrients = nutrition.get('nutrients', [])
                 
-                # Extract key nutrients
-                nutrient_map = {}
-                for nutrient in nutrients:
-                    name = nutrient.get('name', '').lower()
-                    amount = nutrient.get('amount', 0)
-                    
-                    if 'calories' in name or 'energy' in name:
-                        nutrient_map['calories'] = amount
-                    elif 'protein' in name:
-                        nutrient_map['protein'] = amount
-                    elif 'fat' in name and 'saturated' not in name:
-                        nutrient_map['fat'] = amount
-                    elif 'carbohydrate' in name:
-                        nutrient_map['carbohydrates'] = amount
-                    elif 'sugar' in name:
-                        nutrient_map['sugar'] = amount
+                # Extract key nutrients (exact names — see services/nutrition_parsing.py)
+                nutrient_map = extract_macros(nutrients)
                 
                 # Get possible units
                 possible_units = data.get('possibleUnits', [])

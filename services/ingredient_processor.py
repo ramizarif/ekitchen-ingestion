@@ -23,6 +23,7 @@ import requests
 import time
 from services.unit_conversion_validator import UnitConversionValidator
 from services.ingredient_validator import validate_ingredient_name
+from services.nutrition_parsing import extract_macros
 
 def load_env_file(file_path: str) -> Dict[str, str]:
     """Load environment variables from a file"""
@@ -530,22 +531,8 @@ class DirectIngredientProcessor:
                 nutrition = data.get('nutrition', {})
                 nutrients = nutrition.get('nutrients', [])
                 
-                # Extract key nutrients
-                nutrient_map = {}
-                for nutrient in nutrients:
-                    name = nutrient.get('name', '').lower()
-                    amount = nutrient.get('amount', 0)
-                    
-                    if 'calories' in name or 'energy' in name:
-                        nutrient_map['calories'] = amount
-                    elif 'protein' in name:
-                        nutrient_map['protein'] = amount
-                    elif 'fat' in name and 'saturated' not in name:
-                        nutrient_map['fat'] = amount
-                    elif 'carbohydrate' in name:
-                        nutrient_map['carbohydrates'] = amount
-                    elif 'sugar' in name:
-                        nutrient_map['sugar'] = amount
+                # Extract key nutrients (exact names — see services/nutrition_parsing.py)
+                nutrient_map = extract_macros(nutrients)
                 
                 # Get possible units
                 possible_units = data.get('possibleUnits', [])
@@ -2288,29 +2275,19 @@ Return ONLY a number (the conversion factor)."""
                         category = self.categorize_ingredient_with_ai(ingredient_name)
                         tags = self.generate_tags_for_ingredient(ingredient_name, category)
                         
+                        # By name, not position: nutrients[0] is protein when calories are missing.
+                        macros = extract_macros(nutrition.get('nutrition', {}).get('nutrients', []))
                         ingredient_data = IngredientData(
                             name=ingredient_name,
-                            calories=nutrition.get('nutrition', {}).get('nutrients', [{}])[0].get('amount', 0),
+                            calories=macros.get('calories', 0),
                             category=category,
-                            external_id=str(spoon_result['id']),
+                            external_id=str(spoon_result.id),
                             tag_names=tags,
                             consistency="solid"
                         )
-                        
-                        # Extract other nutrients
-                        nutrients = nutrition.get('nutrition', {}).get('nutrients', [])
-                        for nutrient in nutrients:
-                            name = nutrient.get('name', '').lower()
-                            amount = nutrient.get('amount', 0)
-                            
-                            if 'protein' in name:
-                                ingredient_data.protein = amount
-                            elif 'fat' in name and 'saturated' not in name:
-                                ingredient_data.fat = amount
-                            elif 'carbohydrate' in name:
-                                ingredient_data.carbohydrates = amount
-                            elif 'sugar' in name:
-                                ingredient_data.sugar = amount
+                        for field in ('protein', 'fat', 'carbohydrates', 'sugar'):
+                            if field in macros:
+                                setattr(ingredient_data, field, macros[field])
                         
                         result_mapping[ingredient_name] = ingredient_data
                     else:
