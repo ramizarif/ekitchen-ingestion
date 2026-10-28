@@ -5,7 +5,9 @@ candidate disambiguation for canonical ingredient resolution.
 Two responsibilities, both LLM-backed (kept in the ingestion service so all
 OpenAI usage + the key live in one place; the Go backend delegates here):
   - extract_receipt(): GPT-4o vision OCR + abbreviation expansion + food/non-food
-    classification + a singular, qualifier-stripped `canonical_query` per item.
+    classification + a singular, qualifier-stripped `canonical_query` per item,
+    plus each line's price, the store/date/totals, and a check that the line
+    prices add up (check_prices).
   - resolve_ingredient(): given a receipt item and the candidate catalog
     ingredients the Go backend's search returned, pick the best-matching id
     (used only when the search returned >1 candidate).
@@ -13,8 +15,11 @@ OpenAI usage + the key live in one place; the Go backend delegates here):
 The extraction prompt is the one validated in scripts/receipt_extraction_spike.py
 (38% -> 90% catalog match rate on real receipts).
 """
+import datetime
 import json
 import logging
+import re
+from typing import Optional
 
 import openai
 
@@ -27,7 +32,21 @@ RESOLVE_MODEL = "gpt-4o-mini"  # picking among a supplied short list is cheap
 
 EXTRACTION_SYSTEM_PROMPT = """You extract purchased line items from a photo of a grocery receipt for a cooking app.
 
-Return STRICT JSON: {"items": [ ... ]}. No prose. One object per PURCHASED LINE ITEM with:
+Return STRICT JSON: {"receipt": { ... }, "items": [ ... ]}. No prose.
+
+"receipt" describes the receipt as a whole. Use "" or null for anything not visible
+— receipts are often photographed cropped, so never guess:
+- "store_name": the store name as printed at the top, e.g. "Publix Super Market".
+- "store_chain": the chain as people say it, e.g. "Publix", "Aldi", "Kroger",
+  "Trader Joe's", "Whole Foods Market". "" if the store can't be identified.
+- "store_zip": the 5-digit ZIP code from the store's printed address, else "".
+- "purchased_on": the transaction date as YYYY-MM-DD, else "".
+- "subtotal": the printed subtotal before tax, else null.
+- "tax": the total sales tax charged, else null.
+- "total": the printed total / balance due, else null.
+NEVER return card numbers, loyalty or member IDs, cashier names, or phone numbers.
+
+"items" has one object per PURCHASED LINE ITEM with:
 - "raw": exact text as printed (reconstruct an obvious cut-off first letter from context).
 - "name": readable, plain-English product name with store/brand abbreviations expanded
   (e.g. "PBX FNCY PARM SHRD" -> "shredded parmesan", "GV WHL MLK" -> "whole milk").
@@ -57,9 +76,22 @@ Return STRICT JSON: {"items": [ ... ]}. No prose. One object per PURCHASED LINE 
   A single processed product is NOT composite: ketchup, peanut butter, broth, bread,
   yogurt, tomato paste are is_composite=false.
 - "confidence": 0.0-1.0 in the name/canonical_query normalization.
+- "line_total": the dollar amount in the price column for this item, as printed, or
+  null if unreadable. When an item's weight or count is on the next line
+  ("1.14 lb @ 2.49/ lb    2.84"), that line's amount is this item's line_total.
+- "unit_price": the per-unit price when printed ("3 @ 0.58" -> 0.58,
+  "1.14 lb @ 2.49/ lb" -> 2.49, "1 @ 2 FOR 4.00" -> 2.00), else null.
+- "discount": the amount of a separate coupon / promotion / markdown line that
+  REDUCES what was paid for this item (printed like "-1.00" or "1.00-"), as a positive
+  number, else 0. A "You Saved" line is NOT a discount here: stores print it as a
+  note about savings already in the item's price.
 
-EXCLUDE entirely: subtotals, totals, tax, "you saved", payment/change/card lines,
-"items in transaction", store address/phone/metadata. Only real purchased line items.
+Non-food lines that add to the bill (bags, bottle deposits, household goods) are
+still items, with is_food false and their line_total, so prices add up.
+
+EXCLUDE from items: subtotals, totals, tax, "you saved" notes, coupon/discount lines
+(record them as the item's "discount" instead), payment/change/card lines,
+"items in transaction", store address/phone/metadata.
 """
 
 RESOLVE_SYSTEM_PROMPT = """You match a grocery-receipt item to the single best ingredient
@@ -80,14 +112,80 @@ No prose.
 """
 
 
+def _money(v) -> Optional[float]:
+    """Parse a receipt amount ("$3.49", "1.00-", 2.5) to a float, or None."""
+    if v is None or isinstance(v, bool):
+        return None
+    if isinstance(v, (int, float)):
+        return round(float(v), 2)
+    s = str(v).strip().replace("$", "").replace(",", "")
+    negative = s.endswith("-") or s.startswith("-")
+    s = s.strip("-").strip()
+    try:
+        amount = float(s)
+    except ValueError:
+        return None
+    return round(-amount if negative else amount, 2)
+
+
+def _valid_date(s: str) -> bool:
+    try:
+        datetime.date.fromisoformat(s)
+        return True
+    except ValueError:
+        return False
+
+
+def check_prices(items: list[dict], receipt: dict) -> dict:
+    """Check the line prices we read against the receipt's own totals.
+
+    A misread digit on one line makes the lines stop adding up, so this is what
+    tells the backend whether a scan's prices can be trusted:
+      matched    — lines add up to the subtotal (or total minus tax)
+      partial    — lines come to less: some weren't captured, usually because the
+                   photo is cropped. The prices that were read are likely fine.
+      mismatch   — lines come to MORE than the receipt says: something was misread
+      unverified — no subtotal or total visible to check against
+    """
+    priced = [it for it in items if it.get("line_total") is not None]
+    items_sum = round(sum(it["line_total"] - (it.get("discount") or 0.0) for it in priced), 2)
+
+    expected = receipt.get("subtotal")
+    if expected is None and receipt.get("total") is not None:
+        expected = round(receipt["total"] - (receipt.get("tax") or 0.0), 2)
+
+    if expected is None or not priced:
+        status = "unverified"
+    else:
+        diff = items_sum - expected
+        tolerance = max(0.05, 0.005 * expected)
+        if abs(diff) <= tolerance:
+            status = "matched"
+        elif diff < 0:
+            status = "partial"
+        else:
+            status = "mismatch"
+
+    return {
+        "status": status,
+        "items_sum": items_sum,
+        "expected": expected,
+        "missing_prices": len(items) - len(priced),
+    }
+
+
 class ReceiptProcessor:
     def __init__(self):
         if not settings.OPENAI_API_KEY:
             raise RuntimeError("OPENAI_API_KEY is not configured")
         self.client = openai.OpenAI(api_key=settings.OPENAI_API_KEY)
 
-    def extract_receipt(self, image_base64: str, content_type: str) -> list[dict]:
-        """Run GPT-4o vision over a receipt image; return normalized line items."""
+    def extract_receipt(self, image_base64: str, content_type: str) -> dict:
+        """Run GPT-4o vision over a receipt image.
+
+        Returns {"receipt": {...store/date/totals}, "items": [...line items],
+        "price_check": {...}} — see check_prices for what the check means.
+        """
         if content_type not in ("image/jpeg", "image/png", "image/webp", "image/gif"):
             raise ValueError(
                 f"unsupported image type {content_type} "
@@ -113,12 +211,32 @@ class ReceiptProcessor:
         items = data.get("items", [])
         if not isinstance(items, list):
             raise ValueError("model did not return an items list")
-        return [self._normalize_item(it) for it in items]
+        items = [self._normalize_item(it) for it in items]
+        receipt = self._normalize_receipt(data.get("receipt"))
+        return {"receipt": receipt, "items": items, "price_check": check_prices(items, receipt)}
+
+    @staticmethod
+    def _normalize_receipt(r) -> dict:
+        r = r if isinstance(r, dict) else {}
+        zip_code = re.sub(r"\D", "", str(r.get("store_zip") or ""))[:5]
+        purchased_on = str(r.get("purchased_on") or "")
+        return {
+            "store_name": str(r.get("store_name") or "").strip(),
+            "store_chain": str(r.get("store_chain") or "").strip(),
+            "store_zip": zip_code if len(zip_code) == 5 else "",
+            "purchased_on": purchased_on if _valid_date(purchased_on) else "",
+            "subtotal": _money(r.get("subtotal")),
+            "tax": _money(r.get("tax")),
+            "total": _money(r.get("total")),
+        }
 
     @staticmethod
     def _normalize_item(it: dict) -> dict:
         """Defensive field normalization so the API contract is stable."""
         return {
+            "line_total": _money(it.get("line_total")),
+            "unit_price": _money(it.get("unit_price")),
+            "discount": abs(_money(it.get("discount")) or 0.0),
             "raw": str(it.get("raw", "")),
             "name": str(it.get("name", "")),
             "canonical_query": str(it.get("canonical_query", "")),

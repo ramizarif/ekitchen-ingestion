@@ -1,7 +1,8 @@
 """
 Receipt scanning endpoints.
 
-  POST /api/v1/scan-receipt      image (base64) -> normalized line items
+  POST /api/v1/scan-receipt      image (base64) -> normalized line items with prices,
+                                 plus the store, date and totals, and a price check
   POST /api/v1/resolve-ingredient receipt item + candidate ids -> chosen id
 
 Both are internal endpoints called by the Go backend's receiptservice (the Go
@@ -48,12 +49,34 @@ class ExtractedItem(BaseModel):
     is_food: bool = False
     is_composite: bool = False
     confidence: float = 0.0
+    line_total: Optional[float] = None
+    unit_price: Optional[float] = None
+    discount: float = 0.0
+
+
+class ReceiptInfo(BaseModel):
+    store_name: str = ""
+    store_chain: str = ""
+    store_zip: str = ""
+    purchased_on: str = ""
+    subtotal: Optional[float] = None
+    tax: Optional[float] = None
+    total: Optional[float] = None
+
+
+class PriceCheck(BaseModel):
+    status: str = "unverified"  # matched | partial | mismatch | unverified
+    items_sum: float = 0.0
+    expected: Optional[float] = None
+    missing_prices: int = 0
 
 
 class ScanReceiptResponse(BaseModel):
     success: bool = True
     items: List[ExtractedItem]
     item_count: int
+    receipt: ReceiptInfo
+    price_check: PriceCheck
     processing_time_ms: int
 
 
@@ -65,7 +88,7 @@ class ScanReceiptResponse(BaseModel):
 async def scan_receipt(request: ScanReceiptRequest):
     start = time.time()
     try:
-        items = _get_processor().extract_receipt(request.image_base64, request.content_type)
+        result = _get_processor().extract_receipt(request.image_base64, request.content_type)
     except ValueError as e:
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(e))
     except Exception as e:  # noqa: BLE001
@@ -74,8 +97,10 @@ async def scan_receipt(request: ScanReceiptRequest):
 
     return ScanReceiptResponse(
         success=True,
-        items=items,
-        item_count=len(items),
+        items=result["items"],
+        item_count=len(result["items"]),
+        receipt=result["receipt"],
+        price_check=result["price_check"],
         processing_time_ms=int((time.time() - start) * 1000),
     )
 
