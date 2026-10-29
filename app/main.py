@@ -16,6 +16,7 @@ from fastapi.responses import JSONResponse
 
 from app.routers import parse, health, ingest, analytics, dashboard, receipt, moderation
 from app.config import settings
+from app.internal_auth import internal_auth_middleware
 
 # Configure logging
 logging.basicConfig(
@@ -206,6 +207,10 @@ async def auth_gate_middleware(request: Request, call_next):
 
     return await call_next(request)
 
+
+# Registered after the auth gate, so it runs first: an unsigned call is turned
+# away before anything else happens.
+app.middleware("http")(internal_auth_middleware)
 
 # CORS middleware
 app.add_middleware(
