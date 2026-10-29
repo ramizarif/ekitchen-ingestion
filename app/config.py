@@ -20,6 +20,10 @@ class Settings(BaseSettings):
     # OpenAI
     OPENAI_API_KEY: str = ""
 
+    # Shared token the backend sends in X-Internal-Token. When set, /api/v1 calls
+    # without it are rejected (see app/internal_auth.py). Empty checks nothing.
+    INTERNAL_API_TOKEN: str = ""
+
     # Spoonacular (optional)
     SPOONACULAR_API_KEY: str = ""
 
