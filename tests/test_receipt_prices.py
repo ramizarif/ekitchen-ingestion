@@ -96,6 +96,7 @@ def test_normalize_receipt_drops_what_cannot_be_trusted():
         "subtotal": 98.10,
         "tax": None,
         "total": 100.00,
+        "items_sold": None,
     }
 
 
@@ -109,3 +110,22 @@ def test_normalize_item_keeps_discount_positive():
     assert it["line_total"] == 2.00
     assert it["discount"] == 0.50
     assert it["unit_price"] is None
+
+
+def test_more_lines_than_the_store_sold_is_a_mismatch():
+    # A sideways photo the model couldn't read: no totals, and a padded list.
+    receipt = {"subtotal": None, "tax": None, "total": None, "items_sold": 7}
+    check = check_prices([item(2.98) for _ in range(12)], receipt)
+    assert check["status"] == "mismatch"
+    assert check["items_sold"] == 7
+
+
+def test_fewer_lines_than_the_store_sold_is_still_fine():
+    receipt = {"subtotal": None, "tax": None, "total": None, "items_sold": 7}
+    assert check_prices([item(2.98), item(1.00)], receipt)["status"] == "unverified"
+
+
+@pytest.mark.parametrize("raw,expected", [(7, 7), ("12", 12), ("7.0", 7), (None, None), ("", None), (0, None), (True, None), ("seven", None)])
+def test_items_sold_parses_counts(raw, expected):
+    r = ReceiptProcessor._normalize_receipt({"items_sold": raw})
+    assert r["items_sold"] == expected

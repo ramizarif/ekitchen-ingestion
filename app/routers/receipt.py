@@ -62,6 +62,7 @@ class ReceiptInfo(BaseModel):
     subtotal: Optional[float] = None
     tax: Optional[float] = None
     total: Optional[float] = None
+    items_sold: Optional[int] = None
 
 
 class PriceCheck(BaseModel):
@@ -69,6 +70,7 @@ class PriceCheck(BaseModel):
     items_sum: float = 0.0
     expected: Optional[float] = None
     missing_prices: int = 0
+    items_sold: Optional[int] = None
 
 
 class ScanReceiptResponse(BaseModel):

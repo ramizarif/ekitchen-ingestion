@@ -34,6 +34,10 @@ EXTRACTION_SYSTEM_PROMPT = """You extract purchased line items from a photo of a
 
 Return STRICT JSON: {"receipt": { ... }, "items": [ ... ]}. No prose.
 
+The photo may be rotated or sideways: read the receipt in its printed orientation.
+Return ONLY lines you can actually read on this receipt. NEVER invent, pad or
+generalize items; if a line is unreadable, leave it out. A short list is fine.
+
 "receipt" describes the receipt as a whole. Use "" or null for anything not visible
 — receipts are often photographed cropped, so never guess:
 - "store_name": the store name as printed at the top, e.g. "Publix Super Market".
@@ -44,6 +48,7 @@ Return STRICT JSON: {"receipt": { ... }, "items": [ ... ]}. No prose.
 - "subtotal": the printed subtotal before tax, else null.
 - "tax": the total sales tax charged, else null.
 - "total": the printed total / balance due, else null.
+- "items_sold": the printed item count ("# ITEMS SOLD 7", "ITEMS 12"), else null.
 NEVER return card numbers, loyalty or member IDs, cashier names, or phone numbers.
 
 "items" has one object per PURCHASED LINE ITEM with:
@@ -128,6 +133,17 @@ def _money(v) -> Optional[float]:
     return round(-amount if negative else amount, 2)
 
 
+def _count(v) -> Optional[int]:
+    """A printed item count, or None. Booleans and nonsense are not counts."""
+    if isinstance(v, bool):
+        return None
+    try:
+        n = int(float(str(v).strip()))
+    except (TypeError, ValueError):
+        return None
+    return n if n > 0 else None
+
+
 def _valid_date(s: str) -> bool:
     try:
         datetime.date.fromisoformat(s)
@@ -144,7 +160,10 @@ def check_prices(items: list[dict], receipt: dict) -> dict:
       matched    — lines add up to the subtotal (or total minus tax)
       partial    — lines come to less: some weren't captured, usually because the
                    photo is cropped. The prices that were read are likely fine.
-      mismatch   — lines come to MORE than the receipt says: something was misread
+      mismatch   — lines come to MORE than the receipt says: something was misread.
+                   Also when we read more lines than the receipt's printed item
+                   count, which is how an invented list shows up on a receipt
+                   whose totals couldn't be read.
       unverified — no subtotal or total visible to check against
     """
     priced = [it for it in items if it.get("line_total") is not None]
@@ -166,11 +185,16 @@ def check_prices(items: list[dict], receipt: dict) -> dict:
         else:
             status = "mismatch"
 
+    items_sold = receipt.get("items_sold")
+    if items_sold and status in ("unverified", "partial") and len(items) > items_sold:
+        status = "mismatch"
+
     return {
         "status": status,
         "items_sum": items_sum,
         "expected": expected,
         "missing_prices": len(items) - len(priced),
+        "items_sold": items_sold,
     }
 
 
@@ -207,7 +231,12 @@ class ReceiptProcessor:
                 },
             ],
         )
-        data = json.loads(resp.choices[0].message.content)
+        choice = resp.choices[0]
+        if choice.finish_reason == "length":
+            # The model ran out of output, usually by repeating one line over and
+            # over on a receipt it can't read. The JSON is cut off; say so plainly.
+            raise ValueError("could not read this receipt; try a closer, upright photo")
+        data = json.loads(choice.message.content)
         items = data.get("items", [])
         if not isinstance(items, list):
             raise ValueError("model did not return an items list")
@@ -228,6 +257,7 @@ class ReceiptProcessor:
             "subtotal": _money(r.get("subtotal")),
             "tax": _money(r.get("tax")),
             "total": _money(r.get("total")),
+            "items_sold": _count(r.get("items_sold")),
         }
 
     @staticmethod
