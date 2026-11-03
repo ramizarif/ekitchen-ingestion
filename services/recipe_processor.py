@@ -34,6 +34,9 @@ from services.ingredient_validator import validate_ingredient_name
 # Publisher attribution stripped from scraped recipe titles at ingestion.
 # KEEP IN SYNC across: services/recipe_processor.py,
 # legacy/src/processing/direct_recipe_processor.py, scripts/backfill_recipe_names.py
+# Writes a recipe's cozy steps, description, cuisine, tags and image prompt.
+AI_DECISIONS_MODEL = "gpt-4o"
+
 KNOWN_SOURCES = [
     "Tasty", "Simply Recipes", "SimplyRecipes", "EatingWell", "Eating Well",
     "Food Network", "Allrecipes", "All Recipes", "Epicurious", "BBC Good Food",
@@ -1245,7 +1248,10 @@ Category:"""
                 prompt = self._create_ai_decision_prompt(recipe_data)
                 
                 response = self.openai_client.chat.completions.create(
-                    model="gpt-4",
+                    # gpt-4 was retired by OpenAI, which failed every import at this
+                    # step (Nov 2026). gpt-4o in JSON mode returns parseable JSON.
+                    model=AI_DECISIONS_MODEL,
+                    response_format={"type": "json_object"},
                     messages=[
                         {"role": "system", "content": "You are an expert culinary assistant for eKitchen, a cozy home cooking platform. Provide JSON responses only."},
                         {"role": "user", "content": prompt}
