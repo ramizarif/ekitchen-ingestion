@@ -21,6 +21,7 @@ sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..', '..'))
 
 from parsers.video import VideoParser
 from services.recipe_processor import DirectRecipeProcessor
+from services.import_progress import NO_PROGRESS, ProgressReporter, contract_extraction_method
 from app.routers.analytics import record_extraction_cost
 
 logger = logging.getLogger(__name__)
@@ -77,6 +78,7 @@ class IngestRequest(BaseModel):
     generate_image: bool = Field(True, description="Whether to generate DALL-E image")
     save_images_dir: Optional[str] = Field(None, description="Directory to save images (optional)")
     user_id: Optional[str] = Field(None, description="ID of user importing the recipe (for user_created tracking)")
+    import_id: Optional[str] = Field(None, description="Backend recipe-import id; when set, stages are reported to it (best effort)")
 
     class Config:
         json_schema_extra = {
@@ -133,6 +135,79 @@ class IngestErrorResponse(BaseModel):
     error_code: str = Field(..., description="Error code")
     error_message: str = Field(..., description="Human-readable error message")
     processing_time_seconds: float = Field(..., description="Processing time before failure")
+
+
+# User-facing messages, keyed by error code. Codes stay stable (the backend keys
+# retry behaviour on them); the raw technical message is logged, not shown.
+_TIKTOK_BLOCKED = (
+    "TikTok wouldn't let us read this video. Try again in a few minutes, "
+    "or share it from the TikTok app."
+)
+_VIDEO_ERROR_MESSAGES = {
+    "UNSUPPORTED_PLATFORM": "We can't import recipes from this link yet.",
+    "NOT_A_RECIPE": "This video doesn't look like a recipe.",
+    "TIKWM_FAILED": _TIKTOK_BLOCKED,
+    "TIKWM_NO_AUDIO": _TIKTOK_BLOCKED,
+    "DOWNLOAD_FAILED": "We couldn't download this video. Try again in a few minutes.",
+    "RECIPE_EXTRACTION_FAILED": "We couldn't find a recipe in this video.",
+    "PARSE_ERROR": "We couldn't read this video. Try again in a few minutes.",
+}
+_INGESTION_ERROR_MESSAGES = {
+    "DUPLICATE_RECIPE": "You've already imported this recipe.",
+    "Failed to scrape recipe data": "We couldn't find a recipe on that page. Check that the link opens a recipe.",
+    "Failed to create recipe in eKitchen": "We found the recipe but couldn't save it. Try again in a moment.",
+    "Failed to create recipe in database": "We found the recipe but couldn't save it. Try again in a moment.",
+    "AI decision generation failed after retries": "Our recipe assistant is busy right now. Try again in a few minutes.",
+    "No ingredients could be processed": "We couldn't identify any ingredients in this recipe.",
+}
+_GENERIC_ERROR_MESSAGE = "Something went wrong on our side. Try again in a few minutes."
+
+
+def _friendly_error(error_code: str, raw_message: Optional[str], default: str) -> str:
+    """The message a person should see for an error. The raw message goes to the logs."""
+    if error_code == "INGESTION_FAILED":
+        return _INGESTION_ERROR_MESSAGES.get(raw_message or "", default)
+    if error_code in ("PARSER_UNAVAILABLE", "PROCESSOR_UNAVAILABLE"):
+        return "Recipe import is temporarily unavailable. Try again in a few minutes."
+    if error_code == "UNEXPECTED_ERROR":
+        return _GENERIC_ERROR_MESSAGE
+    return _VIDEO_ERROR_MESSAGES.get(error_code, default)
+
+
+def _progress_reporter(import_id: Optional[str]) -> ProgressReporter:
+    """Reporter for a backend import, authenticated as the ingestion admin. NO_PROGRESS without an id."""
+    if not import_id:
+        return NO_PROGRESS
+
+    def auth():
+        processor = get_processor()
+        token = processor.get_ekitchen_token()
+        if not token:
+            raise RuntimeError("no eKitchen token available for progress reporting")
+        return processor.ingredient_processor.ekitchen_base_url, token
+
+    return ProgressReporter(import_id, auth)
+
+
+def _ingredient_text(ingredient) -> str:
+    if isinstance(ingredient, dict):
+        parts = [ingredient.get('quantity', ''), ingredient.get('unit', ''), ingredient.get('name', '')]
+        return ' '.join(str(p) for p in parts if p).strip()
+    return str(ingredient)
+
+
+def _extraction_preview(parse_result) -> Dict[str, Any]:
+    """Preview fields known once the recipe has been extracted from the source."""
+    recipe = parse_result.data or {}
+    ingredients = [_ingredient_text(i) for i in (recipe.get('ingredients') or [])]
+    return {
+        'extraction_method': contract_extraction_method(parse_result.extraction_method),
+        'ingredients': ingredients,
+        'ingredient_count': len(ingredients),
+        'step_count': len(recipe.get('steps') or []),
+        'servings': recipe.get('servings'),
+        'total_minutes': recipe.get('total_time_minutes'),
+    }
 
 
 # Lazy initialization
@@ -203,14 +278,18 @@ async def ingest_recipe(request: IngestRequest):
     # Detect URL type
     url_type, platform = detect_url_type(url)
     logger.info(f"Starting ingestion for URL: {url} (type: {url_type}, platform: {platform})")
+
+    progress = _progress_reporter(request.import_id)
+    progress.report("reading", platform=platform or "website")
     
     if url_type == 'video':
-        return await _ingest_video(url, platform, request, start_time)
+        return await _ingest_video(url, platform, request, start_time, progress)
     else:
-        return await _ingest_website(url, request, start_time)
+        return await _ingest_website(url, request, start_time, progress)
 
 
-async def _ingest_video(url: str, platform: str, request: IngestRequest, start_time: float):
+async def _ingest_video(url: str, platform: str, request: IngestRequest, start_time: float,
+                        progress: ProgressReporter = NO_PROGRESS):
     """Handle video URL ingestion (TikTok, Instagram, YouTube)."""
     
     try:
@@ -223,7 +302,7 @@ async def _ingest_video(url: str, platform: str, request: IngestRequest, start_t
             detail={
                 "success": False,
                 "error_code": "PARSER_UNAVAILABLE",
-                "error_message": f"Video parser not available: {str(e)}",
+                "error_message": _friendly_error("PARSER_UNAVAILABLE", str(e), _GENERIC_ERROR_MESSAGE),
                 "processing_time_seconds": processing_time
             }
         )
@@ -231,22 +310,26 @@ async def _ingest_video(url: str, platform: str, request: IngestRequest, start_t
     try:
         # Step 1: Parse video (download audio → Whisper → GPT-4)
         logger.info(f"Parsing {platform} video...")
-        parse_result = await video_parser.parse(url)
+        parse_result = await video_parser.parse(url, progress=progress)
         
         if not parse_result.success:
             processing_time = time.time() - start_time
+            error_code = parse_result.error_code or "VIDEO_PARSE_FAILED"
+            logger.warning(f"Video parse failed ({error_code}): {parse_result.error_message}")
             raise HTTPException(
                 status_code=status.HTTP_400_BAD_REQUEST,
                 detail={
                     "success": False,
-                    "error_code": parse_result.error_code or "VIDEO_PARSE_FAILED",
-                    "error_message": parse_result.error_message or "Failed to extract recipe from video",
+                    "error_code": error_code,
+                    "error_message": _friendly_error(error_code, parse_result.error_message,
+                                                     "We couldn't read a recipe from this video."),
                     "processing_time_seconds": processing_time
                 }
             )
         
         recipe_data = parse_result.data
         logger.info(f"Parsed video recipe: {recipe_data.get('name')} ({len(recipe_data.get('ingredients', []))} ingredients)")
+        progress.report("extracting", **_extraction_preview(parse_result))
 
         # Record cost data for analytics (Issue #39)
         if parse_result.cost_breakdown:
@@ -279,7 +362,8 @@ async def _ingest_video(url: str, platform: str, request: IngestRequest, start_t
             parsed_recipe=recipe_data,
             save_images_dir=save_images_dir if request.generate_image else None,
             use_enhanced_ingredients=True,
-            user_id=request.user_id
+            user_id=request.user_id,
+            progress=progress
         )
         
         processing_time = time.time() - start_time
@@ -321,7 +405,8 @@ async def _ingest_video(url: str, platform: str, request: IngestRequest, start_t
                 detail={
                     "success": False,
                     "error_code": "INGESTION_FAILED",
-                    "error_message": result.error_message or "Unknown error during video ingestion",
+                    "error_message": _friendly_error("INGESTION_FAILED", result.error_message,
+                                                     "We couldn't finish importing this recipe. Try again in a few minutes."),
                     "processing_time_seconds": processing_time
                 }
             )
@@ -339,13 +424,14 @@ async def _ingest_video(url: str, platform: str, request: IngestRequest, start_t
             detail={
                 "success": False,
                 "error_code": "UNEXPECTED_ERROR",
-                "error_message": str(e),
+                "error_message": _friendly_error("UNEXPECTED_ERROR", str(e), _GENERIC_ERROR_MESSAGE),
                 "processing_time_seconds": processing_time
             }
         )
 
 
-async def _ingest_website(url: str, request: IngestRequest, start_time: float):
+async def _ingest_website(url: str, request: IngestRequest, start_time: float,
+                          progress: ProgressReporter = NO_PROGRESS):
     """Handle website URL ingestion (recipe-scrapers)."""
     
     try:
@@ -358,7 +444,7 @@ async def _ingest_website(url: str, request: IngestRequest, start_time: float):
             detail={
                 "success": False,
                 "error_code": "PROCESSOR_UNAVAILABLE",
-                "error_message": f"Recipe processor not available: {str(e)}",
+                "error_message": _friendly_error("PROCESSOR_UNAVAILABLE", str(e), _GENERIC_ERROR_MESSAGE),
                 "processing_time_seconds": processing_time
             }
         )
@@ -377,7 +463,8 @@ async def _ingest_website(url: str, request: IngestRequest, start_time: float):
             save_images_dir=save_images_dir if request.generate_image else None,
             use_enhanced_ingredients=True,
             allow_ingredient_skipping=False,
-            user_id=request.user_id
+            user_id=request.user_id,
+            progress=progress
         )
         
         processing_time = time.time() - start_time
@@ -431,7 +518,8 @@ async def _ingest_website(url: str, request: IngestRequest, start_time: float):
                 detail={
                     "success": False,
                     "error_code": "INGESTION_FAILED",
-                    "error_message": result.error_message or "Unknown error during ingestion",
+                    "error_message": _friendly_error("INGESTION_FAILED", result.error_message,
+                                                     "We couldn't finish importing this recipe. Try again in a few minutes."),
                     "processing_time_seconds": processing_time
                 }
             )
@@ -449,7 +537,7 @@ async def _ingest_website(url: str, request: IngestRequest, start_time: float):
             detail={
                 "success": False,
                 "error_code": "UNEXPECTED_ERROR",
-                "error_message": str(e),
+                "error_message": _friendly_error("UNEXPECTED_ERROR", str(e), _GENERIC_ERROR_MESSAGE),
                 "processing_time_seconds": processing_time
             }
         )
