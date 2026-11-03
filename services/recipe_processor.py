@@ -106,6 +106,22 @@ class RecipeProcessingResult:
     image_generated: bool = False
     processing_time_seconds: float = 0.0
 
+def _normalize_source(url: str) -> str:
+    """'https://www.Delish.com/x/?a=1' -> 'delish.com/x' so two spellings of one link compare equal."""
+    parts = urllib.parse.urlparse((url or '').strip())
+    host = parts.netloc.lower()
+    host = host[4:] if host.startswith('www.') else host
+    return f"{host}{parts.path.rstrip('/')}"
+
+
+def _same_source(recipe: Dict[str, Any], url: str) -> bool:
+    """Whether a catalog recipe came from this link."""
+    mine = _normalize_source(url)
+    if not mine:
+        return False
+    return any(_normalize_source(recipe.get(k) or '') == mine for k in ('inspired_by_url', 'imported_from_url'))
+
+
 class DirectRecipeProcessor:
     """Autonomous recipe processor using direct API calls"""
     
@@ -1798,9 +1814,10 @@ Return ONLY the DALL-E prompt, nothing else."""
         
         # Recipe names are unique catalog-wide, so a user's "Pepper Steak" from
         # TikTok collides with someone else's from Delish. For user imports a
-        # clash means "different recipe, same name", not "already imported"
-        # (same-URL duplicates are caught by the backend before ingestion runs),
-        # so retry under a name that says where it came from.
+        # clash is resolved by what the existing recipe is: the same source means
+        # it is this recipe (already in the catalog, or saved by an earlier
+        # attempt of this import), so it is reused; a different source means a
+        # different recipe, which is saved under a name that says where it came from.
         alternate_names = self._alternate_names(create_data['name'], recipe_data) if user_id else []
         reauthed = False
         while True:
@@ -1836,11 +1853,20 @@ Return ONLY the DALL-E prompt, nothing else."""
                     reauthed = True
                     self._log_and_print("🔄 eKitchen token rejected creating recipe; re-authenticated, retrying...", 'warning')
                     continue
-                if status_code == 409 and alternate_names:
+                if status_code == 409 and user_id:
                     taken = create_data['name']
-                    create_data['name'] = alternate_names.pop(0)
-                    self._log_and_print(f"🔁 '{taken}' is taken; saving as '{create_data['name']}'", 'warning')
-                    continue
+                    existing = self._recipe_named(taken)
+                    if existing and _same_source(existing, recipe_data.get('url', '')):
+                        self._log_and_print(f"♻️  '{taken}' is this recipe already (ID {existing.get('id')}); reusing it")
+                        # Tells the caller not to touch it: it has its own photo.
+                        recipe_data['reused_recipe_id'] = existing.get('id')
+                        return existing.get('id')
+                    if existing and alternate_names:
+                        create_data['name'] = alternate_names.pop(0)
+                        self._log_and_print(f"🔁 '{taken}' is taken; saving as '{create_data['name']}'", 'warning')
+                        continue
+                    # No recipe has that name, so the 409 is about something else:
+                    # renaming would not help. Fall through and report it.
                 # Surface the backend's ACTUAL status + response body. The generic
                 # "Failed to create recipe in eKitchen" upstream hides the real cause
                 # (e.g. a 500 'Failed to rotate token' / DB error / validation). This
@@ -1885,6 +1911,24 @@ Return ONLY the DALL-E prompt, nothing else."""
             except Exception as e:
                 self._log_and_print(f"❌ Error creating recipe: {e}", 'error')
                 return None
+
+    def _recipe_named(self, name: str) -> Optional[Dict[str, Any]]:
+        """The catalog recipe with exactly this name (case-insensitive), or None."""
+        try:
+            resp = requests.get(
+                f"{self.ingredient_processor.ekitchen_base_url}/global-recipes/search",
+                params={"q": name, "limit": 20},
+                headers={'Authorization': f'Bearer {self.ekitchen_token}'},
+                timeout=30,
+            )
+            resp.raise_for_status()
+            wanted = name.strip().lower()
+            for r in resp.json() or []:
+                if (r.get('name') or '').strip().lower() == wanted:
+                    return r
+        except Exception as e:
+            self._log_and_print(f"   recipe-by-name lookup failed: {e}", 'warning')
+        return None
 
     def _find_recipe_id_by_name(self, name: str) -> Optional[str]:
         """Find a recipe id by exact name match (newest first). Used to reconcile
@@ -2269,8 +2313,10 @@ Return ONLY the DALL-E prompt, nothing else."""
                     processing_time_seconds=time.time() - start_time
                 )
             
+            reused = recipe_data.get('reused_recipe_id') == recipe_id
+
             # Phase 7: Upload image if acquired
-            if image_path and os.path.exists(image_path):
+            if image_path and os.path.exists(image_path) and not reused:
                 self._log_and_print("\n📤 PHASE 7: UPLOAD RECIPE IMAGE")
                 if self.upload_recipe_image(recipe_id, image_path, source=image_source or 'ai'):
                     self._log_and_print("✅ Image uploaded successfully")
@@ -2483,8 +2529,8 @@ Return ONLY the DALL-E prompt, nothing else."""
 
             self._remember_created_recipe(recipe_data.get('title'))
 
-            # Phase 7: Upload image (if acquired)
-            if image_path and os.path.exists(image_path) and recipe_id:
+            # Phase 7: Upload image (if acquired). A reused catalog recipe keeps its own.
+            if image_path and os.path.exists(image_path) and recipe_id and recipe_data.get('reused_recipe_id') != recipe_id:
                 self._log_and_print("\n📤 PHASE 7: IMAGE UPLOAD")
                 self.upload_recipe_image(recipe_id, image_path, source=image_source or 'ai')
             

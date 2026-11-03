@@ -59,24 +59,62 @@ def _post_rejecting(taken):
     return post, sent
 
 
+def _catalog(*recipes):
+    """Stub for GET /global-recipes/search: returns recipes whose name contains q."""
+    def get(url, params=None, headers=None, timeout=None):
+        q = (params or {}).get("q", "").lower()
+        resp = MagicMock()
+        resp.raise_for_status.return_value = None
+        resp.json.return_value = [r for r in recipes if q in r["name"].lower()]
+        return resp
+    return get
+
+
+DELISH = {"id": "delish", "name": "Pepper Steak",
+          "inspired_by_url": "https://www.delish.com/pepper-steak", "imported_from_url": None}
+
+
 def test_user_import_takes_a_sourced_name_when_the_name_is_taken():
     post, sent = _post_rejecting({"Pepper Steak"})
-    with patch("requests.post", side_effect=post):
+    with patch("requests.post", side_effect=post), patch("requests.get", side_effect=_catalog(DELISH)):
         rid = _processor().create_ekitchen_recipe(*_inputs(), user_id="u1")
     assert rid == "r1"
     assert sent == ["Pepper Steak", "Pepper Steak (royaleeats)"]
 
 
+def _named(name, url):
+    return {"id": name, "name": name, "inspired_by_url": url, "imported_from_url": None}
+
+
 def test_falls_back_to_a_number_and_then_gives_up():
-    post, sent = _post_rejecting({"Pepper Steak", "Pepper Steak (royaleeats)", "Pepper Steak 2"})
-    with patch("requests.post", side_effect=post):
+    others = [DELISH, _named("Pepper Steak (royaleeats)", "https://a.test/1"), _named("Pepper Steak 2", "https://b.test/2")]
+    post, sent = _post_rejecting({r["name"] for r in others})
+    with patch("requests.post", side_effect=post), patch("requests.get", side_effect=_catalog(*others)):
         assert _processor().create_ekitchen_recipe(*_inputs(), user_id="u1") == "r1"
     assert sent[-1] == "Pepper Steak 3"
 
-    post, sent = _post_rejecting({"Pepper Steak", "Pepper Steak (royaleeats)", "Pepper Steak 2", "Pepper Steak 3"})
-    with patch("requests.post", side_effect=post):
+    others.append(_named("Pepper Steak 3", "https://c.test/3"))
+    post, sent = _post_rejecting({r["name"] for r in others})
+    with patch("requests.post", side_effect=post), patch("requests.get", side_effect=_catalog(*others)):
         assert _processor().create_ekitchen_recipe(*_inputs(), user_id="u1") is None
     assert len(sent) == 4
+
+
+def test_same_recipe_already_in_the_catalog_is_reused_not_copied():
+    # Also what a retry sees after an earlier attempt saved the recipe.
+    data, ai, ings, nutrition = _inputs(author="", url="https://www.delish.com/pepper-steak/")
+    post, sent = _post_rejecting({"Pepper Steak"})
+    with patch("requests.post", side_effect=post), patch("requests.get", side_effect=_catalog(DELISH)):
+        assert _processor().create_ekitchen_recipe(data, ai, ings, nutrition, user_id="u1") == "delish"
+    assert sent == ["Pepper Steak"]
+    assert data["reused_recipe_id"] == "delish"
+
+
+def test_a_409_that_is_not_about_the_name_is_not_renamed_around():
+    post, sent = _post_rejecting({"Pepper Steak"})
+    with patch("requests.post", side_effect=post), patch("requests.get", side_effect=_catalog()):
+        assert _processor().create_ekitchen_recipe(*_inputs(), user_id="u1") is None
+    assert sent == ["Pepper Steak"]
 
 
 def test_website_recipe_uses_the_site():
