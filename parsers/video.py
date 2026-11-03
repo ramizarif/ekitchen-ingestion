@@ -15,8 +15,15 @@ from urllib.parse import urlparse
 
 from parsers.base import BaseParser, ParseResult
 from app.security import is_safe_url
+from services.import_progress import NO_PROGRESS
 
 logger = logging.getLogger(__name__)
+
+
+def _handle(username: Optional[str]) -> Optional[str]:
+    """'cookingwithshereen' -> '@cookingwithshereen' (None when there is no username)."""
+    name = (username or '').strip().lstrip('@')
+    return f"@{name}" if name else None
 
 
 class VideoParser(BaseParser):
@@ -319,6 +326,7 @@ class VideoParser(BaseParser):
         start_time = time.time()
         temp_dir = None
         force_mode = kwargs.get('force_mode', None)
+        progress = kwargs.get('progress') or NO_PROGRESS
 
         try:
             # Step 1: Detect platform
@@ -357,43 +365,42 @@ class VideoParser(BaseParser):
                 # TikTok: Use TikWM API instead of yt-dlp
                 logger.info("Fetching TikTok metadata via TikWM...")
                 tikwm_metadata = self._fetch_tiktok_metadata_via_tikwm(url)
+                tikwm_audio_url = tikwm_metadata.get('audio_url', '') if tikwm_metadata.get('success') else ''
 
-                if not tikwm_metadata.get('success'):
-                    return ParseResult(
-                        success=False,
-                        error_code="TIKWM_FAILED",
-                        error_message=tikwm_metadata.get('error', 'TikWM metadata fetch failed'),
-                        parser_name=self.parser_name
+                if not tikwm_audio_url:
+                    # TikWM is unreliable from server IPs (it has returned 403 to
+                    # Railway). Fall back to TikTok's public oEmbed for the caption,
+                    # then to yt-dlp for the audio.
+                    logger.warning(
+                        f"TikWM unusable ({tikwm_metadata.get('error') or 'no audio URL'}); "
+                        f"falling back to TikTok oEmbed"
                     )
+                    short_result, download_info = self._tiktok_fallback(url, audio_path, platform, progress)
+                    if short_result is not None:
+                        return short_result
+                    tikwm_metadata = None
+                else:
+                    # Download audio from TikWM CDN URL
+                    logger.info("Downloading TikTok audio from TikWM CDN...")
+                    audio_download = self._download_from_url(tikwm_audio_url, audio_path)
 
-                # Download audio from TikWM CDN URL
-                audio_url = tikwm_metadata.get('audio_url', '')
-                if not audio_url:
-                    return ParseResult(
-                        success=False,
-                        error_code="TIKWM_NO_AUDIO",
-                        error_message="TikWM did not return an audio URL",
-                        parser_name=self.parser_name
-                    )
+                    if not audio_download.get('success'):
+                        return ParseResult(
+                            success=False,
+                            error_code="DOWNLOAD_FAILED",
+                            error_message=audio_download.get('error', 'Failed to download TikTok audio'),
+                            parser_name=self.parser_name
+                        )
 
-                logger.info("Downloading TikTok audio from TikWM CDN...")
-                audio_download = self._download_from_url(audio_url, audio_path)
-
-                if not audio_download.get('success'):
-                    return ParseResult(
-                        success=False,
-                        error_code="DOWNLOAD_FAILED",
-                        error_message=audio_download.get('error', 'Failed to download TikTok audio'),
-                        parser_name=self.parser_name
-                    )
-
-                download_info = {
-                    'success': True,
-                    'title': tikwm_metadata.get('title', ''),
-                    'description': tikwm_metadata.get('description', ''),
-                    'duration': tikwm_metadata.get('duration', 0),
-                    'file_size': os.path.getsize(audio_path) if os.path.exists(audio_path) else 0,
-                }
+                    download_info = {
+                        'success': True,
+                        'title': tikwm_metadata.get('title', ''),
+                        'description': tikwm_metadata.get('description', ''),
+                        'duration': tikwm_metadata.get('duration', 0),
+                        'file_size': os.path.getsize(audio_path) if os.path.exists(audio_path) else 0,
+                        'creator': _handle(tikwm_metadata.get('author')),
+                        'thumbnail_url': tikwm_metadata.get('thumbnail_url', ''),
+                    }
             else:
                 # Instagram/YouTube: Use yt-dlp as before
                 logger.info("Downloading audio with yt-dlp...")
@@ -425,63 +432,26 @@ class VideoParser(BaseParser):
             download_info['platform'] = platform
             download_info['url'] = url
 
-            # Step 2.5: Description-first analysis
-            # Check if the video description already contains a full recipe
             video_title = download_info.get('title', '')
             video_description = download_info.get('description', video_title)
+            progress.report(
+                'reading',
+                title=video_title,
+                creator=download_info.get('creator'),
+                thumbnail_url=download_info.get('thumbnail_url'),
+            )
 
-            if video_title or video_description:
-                logger.info("Analyzing video description for recipe content...")
-                desc_analysis = self._analyze_description(video_title, video_description, platform)
-
-                # Early reject: not a recipe video
-                if not desc_analysis.get('is_recipe', True) and desc_analysis.get('confidence', 0) >= 0.8:
-                    processing_time = time.time() - start_time
-                    logger.info(f"❌ Video rejected as non-recipe from description (confidence: {desc_analysis.get('confidence', 0):.2f}): {desc_analysis.get('rejection_reason', 'unknown')}")
-                    return ParseResult(
-                        success=False,
-                        error_code="NOT_A_RECIPE",
-                        error_message=f"This video doesn't appear to be a recipe: {desc_analysis.get('rejection_reason', 'No recipe content detected')}",
-                        parser_name=self.parser_name,
-                        extraction_method="description_rejected"
-                    )
-
-                # Full recipe found in description — skip audio/vision entirely
-                if desc_analysis.get('has_full_recipe', False) and desc_analysis.get('confidence', 0) >= 0.8 and desc_analysis.get('recipe'):
-                    processing_time = time.time() - start_time
-                    logger.info(f"✅ Full recipe found in description! Skipping audio/vision pipeline (saved ~${self._estimate_cost('audio_only'):.3f}+)")
-
-                    recipe_data = desc_analysis['recipe']
-                    # Ensure recipe has a name
-                    if not recipe_data.get('name'):
-                        recipe_data['name'] = video_title.split('\n')[0][:100] if video_title else 'Untitled Recipe'
-
-                    # Convert structured ingredients to strings for downstream processor
-                    if recipe_data.get('ingredients'):
-                        string_ingredients = []
-                        for ing in recipe_data['ingredients']:
-                            if isinstance(ing, dict):
-                                parts = [ing.get('quantity', ''), ing.get('unit', ''), ing.get('name', '')]
-                                string_ingredients.append(' '.join(p for p in parts if p).strip())
-                            else:
-                                string_ingredients.append(str(ing))
-                        recipe_data['ingredients'] = string_ingredients
-
-                    return ParseResult(
-                        success=True,
-                        data=recipe_data,
-                        parser_name=self.parser_name,
-                        confidence_score=desc_analysis.get('confidence', 0.8),
-                        extraction_method="description_only",
-                        frames_used=0,
-                        estimated_cost=0.001,
-                    )
-
-                # Partial recipe or low confidence — continue with audio/vision pipeline
-                if desc_analysis.get('is_recipe', True):
-                    logger.info(f"Description suggests recipe but incomplete (confidence: {desc_analysis.get('confidence', 0):.2f}). Continuing with audio/vision pipeline.")
+            # Step 2.5: Description-first analysis
+            # Check if the video description already contains a full recipe. Skipped
+            # when the TikTok oEmbed fallback already analysed this exact text.
+            if (video_title or video_description) and download_info.get('analyzed_text') != (video_title, video_description):
+                progress.report('extracting')
+                short_result = self._description_first(video_title, video_description, platform)
+                if short_result is not None:
+                    return short_result
 
             # Step 3: Try audio extraction
+            progress.report('extracting')
             logger.info("Attempting audio-only extraction...")
             audio_result = await self._try_audio_extraction(audio_path, download_info)
 
@@ -605,6 +575,12 @@ class VideoParser(BaseParser):
                     extraction_method=extraction_method,
                     frames_used=frames_used
                 )
+
+            # Keep the creator the platform told us about (the transcript path has no author)
+            creator = download_info.get('creator')
+            source_metadata = final_recipe.get('source_metadata')
+            if creator and isinstance(source_metadata, dict) and not source_metadata.get('author'):
+                source_metadata['author'] = creator
 
             # Calculate warnings
             warnings = self._generate_warnings(final_recipe)
@@ -775,6 +751,79 @@ class VideoParser(BaseParser):
             output_tokens=500,
         )
 
+    def _fetch_tiktok_oembed(self, url: str) -> Dict[str, Any]:
+        """
+        Fetch TikTok's public oEmbed record: caption, author and thumbnail (no media).
+
+        Returns dict with success, and on success title (the caption), author
+        (unique_id, no '@'), thumbnail_url. On failure, error.
+        """
+        try:
+            response = requests.get("https://www.tiktok.com/oembed", params={"url": url}, timeout=5)
+            if response.status_code != 200:
+                return {'success': False, 'error': f"oEmbed returned HTTP {response.status_code}"}
+            data = response.json()
+            return {
+                'success': True,
+                'title': (data.get('title') or '').strip(),
+                'author': (data.get('author_unique_id') or '').strip(),
+                'thumbnail_url': data.get('thumbnail_url') or '',
+            }
+        except Exception as e:
+            return {'success': False, 'error': f"oEmbed request failed: {e}"}
+
+    def _tiktok_fallback(
+        self,
+        url: str,
+        audio_path: str,
+        platform: str,
+        progress: Any,
+    ):
+        """
+        Used when TikWM can't give us the audio. Order of attempts:
+        1. oEmbed caption run through description-first analysis. A full recipe
+           there finishes the import without any media download.
+        2. yt-dlp audio download, which then goes through the normal pipeline.
+
+        Returns (short_result, download_info). short_result is a ParseResult when
+        the import is finished or failed here; otherwise download_info is the
+        yt-dlp metadata dict for the audio/vision pipeline.
+        """
+        oembed = self._fetch_tiktok_oembed(url)
+        caption = ''
+        if oembed.get('success'):
+            caption = oembed.get('title', '')
+            progress.report(
+                'reading',
+                title=caption,
+                creator=_handle(oembed.get('author')),
+                thumbnail_url=oembed.get('thumbnail_url'),
+            )
+            if caption:
+                progress.report('extracting')
+                short_result = self._description_first(caption, caption, platform)
+                if short_result is not None:
+                    return short_result, None
+        else:
+            logger.warning(f"TikTok oEmbed unavailable: {oembed.get('error')}")
+
+        logger.info("Trying yt-dlp audio download for TikTok...")
+        info = self._download_audio(url, audio_path)
+        if not info.get('success'):
+            return ParseResult(
+                success=False,
+                error_code="TIKWM_FAILED",
+                error_message=(
+                    "TikWM failed, oEmbed had no full recipe, and yt-dlp could not download "
+                    f"the audio: {(info.get('error') or '')[:300]}"
+                ),
+                parser_name=self.parser_name,
+            ), None
+
+        # The caption was already analysed above; don't spend a second call on the same text.
+        info['analyzed_text'] = (caption, caption) if caption else None
+        return None, info
+
     def _fetch_tiktok_metadata_via_tikwm(self, url: str) -> Dict[str, Any]:
         """
         Fetch TikTok video metadata via TikWM API.
@@ -839,6 +888,7 @@ class VideoParser(BaseParser):
                 'duration': data.get('duration', 0),
                 'author': data.get('author', {}).get('unique_id', ''),
                 'video_id': str(data.get('id', '')),
+                'thumbnail_url': data.get('cover', '') or '',
             }
 
         except requests.Timeout:
@@ -939,13 +989,20 @@ class VideoParser(BaseParser):
 
             title = ""
             description = ""
+            thumbnail_url = ""
+            creator = None
+            duration = None
 
             if info_result.returncode == 0:
                 try:
                     info = json.loads(info_result.stdout)
                     title = info.get('title', '')
                     description = info.get('description', '')
-                except json.JSONDecodeError:
+                    thumbnail_url = info.get('thumbnail') or ''
+                    # uploader_id is the handle on Instagram; YouTube gives "@handle" already
+                    creator = _handle(info.get('uploader_id')) or (info.get('uploader') or None)
+                    duration = info.get('duration') or None
+                except (json.JSONDecodeError, AttributeError):
                     logger.warning("Could not parse video info JSON")
 
             # Download audio only (much faster than full video)
@@ -1001,7 +1058,10 @@ class VideoParser(BaseParser):
                 'success': True,
                 'title': title,
                 'description': description,
-                'file_size': file_size
+                'file_size': file_size,
+                'thumbnail_url': thumbnail_url,
+                'creator': creator,
+                **({'duration': duration} if duration else {}),
             }
             
         except subprocess.TimeoutExpired:
@@ -1247,6 +1307,62 @@ Return ONLY valid JSON, no other text."""
         except Exception as e:
             logger.error(f"GPT-4 recipe extraction failed: {e}")
             return None
+
+    def _description_first(self, video_title: str, video_description: str, platform: str) -> Optional[ParseResult]:
+        """
+        Description-first check shared by the yt-dlp and TikTok oEmbed paths.
+
+        Returns a ParseResult when the text settles the import (not a recipe, or a
+        full recipe), otherwise None so the audio/vision pipeline runs.
+        """
+        logger.info("Analyzing video description for recipe content...")
+        desc_analysis = self._analyze_description(video_title, video_description, platform)
+
+        # Early reject: not a recipe video
+        if not desc_analysis.get('is_recipe', True) and desc_analysis.get('confidence', 0) >= 0.8:
+            logger.info(f"❌ Video rejected as non-recipe from description (confidence: {desc_analysis.get('confidence', 0):.2f}): {desc_analysis.get('rejection_reason', 'unknown')}")
+            return ParseResult(
+                success=False,
+                error_code="NOT_A_RECIPE",
+                error_message=f"This video doesn't appear to be a recipe: {desc_analysis.get('rejection_reason', 'No recipe content detected')}",
+                parser_name=self.parser_name,
+                extraction_method="description_rejected"
+            )
+
+        # Full recipe found in description — skip audio/vision entirely
+        if desc_analysis.get('has_full_recipe', False) and desc_analysis.get('confidence', 0) >= 0.8 and desc_analysis.get('recipe'):
+            logger.info(f"✅ Full recipe found in description! Skipping audio/vision pipeline (saved ~${self._estimate_cost('audio_only'):.3f}+)")
+
+            recipe_data = desc_analysis['recipe']
+            # Ensure recipe has a name
+            if not recipe_data.get('name'):
+                recipe_data['name'] = video_title.split('\n')[0][:100] if video_title else 'Untitled Recipe'
+
+            # Convert structured ingredients to strings for downstream processor
+            if recipe_data.get('ingredients'):
+                string_ingredients = []
+                for ing in recipe_data['ingredients']:
+                    if isinstance(ing, dict):
+                        parts = [ing.get('quantity', ''), ing.get('unit', ''), ing.get('name', '')]
+                        string_ingredients.append(' '.join(p for p in parts if p).strip())
+                    else:
+                        string_ingredients.append(str(ing))
+                recipe_data['ingredients'] = string_ingredients
+
+            return ParseResult(
+                success=True,
+                data=recipe_data,
+                parser_name=self.parser_name,
+                confidence_score=desc_analysis.get('confidence', 0.8),
+                extraction_method="description_only",
+                frames_used=0,
+                estimated_cost=0.001,
+            )
+
+        # Partial recipe or low confidence — continue with audio/vision pipeline
+        if desc_analysis.get('is_recipe', True):
+            logger.info(f"Description suggests recipe but incomplete (confidence: {desc_analysis.get('confidence', 0):.2f}). Continuing with audio/vision pipeline.")
+        return None
 
     def _analyze_description(
         self,
