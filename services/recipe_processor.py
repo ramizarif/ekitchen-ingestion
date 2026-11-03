@@ -29,6 +29,7 @@ except ImportError:
 # Import ingredient processor from same package
 from services.ingredient_processor import DirectIngredientProcessor, IngredientData, load_env_file
 from services.ingredient_validator import validate_ingredient_name
+from services.import_progress import NO_PROGRESS, ProgressReporter
 
 
 # Publisher attribution stripped from scraped recipe titles at ingestion.
@@ -104,6 +105,22 @@ class RecipeProcessingResult:
     ingredients_processed: int = 0
     image_generated: bool = False
     processing_time_seconds: float = 0.0
+
+def _normalize_source(url: str) -> str:
+    """'https://www.Delish.com/x/?a=1' -> 'delish.com/x' so two spellings of one link compare equal."""
+    parts = urllib.parse.urlparse((url or '').strip())
+    host = parts.netloc.lower()
+    host = host[4:] if host.startswith('www.') else host
+    return f"{host}{parts.path.rstrip('/')}"
+
+
+def _same_source(recipe: Dict[str, Any], url: str) -> bool:
+    """Whether a catalog recipe came from this link."""
+    mine = _normalize_source(url)
+    if not mine:
+        return False
+    return any(_normalize_source(recipe.get(k) or '') == mine for k in ('inspired_by_url', 'imported_from_url'))
+
 
 class DirectRecipeProcessor:
     """Autonomous recipe processor using direct API calls"""
@@ -859,6 +876,7 @@ Examples:
     
     def get_or_create_global_ingredient_enhanced(self, standardized_name: str) -> Optional[str]:
         """Get existing global ingredient or create new one with full Spoonacular enrichment"""
+        self._last_ingredient_created = False  # read by process_ingredients_enhanced for progress counts
         
         # Check cache first
         if standardized_name in self.global_ingredients_cache:
@@ -1026,6 +1044,7 @@ Examples:
             
             if created_id:
                 self.global_ingredients_cache[standardized_name] = created_id
+                self._last_ingredient_created = True
                 self._log_and_print(f"   ✨ Created enriched ingredient '{standardized_name}' → {created_id}")
                 return created_id
             else:
@@ -1093,12 +1112,14 @@ Category:"""
             self._log_and_print(f"   ❌ OpenAI categorization failed for '{ingredient_name}': {e}")
             return "other"  # Default fallback
     
-    def process_ingredients_enhanced(self, raw_ingredients: List[str], allow_ingredient_skipping: bool = False) -> Tuple[Dict[str, Any], Dict[str, str], List[Dict], bool]:
+    def process_ingredients_enhanced(self, raw_ingredients: List[str], allow_ingredient_skipping: bool = False,
+                                     progress: Optional[ProgressReporter] = None) -> Tuple[Dict[str, Any], Dict[str, str], List[Dict], bool]:
         """Enhanced ingredient processing with AI standardization, proper quantities/units, and singularization
         
         Args:
             raw_ingredients: List of raw ingredient strings
             allow_ingredient_skipping: Allow interactive ingredient skipping
+            progress: Optional import progress reporter (matching stage)
             
         Returns:
             Tuple containing:
@@ -1115,8 +1136,15 @@ Category:"""
         ingredient_id_map = {}
         formatted_ingredients = []
         ingredients_skipped_by_user = False
+        progress = progress or NO_PROGRESS
+        total_ingredients = len(raw_ingredients)
+        matched_count = 0
+        new_count = 0
         
         for i, ingredient_text in enumerate(raw_ingredients, 1):
+            # Reports only when the numbers move, and at most about once a second
+            progress.report("matching", ingredient_count=total_ingredients, ingredients_done=i - 1,
+                            matched_count=matched_count, new_count=new_count)
             self._log_and_print(f"\n   🔍 Processing ingredient {i}: '{ingredient_text}'")
             
             # Interactive ingredient skipping
@@ -1199,6 +1227,10 @@ Category:"""
             global_ingredient_id = self.get_or_create_global_ingredient_enhanced(standardized_name)
             
             if global_ingredient_id:
+                if getattr(self, '_last_ingredient_created', False):
+                    new_count += 1
+                else:
+                    matched_count += 1
                 # Create recipe ingredient data with AI-generated reference_as
                 recipe_ingredient = {
                     "ingredient_id": global_ingredient_id,
@@ -1224,6 +1256,8 @@ Category:"""
             else:
                 self._log_and_print(f"   ❌ Failed to process ingredient: {ingredient_text}", 'error')
         
+        progress.report("matching", force=True, ingredient_count=total_ingredients, ingredients_done=total_ingredients,
+                        matched_count=matched_count, new_count=new_count)
         self._log_and_print(f"\n✅ Enhanced processing complete: {len(formatted_ingredients)}/{len(raw_ingredients)} ingredients processed")
         
         return processed_ingredients, ingredient_id_map, formatted_ingredients, ingredients_skipped_by_user
@@ -1722,6 +1756,10 @@ Return ONLY the DALL-E prompt, nothing else."""
         self.ekitchen_refresh_token = ip.refresh_token
         return True
 
+    def get_ekitchen_token(self) -> Optional[str]:
+        """A usable eKitchen admin bearer token (re-authenticating if needed), or None."""
+        return self.ekitchen_token if self._ensure_ekitchen_auth() else None
+
     def create_ekitchen_recipe(self, recipe_data: Dict[str, Any], ai_decisions: Dict[str, Any],
                              formatted_ingredients: List[Dict[str, str]],
                              nutrition_data: Dict[str, float], user_id: Optional[str] = None) -> Optional[str]:
@@ -1774,7 +1812,15 @@ Return ONLY the DALL-E prompt, nothing else."""
             "imported_from_url": recipe_data['url'] if user_id else None
         }
         
-        for attempt in range(2):
+        # Recipe names are unique catalog-wide, so a user's "Pepper Steak" from
+        # TikTok collides with someone else's from Delish. For user imports a
+        # clash is resolved by what the existing recipe is: the same source means
+        # it is this recipe (already in the catalog, or saved by an earlier
+        # attempt of this import), so it is reused; a different source means a
+        # different recipe, which is saved under a name that says where it came from.
+        alternate_names = self._alternate_names(create_data['name'], recipe_data) if user_id else []
+        reauthed = False
+        while True:
             try:
                 response = requests.post(
                     f"{self.ingredient_processor.ekitchen_base_url}/global-recipes",
@@ -1803,9 +1849,24 @@ Return ONLY the DALL-E prompt, nothing else."""
             except requests.exceptions.HTTPError as e:
                 # Token expired/rejected mid-run — re-authenticate and retry ONCE.
                 status_code = e.response.status_code if e.response is not None else None
-                if status_code in (401, 403) and attempt == 0 and self._ensure_ekitchen_auth(force=True):
+                if status_code in (401, 403) and not reauthed and self._ensure_ekitchen_auth(force=True):
+                    reauthed = True
                     self._log_and_print("🔄 eKitchen token rejected creating recipe; re-authenticated, retrying...", 'warning')
                     continue
+                if status_code == 409 and user_id:
+                    taken = create_data['name']
+                    existing = self._recipe_named(taken)
+                    if existing and _same_source(existing, recipe_data.get('url', '')):
+                        self._log_and_print(f"♻️  '{taken}' is this recipe already (ID {existing.get('id')}); reusing it")
+                        # Tells the caller not to touch it: it has its own photo.
+                        recipe_data['reused_recipe_id'] = existing.get('id')
+                        return existing.get('id')
+                    if existing and alternate_names:
+                        create_data['name'] = alternate_names.pop(0)
+                        self._log_and_print(f"🔁 '{taken}' is taken; saving as '{create_data['name']}'", 'warning')
+                        continue
+                    # No recipe has that name, so the 409 is about something else:
+                    # renaming would not help. Fall through and report it.
                 # Surface the backend's ACTUAL status + response body. The generic
                 # "Failed to create recipe in eKitchen" upstream hides the real cause
                 # (e.g. a 500 'Failed to rotate token' / DB error / validation). This
@@ -1850,6 +1911,24 @@ Return ONLY the DALL-E prompt, nothing else."""
             except Exception as e:
                 self._log_and_print(f"❌ Error creating recipe: {e}", 'error')
                 return None
+
+    def _recipe_named(self, name: str) -> Optional[Dict[str, Any]]:
+        """The catalog recipe with exactly this name (case-insensitive), or None."""
+        try:
+            resp = requests.get(
+                f"{self.ingredient_processor.ekitchen_base_url}/global-recipes/search",
+                params={"q": name, "limit": 20},
+                headers={'Authorization': f'Bearer {self.ekitchen_token}'},
+                timeout=30,
+            )
+            resp.raise_for_status()
+            wanted = name.strip().lower()
+            for r in resp.json() or []:
+                if (r.get('name') or '').strip().lower() == wanted:
+                    return r
+        except Exception as e:
+            self._log_and_print(f"   recipe-by-name lookup failed: {e}", 'warning')
+        return None
 
     def _find_recipe_id_by_name(self, name: str) -> Optional[str]:
         """Find a recipe id by exact name match (newest first). Used to reconcile
@@ -2049,8 +2128,42 @@ Return ONLY the DALL-E prompt, nothing else."""
 
         self._log_and_print(f"✅ Auto-resolved {resolved_count}/{len(unresolved)} ambiguous matches for recipe '{recipe_name}'")
 
+    @classmethod
+    def _alternate_names(cls, name: str, recipe_data: Dict[str, Any]) -> List[str]:
+        """Names to try when `name` is taken: 'Pepper Steak (royaleeats)', then
+        'Pepper Steak 2', 'Pepper Steak 3'."""
+        source = (recipe_data.get('author') or '').strip().lstrip('@') or cls._site_name(recipe_data.get('url', ''))
+        names = [f"{name} ({source})"] if source else []
+        names += [f"{name} {n}" for n in (2, 3)]
+        return names
+
+    @staticmethod
+    def _site_name(recipe_url: str) -> Optional[str]:
+        """'https://www.delish.com/x' -> 'delish.com'"""
+        netloc = urllib.parse.urlparse(recipe_url or '').netloc
+        return netloc[4:] if netloc.startswith('www.') else (netloc or None)
+
+    @staticmethod
+    def _photo_source(image_source: Optional[str]) -> str:
+        """Map _acquire_hero_image's source to the import contract's photo_source."""
+        if image_source in ('pexels', 'pixabay'):
+            return 'stock'
+        if image_source == 'ai':
+            return 'ai'
+        return 'none'
+
+    @staticmethod
+    def _writing_preview(ai_decisions: Dict[str, Any]) -> Dict[str, Any]:
+        """Preview fields known once the AI decisions are back."""
+        return {
+            'cuisine': ai_decisions.get('cuisine'),
+            'difficulty': ai_decisions.get('difficulty'),
+            'meal_type': ai_decisions.get('meal_type'),
+        }
+
     def process_parsed_recipe(self, parsed_recipe: Dict[str, Any], save_images_dir: str = None,
-                               use_enhanced_ingredients: bool = True, user_id: Optional[str] = None) -> 'RecipeProcessingResult':
+                               use_enhanced_ingredients: bool = True, user_id: Optional[str] = None,
+                               progress: Optional[ProgressReporter] = None) -> 'RecipeProcessingResult':
         """
         Process a pre-parsed recipe (e.g., from video transcription).
         
@@ -2091,15 +2204,17 @@ Return ONLY the DALL-E prompt, nothing else."""
         }
         
         # Now process using the internal pipeline (same as process_recipe_autonomous but skip scraping)
-        return self._process_recipe_data(recipe_data, save_images_dir, use_enhanced_ingredients, user_id)
+        return self._process_recipe_data(recipe_data, save_images_dir, use_enhanced_ingredients, user_id, progress=progress)
     
     def _process_recipe_data(self, recipe_data: Dict[str, Any], save_images_dir: str = None,
-                              use_enhanced_ingredients: bool = True, user_id: Optional[str] = None) -> 'RecipeProcessingResult':
+                              use_enhanced_ingredients: bool = True, user_id: Optional[str] = None,
+                              progress: Optional[ProgressReporter] = None) -> 'RecipeProcessingResult':
         """
         Internal method to process recipe_data through the full pipeline.
         Called by both process_recipe_autonomous (after scraping) and process_parsed_recipe.
         """
         start_time = time.time()
+        progress = progress or NO_PROGRESS
         
         self._log_and_print("="*80)
         self._log_and_print("🚀 PROCESSING RECIPE DATA")
@@ -2113,7 +2228,8 @@ Return ONLY the DALL-E prompt, nothing else."""
                 self._log_and_print("\n🥘 PHASE 2: ENHANCED INGREDIENT PROCESSING (AI + Proper Quantities/Units)")
                 processed_ingredients, ingredient_id_map, formatted_ingredients, ingredients_skipped_by_user = self.process_ingredients_enhanced(
                     recipe_data['ingredients'],
-                    allow_ingredient_skipping=False  # No interactive mode for parsed recipes
+                    allow_ingredient_skipping=False,  # No interactive mode for parsed recipes
+                    progress=progress
                 )
             else:
                 self._log_and_print("\n🥘 PHASE 2: STANDARD INGREDIENT PROCESSING")
@@ -2149,7 +2265,19 @@ Return ONLY the DALL-E prompt, nothing else."""
             
             # Phase 4: Generate AI decisions
             self._log_and_print("\n🤖 PHASE 4: AI RECIPE DECISIONS")
+            progress.report("writing")
             ai_decisions = self.generate_ai_decisions(recipe_data)
+
+            # Without decisions there is no cuisine, steps or tags to save, and
+            # create_ekitchen_recipe would fail on them with a TypeError.
+            if ai_decisions is None:
+                self._log_and_print("❌ AI decision generation failed - stopping recipe processing", 'error')
+                return RecipeProcessingResult(
+                    success=False,
+                    error_message="AI decision generation failed after retries",
+                    processing_time_seconds=time.time() - start_time
+                )
+            progress.report("writing", **self._writing_preview(ai_decisions))
 
             # Apply AI-estimated times if original times are missing (0 or None)
             if ai_decisions:
@@ -2168,10 +2296,14 @@ Return ONLY the DALL-E prompt, nothing else."""
             # Phase 5: Acquire hero image — vetted real photo first, AI as fallback
             if save_images_dir:
                 self._log_and_print("\n🎨 PHASE 5: RECIPE IMAGE (stock-first, AI fallback)")
+                progress.report("photo")
             image_path, image_source = self._acquire_hero_image(recipe_data, ai_decisions, save_images_dir)
+            if save_images_dir:
+                progress.report("photo", photo_source=self._photo_source(image_source))
 
             # Phase 6: Create recipe in eKitchen
             self._log_and_print("\n📝 PHASE 6: CREATE EKITCHEN RECIPE")
+            progress.report("saving")
             recipe_id = self.create_ekitchen_recipe(recipe_data, ai_decisions, formatted_ingredients, nutrition_data, user_id)
             
             if not recipe_id:
@@ -2181,8 +2313,10 @@ Return ONLY the DALL-E prompt, nothing else."""
                     processing_time_seconds=time.time() - start_time
                 )
             
+            reused = recipe_data.get('reused_recipe_id') == recipe_id
+
             # Phase 7: Upload image if acquired
-            if image_path and os.path.exists(image_path):
+            if image_path and os.path.exists(image_path) and not reused:
                 self._log_and_print("\n📤 PHASE 7: UPLOAD RECIPE IMAGE")
                 if self.upload_recipe_image(recipe_id, image_path, source=image_source or 'ai'):
                     self._log_and_print("✅ Image uploaded successfully")
@@ -2226,7 +2360,7 @@ Return ONLY the DALL-E prompt, nothing else."""
                 processing_time_seconds=time.time() - start_time
             )
 
-    def process_recipe_autonomous(self, recipe_url: str, save_images_dir: str = None, use_enhanced_ingredients: bool = True, allow_ingredient_skipping: bool = False, user_id: Optional[str] = None) -> RecipeProcessingResult:
+    def process_recipe_autonomous(self, recipe_url: str, save_images_dir: str = None, use_enhanced_ingredients: bool = True, allow_ingredient_skipping: bool = False, user_id: Optional[str] = None, progress: Optional[ProgressReporter] = None) -> RecipeProcessingResult:
         """
         Complete autonomous recipe processing pipeline
         
@@ -2240,6 +2374,7 @@ Return ONLY the DALL-E prompt, nothing else."""
             RecipeProcessingResult with success status and details
         """
         start_time = time.time()
+        progress = progress or NO_PROGRESS
         
         self._log_and_print("="*80)
         self._log_and_print("🚀 STARTING AUTONOMOUS RECIPE PROCESSING")
@@ -2257,9 +2392,26 @@ Return ONLY the DALL-E prompt, nothing else."""
                     processing_time_seconds=time.time() - start_time
                 )
 
+            # A page is read in one step, so its title and the recipe arrive together.
+            progress.report(
+                "extracting",
+                extraction_method="page",
+                title=recipe_data.get('title'),
+                creator=recipe_data.get('author') or self._site_name(recipe_url),
+                site_name=self._site_name(recipe_url),
+                thumbnail_url=recipe_data.get('image_url'),
+                ingredients=recipe_data.get('ingredients') or [],
+                ingredient_count=len(recipe_data.get('ingredients') or []),
+                step_count=len(recipe_data.get('instructions') or []),
+                servings=recipe_data.get('yields') or None,
+                total_minutes=recipe_data.get('total_time') or None,
+            )
+
             # Early duplicate pre-check: abort BEFORE paying for AI enrichment + image
             # generation if a recipe with this (cleaned) title already exists.
-            if self._recipe_already_exists(recipe_data.get('title')):
+            # User imports skip it: a same-named recipe from another source is a
+            # different recipe and gets a distinct name at create time.
+            if not user_id and self._recipe_already_exists(recipe_data.get('title')):
                 self._log_and_print(f"⏭️  Duplicate — '{recipe_data.get('title')}' already exists; skipping before enrichment/image")
                 return RecipeProcessingResult(
                     success=False,
@@ -2274,7 +2426,8 @@ Return ONLY the DALL-E prompt, nothing else."""
                 self._log_and_print("\n🥘 PHASE 2: ENHANCED INGREDIENT PROCESSING (AI + Proper Quantities/Units)")
                 processed_ingredients, ingredient_id_map, formatted_ingredients, ingredients_skipped_by_user = self.process_ingredients_enhanced(
                     recipe_data['ingredients'],
-                    allow_ingredient_skipping=allow_ingredient_skipping
+                    allow_ingredient_skipping=allow_ingredient_skipping,
+                    progress=progress
                 )
             else:
                 self._log_and_print("\n🥘 PHASE 2: STANDARD INGREDIENT PROCESSING")
@@ -2319,6 +2472,7 @@ Return ONLY the DALL-E prompt, nothing else."""
             
             # Phase 4: AI decisions
             self._log_and_print("\n🤖 PHASE 4: AI DECISION GENERATION")
+            progress.report("writing")
             ai_decisions = self.generate_ai_decisions(recipe_data)
 
             # Check if AI decisions failed
@@ -2329,6 +2483,7 @@ Return ONLY the DALL-E prompt, nothing else."""
                     error_message="AI decision generation failed after retries",
                     processing_time_seconds=time.time() - start_time
                 )
+            progress.report("writing", **self._writing_preview(ai_decisions))
 
             # Apply AI-estimated times if original times are missing (0 or None)
             if (not recipe_data['prep_time'] or recipe_data['prep_time'] == 0) and ai_decisions.get('estimated_prep_time_minutes'):
@@ -2346,11 +2501,15 @@ Return ONLY the DALL-E prompt, nothing else."""
             # Phase 5: Acquire hero image — vetted real photo first, AI as fallback
             if save_images_dir:
                 self._log_and_print("\n🎨 PHASE 5: RECIPE IMAGE (stock-first, AI fallback)")
+                progress.report("photo")
             image_path, image_source = self._acquire_hero_image(recipe_data, ai_decisions, save_images_dir)
+            if save_images_dir:
+                progress.report("photo", photo_source=self._photo_source(image_source))
             image_generated = image_path is not None
 
             # Phase 7: Create recipe in database
             self._log_and_print("\n🏗️  PHASE 6: RECIPE CREATION")
+            progress.report("saving")
             recipe_id = self.create_ekitchen_recipe(
                 recipe_data,
                 ai_decisions,
@@ -2370,8 +2529,8 @@ Return ONLY the DALL-E prompt, nothing else."""
 
             self._remember_created_recipe(recipe_data.get('title'))
 
-            # Phase 7: Upload image (if acquired)
-            if image_path and os.path.exists(image_path) and recipe_id:
+            # Phase 7: Upload image (if acquired). A reused catalog recipe keeps its own.
+            if image_path and os.path.exists(image_path) and recipe_id and recipe_data.get('reused_recipe_id') != recipe_id:
                 self._log_and_print("\n📤 PHASE 7: IMAGE UPLOAD")
                 self.upload_recipe_image(recipe_id, image_path, source=image_source or 'ai')
             
