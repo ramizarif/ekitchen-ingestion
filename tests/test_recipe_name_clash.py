@@ -90,3 +90,29 @@ def test_catalog_ingestion_still_fails_on_a_taken_name():
     with patch("requests.post", side_effect=post):
         assert _processor().create_ekitchen_recipe(*_inputs()) is None
     assert sent == ["Pepper Steak"]
+
+
+# ─── Video results carry the link and creator on every extraction path ───
+
+def test_video_result_gets_link_and_creator_when_extraction_left_them_out():
+    import asyncio
+    from parsers.base import ParseResult
+    from parsers.video import VideoParser
+
+    url = "https://www.tiktok.com/@royaleeats/video/1"
+    parser = VideoParser.__new__(VideoParser)
+
+    async def fake_parse(u, **kwargs):
+        kwargs['progress'].report('reading', title='t', creator='@royaleeats')
+        return ParseResult(success=True, data={"name": "Pepper Steak"}, parser_name="video",
+                           extraction_method="description_only")
+
+    parser._parse = fake_parse
+    seen = []
+    progress = MagicMock()
+    progress.report.side_effect = lambda stage, **f: seen.append(stage)
+    result = asyncio.run(parser.parse(url, progress=progress))
+
+    assert result.data["source_url"] == url
+    assert result.data["source_metadata"]["author"] == "@royaleeats"
+    assert seen == ["reading"]  # reports still reach the real reporter

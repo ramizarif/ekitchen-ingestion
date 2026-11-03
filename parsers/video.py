@@ -26,6 +26,34 @@ def _handle(username: Optional[str]) -> Optional[str]:
     return f"@{name}" if name else None
 
 
+class _SourceRecorder:
+    """Passes progress reports through and remembers the creator the
+    'reading' stage named, whichever download path produced it."""
+
+    def __init__(self, inner: Any):
+        self._inner = inner
+        self.creator: Optional[str] = None
+
+    def report(self, stage: str, **fields: Any) -> None:
+        if stage == 'reading' and fields.get('creator'):
+            self.creator = fields['creator']
+        self._inner.report(stage, **fields)
+
+    def __getattr__(self, name: str) -> Any:
+        return getattr(self._inner, name)
+
+
+def _stamp_source(recipe: Dict[str, Any], url: str, creator: Optional[str]) -> None:
+    """Fill in the video link and creator where the extraction left them out."""
+    if not recipe.get('video_url') and not recipe.get('source_url'):
+        recipe['source_url'] = url
+    metadata = recipe.get('source_metadata')
+    if not isinstance(metadata, dict):
+        metadata = recipe['source_metadata'] = {}
+    if creator and not metadata.get('author'):
+        metadata['author'] = creator
+
+
 class VideoParser(BaseParser):
     """
     Parse recipes from video URLs (TikTok, Instagram Reels, YouTube Shorts).
@@ -303,6 +331,17 @@ class VideoParser(BaseParser):
         return (url, None)
 
     async def parse(self, url: str, **kwargs) -> ParseResult:
+        """Parse a recipe from a video URL (see _parse), then make sure the
+        result carries the link and the creator. Some paths (description-only,
+        vision-only, oEmbed) never set them, and without them the saved recipe
+        has no "inspired by" link back to the video."""
+        progress = _SourceRecorder(kwargs.get('progress') or NO_PROGRESS)
+        result = await self._parse(url, **{**kwargs, 'progress': progress})
+        if result.success and isinstance(result.data, dict):
+            _stamp_source(result.data, url, progress.creator)
+        return result
+
+    async def _parse(self, url: str, **kwargs) -> ParseResult:
         """
         Parse a recipe from a video URL using smart audio+vision routing.
 
@@ -576,17 +615,11 @@ class VideoParser(BaseParser):
                     frames_used=frames_used
                 )
 
-            # Keep the creator the platform told us about (the transcript path has
-            # no author), and the link itself: without it the saved recipe has no
-            # "inspired by" link back to the video.
+            # Keep the creator the platform told us about (the transcript path has no author)
             creator = download_info.get('creator')
             source_metadata = final_recipe.get('source_metadata')
-            if not isinstance(source_metadata, dict):
-                source_metadata = final_recipe['source_metadata'] = {}
-            if creator and not source_metadata.get('author'):
+            if creator and isinstance(source_metadata, dict) and not source_metadata.get('author'):
                 source_metadata['author'] = creator
-            if not final_recipe.get('video_url') and not final_recipe.get('source_url'):
-                final_recipe['source_url'] = url
 
             # Calculate warnings
             warnings = self._generate_warnings(final_recipe)
