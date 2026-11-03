@@ -1796,7 +1796,14 @@ Return ONLY the DALL-E prompt, nothing else."""
             "imported_from_url": recipe_data['url'] if user_id else None
         }
         
-        for attempt in range(2):
+        # Recipe names are unique catalog-wide, so a user's "Pepper Steak" from
+        # TikTok collides with someone else's from Delish. For user imports a
+        # clash means "different recipe, same name", not "already imported"
+        # (same-URL duplicates are caught by the backend before ingestion runs),
+        # so retry under a name that says where it came from.
+        alternate_names = self._alternate_names(create_data['name'], recipe_data) if user_id else []
+        reauthed = False
+        while True:
             try:
                 response = requests.post(
                     f"{self.ingredient_processor.ekitchen_base_url}/global-recipes",
@@ -1825,8 +1832,14 @@ Return ONLY the DALL-E prompt, nothing else."""
             except requests.exceptions.HTTPError as e:
                 # Token expired/rejected mid-run — re-authenticate and retry ONCE.
                 status_code = e.response.status_code if e.response is not None else None
-                if status_code in (401, 403) and attempt == 0 and self._ensure_ekitchen_auth(force=True):
+                if status_code in (401, 403) and not reauthed and self._ensure_ekitchen_auth(force=True):
+                    reauthed = True
                     self._log_and_print("🔄 eKitchen token rejected creating recipe; re-authenticated, retrying...", 'warning')
+                    continue
+                if status_code == 409 and alternate_names:
+                    taken = create_data['name']
+                    create_data['name'] = alternate_names.pop(0)
+                    self._log_and_print(f"🔁 '{taken}' is taken; saving as '{create_data['name']}'", 'warning')
                     continue
                 # Surface the backend's ACTUAL status + response body. The generic
                 # "Failed to create recipe in eKitchen" upstream hides the real cause
@@ -2070,6 +2083,15 @@ Return ONLY the DALL-E prompt, nothing else."""
                 self._log_and_print(f"   ERROR resolving match {match_id}: {e}", 'warning')
 
         self._log_and_print(f"✅ Auto-resolved {resolved_count}/{len(unresolved)} ambiguous matches for recipe '{recipe_name}'")
+
+    @classmethod
+    def _alternate_names(cls, name: str, recipe_data: Dict[str, Any]) -> List[str]:
+        """Names to try when `name` is taken: 'Pepper Steak (royaleeats)', then
+        'Pepper Steak 2', 'Pepper Steak 3'."""
+        source = (recipe_data.get('author') or '').strip().lstrip('@') or cls._site_name(recipe_data.get('url', ''))
+        names = [f"{name} ({source})"] if source else []
+        names += [f"{name} {n}" for n in (2, 3)]
+        return names
 
     @staticmethod
     def _site_name(recipe_url: str) -> Optional[str]:
@@ -2341,7 +2363,9 @@ Return ONLY the DALL-E prompt, nothing else."""
 
             # Early duplicate pre-check: abort BEFORE paying for AI enrichment + image
             # generation if a recipe with this (cleaned) title already exists.
-            if self._recipe_already_exists(recipe_data.get('title')):
+            # User imports skip it: a same-named recipe from another source is a
+            # different recipe and gets a distinct name at create time.
+            if not user_id and self._recipe_already_exists(recipe_data.get('title')):
                 self._log_and_print(f"⏭️  Duplicate — '{recipe_data.get('title')}' already exists; skipping before enrichment/image")
                 return RecipeProcessingResult(
                     success=False,

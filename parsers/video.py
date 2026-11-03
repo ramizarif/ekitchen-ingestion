@@ -576,11 +576,17 @@ class VideoParser(BaseParser):
                     frames_used=frames_used
                 )
 
-            # Keep the creator the platform told us about (the transcript path has no author)
+            # Keep the creator the platform told us about (the transcript path has
+            # no author), and the link itself: without it the saved recipe has no
+            # "inspired by" link back to the video.
             creator = download_info.get('creator')
             source_metadata = final_recipe.get('source_metadata')
-            if creator and isinstance(source_metadata, dict) and not source_metadata.get('author'):
+            if not isinstance(source_metadata, dict):
+                source_metadata = final_recipe['source_metadata'] = {}
+            if creator and not source_metadata.get('author'):
                 source_metadata['author'] = creator
+            if not final_recipe.get('video_url') and not final_recipe.get('source_url'):
+                final_recipe['source_url'] = url
 
             # Calculate warnings
             warnings = self._generate_warnings(final_recipe)
